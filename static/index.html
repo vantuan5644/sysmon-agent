@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#080b10">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Sysmon">
+  <title>Sysmon</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="topbar-id">
+        <span id="statusDot" class="status-dot"></span>
+        <h1 id="hostname">Sysmon</h1>
+        <p class="eyebrow" id="platform">Loading</p>
+      </div>
+      <div class="top-actions">
+        <button id="dimBtn" class="button" type="button" aria-label="Dim mode" aria-pressed="false" title="Dim mode">◐</button>
+        <button id="shiftBtn" class="button" type="button" aria-label="Screen shift mode" aria-pressed="false" title="Screen shift mode">⇄</button>
+        <button id="wakeBtn" class="button" type="button" aria-label="Keep screen awake" aria-pressed="false" title="Keep screen awake">☀</button>
+        <button id="pauseBtn" class="button" type="button" aria-label="Pause updates" aria-pressed="false" title="Pause updates">Ⅱ</button>
+      </div>
+    </header>
+
+    <section id="statusStrip" class="status-strip" role="button" tabindex="0" aria-label="Refresh metrics now" aria-live="polite">
+      <span id="statusText">Connecting</span>
+      <span id="agentMeta" class="muted">--</span>
+      <span id="updatedAt" class="muted">--</span>
+    </section>
+
+    <section id="alertsPanel" class="panel alerts-panel" role="button" tabindex="0" aria-label="Alert details" aria-expanded="false" aria-live="polite" hidden>
+      <div class="section-head">
+        <h2>Alerts</h2>
+        <span id="alertsSummary" class="muted">--</span>
+      </div>
+      <div id="alertsList" class="rows"></div>
+    </section>
+
+    <div id="pager" class="pager">
+      <section class="page" aria-label="Live metrics">
+        <section class="gauge-grid" aria-label="Primary metrics">
+          <article class="metric-card">
+            <div class="gauge" id="cpuGauge">
+              <div class="gauge-ring-inner" aria-hidden="true"></div>
+              <div class="gauge-center">
+                <span class="gauge-value" id="cpuValue">--</span>
+                <span class="gauge-sub" id="cpuSub" aria-live="polite">--</span>
+              </div>
+            </div>
+            <div class="metric-label">CPU</div>
+            <div class="card-detail" id="cpuDetail" aria-live="polite">--</div>
+            <div class="sparkline" id="cpuTrend" aria-hidden="true"></div>
+          </article>
+          <article class="metric-card">
+            <div class="gauge" id="gpuGauge">
+              <div class="gauge-ring-inner" aria-hidden="true"></div>
+              <div class="gauge-center">
+                <span class="gauge-value" id="gpuValue">--</span>
+                <span class="gauge-sub" id="gpuSub" aria-live="polite">--</span>
+              </div>
+            </div>
+            <div class="metric-label">GPU</div>
+            <div class="card-detail" id="gpuDetail" aria-live="polite">--</div>
+            <div class="sparkline" id="gpuTrend" aria-hidden="true"></div>
+          </article>
+          <article class="metric-card">
+            <div class="gauge hide-inner" id="memGauge">
+              <div class="gauge-ring-inner" aria-hidden="true"></div>
+              <div class="gauge-center">
+                <span class="gauge-value" id="memValue">--</span>
+                <span class="gauge-sub" id="memSub" aria-live="polite">--</span>
+              </div>
+            </div>
+            <div class="metric-label">RAM</div>
+            <div class="card-detail" id="memDetail" aria-live="polite">--</div>
+            <div class="sparkline" id="memTrend" aria-hidden="true"></div>
+          </article>
+          <article class="metric-card">
+            <div class="gauge" id="netGauge">
+              <div class="gauge-ring-inner" aria-hidden="true"></div>
+              <div class="gauge-center">
+                <span class="gauge-value" id="netValue">--</span>
+                <span class="gauge-sub" id="netSub" aria-live="polite">--</span>
+              </div>
+            </div>
+            <div class="metric-label">NET</div>
+            <div class="card-detail" id="netDetail" aria-live="polite">--</div>
+            <div class="sparkline" id="netTrend" aria-hidden="true"></div>
+          </article>
+        </section>
+      </section>
+      <section class="page" aria-label="More status">
+        <section id="issuesPanel" class="panel issues-panel" role="button" tabindex="0" aria-label="Issue details" aria-expanded="false" aria-live="polite" hidden>
+          <div class="section-head">
+            <h2>Issues</h2>
+            <span id="issuesSummary" class="muted">--</span>
+          </div>
+          <div id="issuesList" class="rows"></div>
+        </section>
+        <section id="issuesEmpty" class="page-empty" aria-live="polite">
+          <span class="page-empty-glyph" aria-hidden="true">✓</span>
+          <span class="page-empty-title">All clear</span>
+          <span class="page-empty-sub">No issues reported</span>
+        </section>
+      </section>
+    </div>
+
+    <nav id="pageDots" class="page-dots" aria-label="Dashboard pages">
+      <button id="pageDot0" class="page-dot active" type="button" aria-label="Live metrics" aria-current="true"></button>
+      <button id="pageDot1" class="page-dot" type="button" aria-label="More status" aria-current="false"></button>
+    </nav>
+
+    <footer class="bottom-controls" aria-label="Host controls">
+      <section class="control-row" aria-label="Host controls">
+        <button id="micCtl" class="control-btn" type="button" data-control="mic_mute" aria-pressed="false" aria-label="Mute all microphones" disabled>
+          <span class="control-glyph" aria-hidden="true">🎙</span>
+          <span class="control-label" id="micCtlLabel">Mic</span>
+        </button>
+        <button id="mediaCtl" class="control-btn" type="button" data-control="media_toggle" aria-label="Play or pause media" disabled>
+          <span class="control-glyph" aria-hidden="true">⏯</span>
+          <span class="control-label">Media</span>
+        </button>
+        <button id="volumeCtl" class="control-btn" type="button" data-control="volume_mute" aria-pressed="false" aria-label="Mute speaker" disabled>
+          <span class="control-glyph" id="volumeCtlGlyph" aria-hidden="true">🔊</span>
+          <span class="control-label" id="volumeCtlLabel">Speaker</span>
+        </button>
+        <button id="lockCtl" class="control-btn" type="button" data-control="lock_screen" aria-label="Lock the screen" disabled>
+          <span class="control-glyph" aria-hidden="true">🔒</span>
+          <span class="control-label">Lock</span>
+        </button>
+      </section>
+    </footer>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

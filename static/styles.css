@@ -1,0 +1,877 @@
+:root {
+  color-scheme: dark;
+  --bg: #080b10;
+  --panel: #111820;
+  --panel-strong: #151f2a;
+  --line: #253140;
+  --text: #e9f0f7;
+  --muted: #8ea0b3;
+  --good: #46d58a;
+  --warn: #f5b84b;
+  --bad: #ff6b6b;
+  --accent: #52c7ff;
+  --pad-x: 12px;
+  --pad-top: 12px;
+  --pad-bottom: 18px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  min-height: 100%;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  overscroll-behavior: none;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  letter-spacing: 0;
+  min-height: 100vh;
+  min-height: 100svh;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: pan-y;
+}
+
+body.dim {
+  --bg: #030507;
+  --panel: #080d12;
+  --panel-strong: #0d131a;
+  --line: #18222d;
+  --text: #cad6e2;
+  --muted: #6f8092;
+}
+
+body.shift .shell {
+  animation: screen-shift 120s steps(1, end) infinite;
+}
+
+button {
+  font: inherit;
+}
+
+.shell {
+  width: min(100%, 760px);
+  min-height: 100vh;
+  min-height: 100svh;
+  margin: 0 auto;
+  padding:
+    calc(var(--pad-top) + env(safe-area-inset-top))
+    calc(var(--pad-x) + env(safe-area-inset-right))
+    0
+    calc(var(--pad-x) + env(safe-area-inset-left));
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 48px;
+}
+
+.topbar > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+.topbar-id {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.eyebrow {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+h1,
+h2 {
+  margin: 0;
+  font-weight: 750;
+  line-height: 1.05;
+}
+
+h1 {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 2.1rem;
+}
+
+h2 {
+  font-size: 0.92rem;
+}
+
+.top-actions,
+.control-row {
+  display: flex;
+  gap: 6px;
+}
+
+.top-actions {
+  display: grid;
+  grid-template-columns: repeat(4, 34px);
+  justify-content: flex-end;
+}
+
+.button,
+.control-btn {
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #101720;
+  color: var(--text);
+  padding: 0 11px;
+}
+
+.button {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  min-width: 34px;
+  padding: 0;
+  font-size: 1rem;
+  font-weight: 800;
+  line-height: 1;
+  touch-action: manipulation;
+}
+
+.button.active,
+.control-btn.active {
+  border-color: var(--accent);
+  background: #153247;
+}
+
+.status-strip {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+  min-height: 30px;
+  color: var(--muted);
+  font-size: 0.83rem;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.status-strip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 7px;
+}
+
+#agentMeta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#updatedAt {
+  white-space: nowrap;
+}
+
+.status-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 14px currentColor;
+}
+
+.status-dot.ok {
+  background: var(--good);
+}
+
+.status-dot.warn {
+  background: var(--warn);
+}
+
+.status-dot.paused {
+  background: var(--accent);
+}
+
+.status-dot.bad {
+  background: var(--bad);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.control-row {
+  margin-bottom: 10px;
+}
+
+.bottom-controls {
+  position: sticky;
+  bottom: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin:
+    12px
+    calc(-1 * (var(--pad-x) + env(safe-area-inset-right)))
+    0
+    calc(-1 * (var(--pad-x) + env(safe-area-inset-left)));
+  padding:
+    10px
+    calc(var(--pad-x) + env(safe-area-inset-right))
+    calc(env(safe-area-inset-bottom) + 8px)
+    calc(var(--pad-x) + env(safe-area-inset-left));
+  background: var(--panel-strong);
+  border-top: 1px solid var(--line);
+  box-shadow: 0 -8px 16px rgba(0, 0, 0, 0.35);
+}
+
+.bottom-controls .control-row {
+  margin: 0;
+}
+
+.control-btn {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-height: 48px;
+  padding: 6px 4px;
+  touch-action: manipulation;
+}
+
+.control-glyph {
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+.control-label {
+  max-width: 100%;
+  overflow: hidden;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.control-btn.active .control-label {
+  color: var(--text);
+}
+
+.control-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* iOS StandBy-style horizontal pager: page 1 is the live gauges, page 2 is the
+   Issues / "all clear" status. Swipe left-right between them; scroll-snap keeps
+   each page locked to the viewport. The body limits touch to vertical panning,
+   so the pager re-enables horizontal panning for the swipe. */
+.pager {
+  display: flex;
+  margin-top: 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  scroll-behavior: smooth;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x pan-y;
+  scrollbar-width: none;
+}
+
+.pager::-webkit-scrollbar {
+  display: none;
+}
+
+.page {
+  flex: 0 0 100%;
+  width: 100%;
+  min-width: 100%;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+}
+
+.page-dots {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 2px;
+}
+
+.page-dot {
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--line);
+  transition: background 0.2s ease, transform 0.2s ease;
+  touch-action: manipulation;
+  cursor: pointer;
+}
+
+.page-dot.active {
+  background: var(--accent);
+  transform: scale(1.3);
+}
+
+.page-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 140px;
+  margin-top: 8px;
+  padding: 22px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  text-align: center;
+}
+
+.page-empty[hidden] {
+  display: none;
+}
+
+.page-empty-glyph {
+  font-size: 2.1rem;
+  line-height: 1;
+  color: var(--good);
+}
+
+.page-empty-title {
+  font-size: 1.05rem;
+  font-weight: 750;
+  color: var(--text);
+}
+
+.page-empty-sub {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.gauge-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+/* On wide screens (tablet / desktop) the four cards fit comfortably in a single
+   row; on phones the 2x2 grid above keeps each gauge large for the StandBy-style
+   always-on glance. */
+@media (min-width: 560px) {
+  .gauge-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.metric-card,
+.panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.metric-card {
+  min-width: 0;
+  padding: 10px 6px 8px;
+  text-align: center;
+}
+
+.gauge {
+  --p: 0;
+  --c: var(--accent);
+  --inner-p: 0;
+  --inner-c: var(--accent);
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: min(40vw, 172px);
+  min-width: 120px;
+  aspect-ratio: 1;
+  margin: 0 auto 9px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at center, var(--panel) 0 60%, transparent 61%),
+    conic-gradient(var(--c) calc(var(--p) * 1%), #263342 0);
+}
+
+/* Inner ring: a smaller absolutely-centered circle painted on top of the
+   gauge's center hole. Its own radial hole leaves room for the value text in
+   the middle, so outer band = 70-100% radius, inner band = 50-66%, and the
+   center 0-50% holds the value + sub labels. */
+.gauge-ring-inner {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 72%;
+  aspect-ratio: 1;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at center, var(--panel) 0 64%, transparent 65%),
+    conic-gradient(var(--inner-c) calc(var(--inner-p) * 1%), #263342 0);
+}
+
+.gauge.hide-inner .gauge-ring-inner {
+  display: none;
+}
+
+.gauge-center {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  max-width: 86%;
+  pointer-events: none;
+}
+
+.gauge-value {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-size: 1.85rem;
+  font-weight: 780;
+  line-height: 1;
+  letter-spacing: -0.01em;
+}
+
+.gauge-sub {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 650;
+  line-height: 1.05;
+}
+
+.gauge.unavailable {
+  --p: 100;
+  --c: #394656;
+}
+
+.gauge.unavailable .gauge-ring-inner {
+  display: none;
+}
+
+.metric-label {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.card-detail {
+  color: var(--text);
+  font-size: 1.02rem;
+  font-weight: 700;
+  line-height: 1.2;
+  min-height: 1.3rem;
+  margin: 4px 0 1px;
+  overflow-wrap: anywhere;
+}
+
+.card-detail.warn {
+  color: var(--warn);
+}
+
+.card-detail.crit {
+  color: var(--bad);
+}
+
+.sparkline {
+  display: grid;
+  grid-template-columns: repeat(24, minmax(0, 1fr));
+  align-items: end;
+  gap: 2px;
+  height: 18px;
+  margin-top: 7px;
+  padding: 0 2px;
+}
+
+.sparkline-bar {
+  display: block;
+  min-width: 0;
+  min-height: 2px;
+  height: var(--h, 3px);
+  border-radius: 2px 2px 0 0;
+  background: var(--c, var(--accent));
+  opacity: 0.88;
+}
+
+.sparkline-bar.unavailable {
+  height: 3px;
+  background: #394656;
+  opacity: 0.56;
+}
+
+.panel {
+  margin-top: 8px;
+  padding: 10px;
+}
+
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.section-head .muted {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.78rem;
+}
+
+.rows {
+  display: grid;
+  gap: 6px;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 7px 8px;
+  border-radius: 7px;
+  background: var(--panel-strong);
+}
+
+.row > :first-child {
+  min-width: 0;
+}
+
+.alerts-panel,
+.issues-panel {
+  border-color: #7a5c22;
+  background: #16160f;
+}
+
+.alerts-panel {
+  border-color: #7a3030;
+  background: #1a1010;
+}
+
+.alerts-panel[role="button"],
+.issues-panel[role="button"] {
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.alerts-panel:focus-visible,
+.issues-panel:focus-visible {
+  outline: 2px solid var(--warn);
+  outline-offset: 2px;
+}
+
+/* Re-enable text selection inside alert/issue rows so the diagnostic text can
+   be long-pressed / dragged and copied, even though the dashboard root disables
+   selection for the kiosk / always-on style. The panel header and summary stay
+   non-selectable so they remain clean tap targets for expand/collapse. */
+.alerts-panel .rows,
+.issues-panel .rows,
+.alert-row,
+.issue-row {
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: text;
+}
+
+.alert-row,
+.issue-row {
+  grid-template-columns: minmax(0, 1fr);
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.alert-row {
+  color: var(--bad);
+}
+
+.issue-row {
+  color: var(--warn);
+}
+
+@media (max-width: 480px) {
+  .shell {
+    --pad-x: 10px;
+  }
+
+  h1 {
+    font-size: 1.7rem;
+  }
+
+  .gauge-grid {
+    gap: 10px;
+  }
+
+  .gauge-value {
+    font-size: 1.7rem;
+  }
+
+  .gauge-sub {
+    font-size: 0.74rem;
+  }
+
+  .card-detail {
+    font-size: 0.96rem;
+  }
+
+  .button,
+  .control-btn {
+    padding: 0 9px;
+  }
+
+  .status-strip {
+    grid-template-columns: 1fr auto;
+    grid-template-areas:
+      "state updated"
+      "meta meta";
+  }
+
+  #statusText {
+    grid-area: state;
+  }
+
+  #agentMeta {
+    grid-area: meta;
+    font-size: 0.74rem;
+  }
+
+  #updatedAt {
+    grid-area: updated;
+    justify-self: end;
+  }
+}
+
+@media (max-width: 360px) {
+  .metric-card {
+    padding: 8px 4px 7px;
+  }
+
+  .gauge {
+    min-width: 54px;
+  }
+
+  .gauge-value {
+    font-size: 1.35rem;
+  }
+
+  .gauge-sub {
+    font-size: 0.66rem;
+  }
+
+  .card-detail {
+    font-size: 0.86rem;
+  }
+
+  .sparkline {
+    gap: 1px;
+    height: 12px;
+    margin-top: 5px;
+    padding: 0 1px;
+  }
+
+  .control-btn {
+    padding: 0 6px;
+  }
+}
+
+@media (pointer: coarse) {
+  .top-actions {
+    grid-template-columns: repeat(4, 40px);
+  }
+
+  .button {
+    width: 40px;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0;
+  }
+
+  .status-strip {
+    min-height: 40px;
+  }
+
+  .metric-card {
+    min-height: 118px;
+  }
+}
+
+@media (max-width: 390px) {
+  .topbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .top-actions {
+    width: 100%;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .button {
+    width: 100%;
+    min-width: 0;
+  }
+}
+
+/* Landscape phone is the primary "always-on glance" target: a slim header and
+   four large circles that fill the viewport height. The bottom host controls
+   (mic / media / speaker / lock) stay docked as a slim horizontal bar so they
+   are reachable without rotating. Gauge sizing tracks the viewport HEIGHT so the
+   circles grow as large as the short side allows. */
+@media (orientation: landscape) and (max-height: 500px) {
+  .shell {
+    --pad-top: 6px;
+    max-width: none;
+    min-height: 100vh;
+    min-height: 100svh;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  h1 {
+    font-size: 1.5rem;
+  }
+
+  .topbar {
+    min-height: 38px;
+  }
+
+  .status-strip {
+    margin: 0;
+  }
+
+  .panel {
+    margin-top: 0;
+  }
+
+  .pager {
+    flex: 1 1 auto;
+    min-height: 0;
+    margin-top: 0;
+  }
+
+  .page {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .page-dots {
+    margin: 2px 0;
+  }
+
+  .gauge-grid {
+    flex: 1 1 auto;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .metric-card {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 4px 6px;
+  }
+
+  .gauge {
+    width: min(42vh, 21vw);
+    min-width: 92px;
+    margin-bottom: 6px;
+  }
+
+  .gauge-value {
+    font-size: 2rem;
+  }
+
+  .gauge-sub {
+    font-size: 0.8rem;
+  }
+
+  .card-detail {
+    font-size: 0.92rem;
+  }
+
+  .sparkline {
+    height: 14px;
+    margin-top: 6px;
+  }
+
+  .bottom-controls {
+    margin-top: 0;
+    padding-top: 6px;
+    padding-bottom: calc(env(safe-area-inset-bottom) + 4px);
+  }
+
+  .control-btn {
+    flex-direction: row;
+    gap: 6px;
+    min-height: 36px;
+    padding: 4px 6px;
+  }
+
+  .control-glyph {
+    font-size: 1rem;
+  }
+}
+
+@supports (min-height: 100dvh) {
+  body,
+  .shell {
+    min-height: 100dvh;
+  }
+}
+
+@keyframes screen-shift {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+
+  20% {
+    transform: translate3d(2px, 1px, 0);
+  }
+
+  40% {
+    transform: translate3d(-1px, 2px, 0);
+  }
+
+  60% {
+    transform: translate3d(-2px, -1px, 0);
+  }
+
+  80% {
+    transform: translate3d(1px, -2px, 0);
+  }
+}

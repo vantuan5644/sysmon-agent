@@ -1,0 +1,23 @@
+# Build output
+/sysmon-agent
+/sysmon-agent.exe
+/sysmon-agent.test
+/sysmon-agent.test.exe
+*.exe
+*.test
+
+# Local runtime state / settings
+settings.json
+*.bad-*
+*.bad-*.json
+
+# Logs
+*.log
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/

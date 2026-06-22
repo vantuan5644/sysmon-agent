@@ -1,0 +1,53 @@
+[Unit]
+# Portable, path-agnostic standalone unit for sysmon-agent.
+#
+# Runs the agent standalone on ANY Linux host you want to monitor:
+#   - binary lives at /usr/local/bin/sysmon-agent (decoupled from the repo checkout)
+#   - state dir is created/owned by systemd at /var/lib/sysmon-agent
+#   - the only host-specific line is User= below
+#
+# Install:
+#   ./build.sh
+#   sudo install -m0755 sysmon-agent /usr/local/bin/sysmon-agent
+#   sudo install -m0644 deploy/sysmon-agent.service /etc/systemd/system/
+#   sudoedit /etc/systemd/system/sysmon-agent.service   # set User= for this host
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sysmon-agent.service
+#
+# Publish to the tailnet for the PWA (recommended):
+#   sudo tailscale serve --bg --https=9443 http://127.0.0.1:9099
+Description=System Monitor Agent (sysmon-agent)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# --- the ONLY host-specific line: the local account that should own the agent ---
+User=vantuan5644
+
+Environment=SYSMON_BIND=127.0.0.1
+Environment=SYSMON_PORT=9099
+Environment=SYSMON_START_READY_TIMEOUT=20s
+
+# systemd creates/owns /var/lib/sysmon-agent for the User above (path-agnostic state)
+StateDirectory=sysmon-agent
+Environment=SYSMON_SETTINGS=/var/lib/sysmon-agent/settings.json
+
+ExecStart=/usr/local/bin/sysmon-agent -bind ${SYSMON_BIND} -port ${SYSMON_PORT} -settings ${SYSMON_SETTINGS}
+ExecStartPost=/usr/local/bin/sysmon-agent -wait-ready -bind ${SYSMON_BIND} -port ${SYSMON_PORT} -wait-ready-timeout ${SYSMON_START_READY_TIMEOUT}
+TimeoutStartSec=infinity
+Restart=on-failure
+RestartSec=3
+
+# Hardening mirrors the known-good unit. Do NOT add ProtectSystem / PrivateDevices /
+# ProtectKernelModules etc. -- the Linux collector reads /proc, sysfs, hwmon and the
+# RAPL powercap counters, and those directives would silently break those reads.
+NoNewPrivileges=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

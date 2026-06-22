@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Sysmon">
+  <rect width="512" height="512" rx="96" fill="#080b10"/>
+  <rect x="72" y="88" width="368" height="336" rx="44" fill="#111820" stroke="#253140" stroke-width="14"/>
+  <path d="M112 300h62l32-92 58 166 52-132 28 58h56" fill="none" stroke="#46d58a" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="370" cy="154" r="22" fill="#52c7ff"/>
+  <circle cx="304" cy="154" r="22" fill="#f5b84b"/>
+</svg>
