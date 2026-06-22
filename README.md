@@ -42,8 +42,18 @@ network. The device only renders the dashboard; every metric is collected on the
 
 ## Quick start
 
+**Windows users — no build tools needed.** Download the latest
+**`SysmonAgent-Setup-<version>.exe`** from the
+[Releases page](https://github.com/vantuan5644/sysmon-agent/releases/latest) and
+double-click it. The wizard installs the background service, opens the firewall, and adds
+a dashboard shortcut. See [Distribution — Windows installer](#distribution--windows-installer)
+for what to expect (including the one-time SmartScreen "unrecognized app" prompt on an
+unsigned build).
+
+To build from source instead:
+
 ```bash
-git clone <this-repo> system-monitor
+git clone https://github.com/vantuan5644/sysmon-agent system-monitor
 cd system-monitor
 ./build.sh                 # produces ./sysmon-agent
 ./sysmon-agent             # listens on 0.0.0.0:9099
