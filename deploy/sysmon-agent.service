@@ -6,6 +6,12 @@
 #   - state dir is created/owned by systemd at /var/lib/sysmon-agent
 #   - the only host-specific line is User= below
 #
+# NOTE: for a desktop with an interactive session, prefer the user unit
+# (deploy/sysmon-agent.user.service) -- it inherits the session bus and audio
+# socket, which the footer controls (mic mute, media toggle, speaker mute, lock
+# screen) need. This system unit is for headless hosts or when those controls
+# are not used.
+#
 # Install:
 #   ./build.sh
 #   sudo install -m0755 sysmon-agent /usr/local/bin/sysmon-agent
@@ -24,7 +30,8 @@ StartLimitBurst=5
 [Service]
 Type=simple
 # --- the ONLY host-specific line: the local account that should own the agent ---
-User=vantuan5644
+# Replace YOUR_USERNAME with the account that should own the agent on this host.
+User=YOUR_USERNAME
 
 Environment=SYSMON_BIND=127.0.0.1
 Environment=SYSMON_PORT=9099

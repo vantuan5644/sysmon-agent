@@ -146,7 +146,38 @@ installed PWA path.
 
 ### Linux (systemd)
 
-A path-agnostic unit is shipped at [`deploy/sysmon-agent.service`](deploy/sysmon-agent.service).
+Two path-agnostic units are shipped under `deploy/`. **Pick the one that matches your
+host.**
+
+#### User session unit (recommended for desktops)
+
+[`deploy/sysmon-agent.user.service`](deploy/sysmon-agent.user.service) runs under the
+per-user systemd manager. This is the right choice for a desktop/laptop with an
+interactive session, because it inherits `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` —
+which the **footer control buttons** (mic mute, media toggle, speaker mute, lock screen)
+need: `wpctl`/`pactl` reach PipeWire/PulseAudio, `playerctl` reaches the media player, and
+`loginctl lock-session` reaches the active session. Install it as your **desktop user, not
+root**:
+
+```bash
+./build.sh
+sudo install -m0755 sysmon-agent /usr/local/bin/sysmon-agent
+mkdir -p ~/.config/systemd/user
+install -m0644 deploy/sysmon-agent.user.service ~/.config/systemd/user/sysmon-agent.service
+systemctl --user daemon-reload
+systemctl --user enable --now sysmon-agent.service
+sudo loginctl enable-linger "$USER"   # also run at boot, before/without login
+```
+
+State lives under `$XDG_STATE_HOME/sysmon-agent/` (~/.local/state/sysmon-agent) and the unit
+is `WantedBy=default.target`. The controls also need `wireplumber` (`wpctl`) or
+`pulseaudio` (`pactl`), `playerctl`, and a session that honors `loginctl lock-session`
+(KDE/GNOME Wayland do).
+
+#### System unit (headless hosts)
+
+[`deploy/sysmon-agent.service`](deploy/sysmon-agent.service) runs as a system service — the
+right choice for a headless host, or when you don't use the footer controls.
 
 ```bash
 ./build.sh
@@ -157,17 +188,36 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now sysmon-agent.service
 ```
 
-The unit:
+Both units:
 
-- Runs the binary at `/usr/local/bin/sysmon-agent`.
-- Binds to `127.0.0.1:9099` by default (for use behind an HTTPS proxy); override
+- Run the binary at `/usr/local/bin/sysmon-agent`.
+- Bind to `127.0.0.1:9099` by default (for use behind an HTTPS proxy); override
   `SYSMON_BIND`/`SYSMON_PORT` in the unit for a direct LAN listener.
-- systemd creates and owns `/var/lib/sysmon-agent` for state (`SYSMON_SETTINGS`).
-- Performs a bounded `/readyz` readiness probe (`SYSMON_START_READY_TIMEOUT`, default `20s`)
+- Perform a bounded `/readyz` readiness probe (`SYSMON_START_READY_TIMEOUT`, default `20s`)
   before startup is considered successful, and rate-limits repeated restart failures.
-- Applies basic hardening while preserving access to `/proc`, sysfs, hwmon, and the RAPL
+- Apply basic hardening while preserving access to `/proc`, sysfs, hwmon, and the RAPL
   powercap counters the Linux collector reads. (Do **not** add `ProtectSystem` /
   `PrivateDevices` / `ProtectKernelModules` — they would silently break those reads.)
+
+The system unit additionally creates and owns `/var/lib/sysmon-agent` for state.
+
+#### Rebuild / rerun helper
+
+[`run-linux.sh`](run-linux.sh) rebuilds the Go binary, reinstalls it to `/usr/local/bin`,
+and restarts the installed service — the Linux counterpart to `run-windows.ps1`. It
+auto-detects whether the user unit or the system unit is installed and targets the right
+manager:
+
+```bash
+./run-linux.sh                 # build + install + restart the service
+./run-linux.sh -n              # reuse the existing binary (skip the build)
+./run-linux.sh -f              # dev: stop service, run attached (Ctrl+C), then restart it
+./run-linux.sh -u              # force the user service (systemctl --user)
+./run-linux.sh -s              # force the system service (sudo systemctl)
+```
+
+Static assets and `lhm-bridge.ps1` are `//go:embed`-ed, so any `static/` or bridge change
+requires the rebuild this script performs.
 
 ### Windows service
 
@@ -508,4 +558,10 @@ PowerShell/LibreHardwareMonitor/Node) is in [REQUIREMENTS.md](REQUIREMENTS.md).
 
 ## License
 
-[MIT](LICENSE).
+Licensed under the Creative Commons Attribution-NonCommercial 4.0 International
+License (CC-BY-NC 4.0). See [LICENSE](LICENSE) for the full text, or
+<https://creativecommons.org/licenses/by-nc/4.0/>.
+
+In short: you are free to use, share, and adapt this work **for non-commercial
+purposes**, as long as you give appropriate credit. Commercial use requires a separate
+license from the maintainer.

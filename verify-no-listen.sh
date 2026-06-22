@@ -376,7 +376,8 @@ fi
 
 if command -v systemd-analyze >/dev/null 2>&1; then
     run_step "systemd_verify" "systemd unit syntax" systemd-analyze verify \
-        "$SCRIPT_DIR/deploy/sysmon-agent.service"
+        "$SCRIPT_DIR/deploy/sysmon-agent.service" \
+        "$SCRIPT_DIR/deploy/sysmon-agent.user.service"
 else
     report "systemd_verify=skipped_systemd_analyze_unavailable"
 fi

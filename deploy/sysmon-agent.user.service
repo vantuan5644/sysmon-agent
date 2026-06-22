@@ -1,0 +1,48 @@
+[Unit]
+# User/session variant of sysmon-agent for an interactive desktop.
+#
+# Runs under the per-user systemd manager, so it inherits XDG_RUNTIME_DIR and
+# DBUS_SESSION_BUS_ADDRESS automatically -- which is what the footer control
+# buttons need: wpctl/pactl (mic + speaker) reach PipeWire, playerctl reaches
+# the media player, and loginctl lock-session reaches the active session.
+#
+# Install (as the desktop user, NOT root):
+#   ./build.sh
+#   sudo install -m0755 sysmon-agent /usr/local/bin/sysmon-agent
+#   mkdir -p ~/.config/systemd/user
+#   install -m0644 deploy/sysmon-agent.user.service ~/.config/systemd/user/sysmon-agent.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sysmon-agent.service
+#   sudo loginctl enable-linger "$USER"   # also run at boot, before/without login
+#
+# Controls also need: wireplumber (wpctl) or pulseaudio (pactl), playerctl,
+# and a session that honors loginctl lock-session (KDE/GNOME Wayland do).
+Description=System Monitor Agent (sysmon-agent, user session)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment=SYSMON_BIND=127.0.0.1
+Environment=SYSMON_PORT=9099
+Environment=SYSMON_START_READY_TIMEOUT=20s
+
+# For a user unit, StateDirectory is created under $XDG_STATE_HOME (~/.local/state)
+StateDirectory=sysmon-agent
+Environment=SYSMON_SETTINGS=%S/sysmon-agent/settings.json
+
+ExecStart=/usr/local/bin/sysmon-agent -bind ${SYSMON_BIND} -port ${SYSMON_PORT} -settings ${SYSMON_SETTINGS}
+ExecStartPost=/usr/local/bin/sysmon-agent -wait-ready -bind ${SYSMON_BIND} -port ${SYSMON_PORT} -wait-ready-timeout ${SYSMON_START_READY_TIMEOUT}
+TimeoutStartSec=infinity
+Restart=on-failure
+RestartSec=3
+
+# Hardening. Kept lighter than a system unit because the control actions exec
+# session tools (wpctl/playerctl/loginctl); do NOT add ProtectSystem/PrivateDevices.
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

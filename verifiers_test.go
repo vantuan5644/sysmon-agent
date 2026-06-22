@@ -1690,6 +1690,7 @@ func TestNoListenVerifierDocumentsAutomatedAndManualGates(t *testing.T) {
 		`windows_installer_recent_activity=skipped_pwsh_unavailable`,
 		`systemd-analyze verify`,
 		`deploy/sysmon-agent.service`,
+		`deploy/sysmon-agent.user.service`,
 		`sudo tailscale serve --bg --https=9443 http://127.0.0.1:9099   # publish the dashboard (or any HTTPS reverse proxy)`,
 		`SYSMON_DEPLOY_VERIFY_HOLD=120 ./verify-deployed.sh`,
 		`Add the printed deployed URL to the device Home Screen, then open that Home Screen app and tap the status strip during the hold window.`,
