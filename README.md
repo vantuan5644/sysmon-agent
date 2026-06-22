@@ -33,6 +33,7 @@ network. The device only renders the dashboard; every metric is collected on the
   - [Linux notes](#linux-notes)
   - [Windows notes](#windows-notes)
 - [Troubleshooting](#troubleshooting)
+- [Distribution — Windows installer](#distribution--windows-installer)
 - [Verify & test](#verify--test)
 - [Requirements](#requirements)
 - [License](#license)
@@ -478,6 +479,107 @@ it up with a `.bad-...` suffix and starts with defaults so the monitor still com
   host firewall. Bind to `0.0.0.0` only on trusted LAN or Tailscale networks.
 - For PWA install / service-worker behavior on iOS, serve over HTTPS (Tailscale Serve,
   another reverse proxy, or direct TLS).
+
+---
+
+## Distribution — Windows installer
+
+The repo ships a complete packaging flow under `dist/` that turns the source into a
+**double-clickable Windows installer** for non-technical users. It is fully
+cross-compilable — you build the `.exe` installer from Linux, macOS, or Windows
+without wine.
+
+### One command
+
+```bash
+./dist/build-installer.sh 1.0.0      # or let the version default from `git describe`
+```
+
+This produces `dist/out/SysmonAgent-Setup-1.0.0.exe` (~3 MB). Ship that single file.
+
+What it does, end to end:
+
+1. **Builds a release exe** (`dist/build-windows.sh`): cross-compiles `GOOS=windows`,
+   strips symbols (`-s -w`), injects the version into `-version`, and embeds a Win32
+   version resource + the app icon (so Explorer/Properties show version + icon).
+2. **Packages an NSIS installer** (`dist/installer.nsi`): a Modern-UI wizard that —
+
+   - installs to `Program Files\Sysmon Agent`,
+   - elevates automatically and runs the existing `install-windows.ps1` (the single
+     source of truth for service registration, firewall, recovery actions, and the
+     `/readyz` readiness gate),
+   - adds **Start Menu** and (optional) **Desktop** shortcuts that open the dashboard,
+   - registers a clean uninstaller in **Add/Remove Programs**, and on uninstall stops
+     + removes the service, the firewall rule, the files, and the shortcuts.
+
+### What the end user sees
+
+Double-click `SysmonAgent-Setup-1.0.0.exe` → UAC prompt → wizard → Finish. The agent
+runs as a background Windows service (`SysmonAgent`) that survives reboots. They open
+the dashboard from the Start Menu shortcut, or from their phone at
+`http://<PC-NAME>:9099/` on the same Wi-Fi (the installer opens the firewall for it).
+
+### Requirements to build the installer
+
+- **Go** 1.22+ (always).
+- **NSIS** (`makensis`) — the only extra tool. Install it once:
+  - Debian/Ubuntu: `sudo apt install nsis`
+  - macOS: `brew install nsis`
+  - Arch/CachyOS: `paru -S nsis` (AUR)
+  - Windows: <https://nsis.sourceforge.io/Download>
+- Optional: **ImageMagick** (`magick`/`convert`) regenerates `dist/packaging/sysmon.ico`
+  from `static/icon-512.png`; a committed `.ico` ships as a fallback, so it's not
+  required.
+
+### Just the release binary (no installer)
+
+If you only want a standalone optimized `.exe` (e.g. to run yourself, or to wrap in your
+own deployment):
+
+```bash
+./dist/build-windows.sh 1.0.0       # -> dist/out/sysmon-agent.exe
+```
+
+Then register it manually from an elevated PowerShell:
+
+```powershell
+.\install-windows.ps1 -Action Install
+```
+
+### Enabling CPU power + board temperatures for end users
+
+The zero-dependency install reports **CPU %, RAM, disks, network, and NVIDIA GPU** out of
+the box. CPU package power and CPU/motherboard/RAM temperatures need
+[LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) +
+PowerShell 7 (no native Windows API exposes them). For a non-technical user, have them
+install both machine-wide once after the agent:
+
+```powershell
+winget install --scope machine LibreHardwareMonitor.LibreHardwareMonitor
+winget install --scope machine Microsoft.PowerShell
+```
+
+Then reboot (or launch the LibreHardwareMonitor GUI once as admin) so its kernel driver
+loads. The agent picks the sensors up automatically; no restart of the agent is needed.
+
+### Signing (recommended before public release)
+
+Windows SmartScreen will warn on an unsigned installer from a new publisher. For public
+distribution, sign both the exe and the installer with a code-signing certificate
+(`signtool sign /tr <timestamp-url> /fd sha256 /a <file>`), obtained from a CA or
+[Azure Trusted Signing](https://learn.microsoft.com/azure/trusted-signing/). Without a
+known reputation, expect a one-time "unrecognized app" prompt regardless of signing
+until SmartScreen builds trust.
+
+### Why NSIS (.exe) and not .msi?
+
+NSIS was chosen because `makensis` runs **natively on Linux/macOS**, so the whole release
+is cross-compilable from the same machine you develop on, and it can reuse the existing,
+battle-tested `install-windows.ps1` instead of re-implementing service/firewall/readiness
+logic in installer primitives. If you specifically need a `.msi` (e.g. for Group Policy
+deployment), the same files work with [WiX Toolset v4](https://wixtoolset.org/)
+(`dotnet tool install -g wix`, runs on Linux via .NET) or [`go-msi`](https://github.com/mhewedy/go-msi);
+use `install-windows.ps1` as a deferred custom action just as the NSIS script does.
 
 ---
 

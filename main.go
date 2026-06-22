@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
@@ -17,6 +18,10 @@ import (
 
 //go:embed static/*
 var staticFS embed.FS
+
+// version is the agent build version. It is overridden at release-build time via
+// -ldflags="-X main.version=<version>"; "dev" when built without a stamp.
+var version = "dev"
 
 func main() {
 	defaultBind := envString("SYSMON_BIND", "0.0.0.0")
@@ -36,12 +41,18 @@ func main() {
 	diskWarn := flag.Int("disk-warn", envInt("SYSMON_DISK_WARN", 0), "disk utilization warn threshold percent (50-90); 0 keeps the saved/default value")
 	gpuWarn := flag.Int("gpu-warn", envInt("SYSMON_GPU_WARN", 0), "GPU utilization warn threshold percent (50-90); 0 keeps the saved/default value")
 	tempWarn := flag.Int("temp-warn", envInt("SYSMON_TEMP_WARN", 0), "temperature warn threshold in Celsius (50-90); 0 keeps the saved/default value")
+	showVersion := flag.Bool("version", false, "print the build version and exit")
 	selfCheck := flag.Bool("self-check", envBool("SYSMON_SELF_CHECK", false), "run in-process endpoint checks and exit")
 	waitHealth := flag.Bool("wait-health", envBool("SYSMON_WAIT_HEALTH", false), "wait until the configured /healthz endpoint responds and exit")
 	waitHealthTimeout := flag.Duration("wait-health-timeout", envDuration("SYSMON_WAIT_HEALTH_TIMEOUT", 10*time.Second), "maximum time to wait with -wait-health")
 	waitReady := flag.Bool("wait-ready", envBool("SYSMON_WAIT_READY", false), "wait until the configured /readyz endpoint responds and exit")
 	waitReadyTimeout := flag.Duration("wait-ready-timeout", envDuration("SYSMON_WAIT_READY_TIMEOUT", 15*time.Second), "maximum time to wait with -wait-ready")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("sysmon-agent %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+		return
+	}
 
 	listen := listenConfig{
 		bind:       *bind,

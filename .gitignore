@@ -6,6 +6,11 @@
 *.exe
 *.test
 
+# Distribution build output (release binaries + installers) — built by dist/
+/dist/out/
+/dist/packaging/resource.syso
+/resource.syso
+
 # Local runtime state / settings
 settings.json
 *.bad-*
