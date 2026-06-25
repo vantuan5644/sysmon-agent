@@ -56,7 +56,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v102";
+const dashboardBuild = "sysmon-static-v107";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 const defaultThresholds = {
@@ -1039,7 +1039,7 @@ function render(metrics) {
   // reference), center = download rate, sub = upload rate.
   setNetGauge(net);
 
-  renderPrimaryCardDetails(metrics, primaryGPU, net);
+  renderPrimaryCardDetails(metrics, primaryGPU);
 }
 
 // networkTotals sums RX/TX byte rates across every interface into one aggregate
@@ -1242,24 +1242,66 @@ function renderMetricAlerts(metrics) {
   }
 }
 
+// metricAlertMessages collects the threshold breaches the alerts panel surfaces.
+// Readings that already warn on a primary gauge card are deliberately NOT
+// repeated here: CPU/GPU/RAM usage lives on the outer rings, CPU die temp on
+// the CPU inner ring + detail line, GPU die temp on the GPU detail line, and GPU
+// VRAM on the GPU inner ring -- all of them turn red at their threshold, so
+// listing them again would just be noise. Only disks (no card) and auxiliary
+// temperature sensors (board, water, PSU, ...) that are not shown elsewhere
+// surface as alerts.
 function metricAlertMessages(metrics) {
   const messages = [];
-  addPercentAlert(messages, "CPU", metricPercent(metrics?.cpu_percent), thresholdValue("cpu_warn"));
-  addPercentAlert(messages, "RAM", capacityPercent(metrics?.memory), thresholdValue("memory_warn"));
   for (const disk of metrics?.disks || []) {
     const label = disk.mountpoint || disk.name || "disk";
     addPercentAlert(messages, `Disk ${label}`, capacityPercent(disk.capacity), thresholdValue("disk_warn"));
   }
-  for (const device of metrics?.gpu?.devices || []) {
-    const label = device.name || "GPU";
-    addPercentAlert(messages, `${label} load`, metricPercent(device.usage_percent), thresholdValue("gpu_warn"));
-    addPercentAlert(messages, `${label} VRAM`, capacityPercent(device.memory), thresholdValue("gpu_warn"));
-    addTemperatureAlert(messages, `${label} temp`, numberMetric(device.temperature_celsius), thresholdValue("temp_warn_c"));
-  }
   for (const sensor of metrics?.temperatures?.sensors || []) {
+    if (isPrimaryCardTemperatureSensor(sensor.name)) {
+      continue;
+    }
     addTemperatureAlert(messages, sensor.name || "sensor", numberMetric(sensor.celsius), thresholdValue("temp_warn_c"));
   }
   return messages;
+}
+
+// isPrimaryCardTemperatureSensor reports whether a temperature-sensor name is
+// already shown on a primary gauge card: the CPU die reading that feeds the CPU
+// card (inner ring + detail line), or a GPU die reading that feeds a GPU card
+// detail line. Those carry their own warn colour on the cards, so alerting them
+// again here just repeats what the rings already show; auxiliary sensors (board,
+// water, PSU, chipset, ...) have no card and stay. Mirrors the Go-side
+// pickCPUTemperature/isCPUTemperatureSensor classification in metrics.go.
+function isPrimaryCardTemperatureSensor(name) {
+  const n = String(name || "").toLowerCase();
+  if (!n) {
+    return false;
+  }
+  // GPU die sensors are each carried by a GPU device's temperature_celsius, so
+  // any GPU-named sensor is treated as already shown on a GPU card.
+  for (const fragment of ["gpu", "nvidia", "geforce", "radeon", "arc"]) {
+    if (n.includes(fragment)) {
+      return true;
+    }
+  }
+  // Reject non-CPU-die sensors (board, water, disks, PSU, RAM) before the CPU
+  // name check so e.g. a "CPU VRM"/"board" reading is not mistaken for the die.
+  for (const fragment of [
+    "dimm", "ram", "memory",
+    "water", "ambient", "board", "chipset", "motherboard",
+    "hdd", "ssd", "nvme", "disk",
+    "psu", "battery",
+  ]) {
+    if (n.includes(fragment)) {
+      return false;
+    }
+  }
+  for (const fragment of ["cpu", "core", "package", "socket", "tctl", "tdie", "tcase", "k10temp", "coretemp", "k8temp", "ryzen", "xeon", "epyc", "threadripper"]) {
+    if (n.includes(fragment)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function addPercentAlert(messages, label, metric, threshold) {
@@ -1273,7 +1315,7 @@ function addTemperatureAlert(messages, label, metric, threshold) {
   if (!metric.available || metric.value < threshold) {
     return;
   }
-  messages.push(`${label} ${Math.round(metric.value)}C over ${threshold}C`);
+  messages.push(`${label} ${formatTemp(metric.value)} over ${formatTemp(threshold)}`);
 }
 
 function toggleIssuesPanel() {
@@ -1398,33 +1440,112 @@ function sparklineBar(sample, warnThreshold) {
 
 // renderPrimaryCardDetails fills the small detail line under each gauge with the
 // readings NOT already shown by the rings/center labels: CPU/GPU temperature and
-// power draw, RAM headroom, and the full network throughput. The detail line is
-// colour-coded by the temperature threshold for the CPU and GPU cards.
-function renderPrimaryCardDetails(metrics, primaryGPU, net) {
+// power draw, RAM headroom, and the host's Tailscale connectivity (online +
+// exit-node state) under the NET card. The detail line is colour-coded by the
+// temperature threshold for the CPU and GPU cards.
+function renderPrimaryCardDetails(metrics, primaryGPU) {
   const tempWarn = thresholdValue("temp_warn_c");
 
   const cpuTemp = numberMetric(metrics.cpu_temperature);
   const cpuPower = numberMetric(metrics.cpu_power);
   setCardDetail("cpuDetail", joinDetail([
-    cpuTemp.available ? `${Math.round(cpuTemp.value)}C` : "",
+    cpuTemp.available ? formatTemp(cpuTemp.value) : "",
     cpuPower.available ? formatPower(cpuPower.value) : "",
   ]), cpuTemp, tempWarn);
 
   const gpuTemp = primaryGPU ? numberMetric(primaryGPU.temperature_celsius) : unavailable();
   const gpuPower = primaryGPU ? numberMetric(primaryGPU.power_watts) : unavailable();
   setCardDetail("gpuDetail", joinDetail([
-    gpuTemp.available ? `${Math.round(gpuTemp.value)}C` : "",
+    gpuTemp.available ? formatTemp(gpuTemp.value) : "",
     gpuPower.available ? formatPower(gpuPower.value) : "",
   ]), gpuTemp, tempWarn);
 
   const memory = capacityPercent(metrics.memory);
-  setCardDetail("memDetail", memory.available
-    ? `${formatBytes(Math.max(0, memory.totalBytes - memory.usedBytes))} free`
-    : "", null, null);
+  const swap = capacityPercent(metrics.memory_swap);
+  setCardDetail("memDetail", swap.available
+    ? `⇅ ${formatBytes(swap.usedBytes)} swap`
+    : "no swap", null, null);
 
-  setCardDetail("netDetail", net.available
-    ? `${formatBytes(net.rx)}/s down / ${formatBytes(net.tx)}/s up`
-    : "", null, null);
+  renderNetDetail(metrics.tailscale);
+}
+
+// renderNetDetail fills the NET card's detail line with Tailscale connectivity
+// state -- a mesh icon (online/offline) and an exit-node icon (on/off) -- shown
+// as pure colour-coded icons with no visible text, so the line never wraps. The
+// state is carried by each icon's colour plus an aria-label for assistive tech.
+function renderNetDetail(tailscale) {
+  const el = $("netDetail");
+  if (!el) { return; }
+  el.classList.remove("warn", "crit");
+  el.textContent = "";
+  if (!tailscale || !tailscale.available) {
+    el.textContent = "--";
+    return;
+  }
+  el.append(
+    statusPill(meshIcon(), tailscale.online ? "Tailscale online" : "Tailscale offline", tailscale.online ? "on" : "bad"),
+    statusPill(exitNodeIcon(), tailscale.exit_node_enabled ? "Exit node on" : "Exit node off", tailscale.exit_node_enabled ? "on" : "dim"),
+  );
+}
+
+// statusPill wraps a status icon in a colour-coded span. The icon inherits the
+// pill's colour via currentColor; the visible state is the colour, and the
+// spoken state is the aria-label/title (there is no visible text).
+function statusPill(icon, label, state) {
+  const span = document.createElement("span");
+  span.className = `ts-pill ts-${state}`;
+  span.setAttribute("role", "img");
+  span.setAttribute("aria-label", label);
+  span.title = label;
+  span.append(icon);
+  return span;
+}
+
+const SVG_ICON_NS = "http://www.w3.org/2000/svg";
+
+// makeIcon builds an inline 24x24 SVG line-art icon (stroke = currentColor,
+// fill = none) entirely through the DOM so it is XSS-safe and inherits the
+// pill's status colour. children is a list of [tag, attrs] pairs.
+function makeIcon(children) {
+  const svg = document.createElementNS(SVG_ICON_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", "14");
+  svg.setAttribute("height", "14");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.8");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  for (const [tag, attrs] of children) {
+    const node = document.createElementNS(SVG_ICON_NS, tag);
+    for (const [name, value] of Object.entries(attrs)) {
+      node.setAttribute(name, value);
+    }
+    svg.append(node);
+  }
+  return svg;
+}
+
+// meshIcon -- three nodes joined in a triangle (a network mesh): the mark for
+// the Tailscale connectivity pill.
+function meshIcon() {
+  return makeIcon([
+    ["path", { d: "M12 7 L6.5 17.5 L17.5 17.5 Z" }],
+    ["circle", { cx: 12, cy: 7, r: 2.3, fill: "currentColor", stroke: "none" }],
+    ["circle", { cx: 6.5, cy: 17.5, r: 2.3, fill: "currentColor", stroke: "none" }],
+    ["circle", { cx: 17.5, cy: 17.5, r: 2.3, fill: "currentColor", stroke: "none" }],
+  ]);
+}
+
+// exitNodeIcon -- a doorway with an arrow leaving through it (egress): the mark
+// for the Tailscale exit-node pill.
+function exitNodeIcon() {
+  return makeIcon([
+    ["path", { d: "M10 21H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" }],
+    ["polyline", { points: "16 17 21 12 16 7" }],
+    ["line", { x1: 21, y1: 12, x2: 9, y2: 12 }],
+  ]);
 }
 
 // joinDetail joins the non-empty parts of a detail line with a thin separator.
@@ -1769,6 +1890,16 @@ function formatPower(watts) {
     return `${(value / 1000).toFixed(2)} kW`;
   }
   return `${value >= 100 ? value.toFixed(0) : value.toFixed(1)} W`;
+}
+
+// formatTemp renders a Celsius reading as a rounded "NN°C" string, matching the
+// CPU/GPU card detail lines and temperature alert messages.
+function formatTemp(celsius) {
+  const value = finiteNumber(celsius);
+  if (value === null) {
+    return "--°C";
+  }
+  return `${Math.round(value)}°C`;
 }
 
 // formatClock renders a CPU clock reading (MHz from the API) as a compact GHz

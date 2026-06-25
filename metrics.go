@@ -68,25 +68,38 @@ type GPUSet struct {
 	Error     string      `json:"error,omitempty"`
 }
 
+// TailscaleStatus reports the host's Tailscale daemon state: whether the node
+// is online to the coordination server and whether it is routing through an
+// exit node. It degrades independently (a missing/offline daemon reports
+// Available:false) and is collected from `tailscale status --json`.
+type TailscaleStatus struct {
+	Available       bool   `json:"available"`
+	Online          bool   `json:"online"`            // Self.Online: logged in and reachable to the control plane
+	ExitNodeEnabled bool   `json:"exit_node_enabled"` // currently routing through a selected exit node
+	Error           string `json:"error,omitempty"`
+}
+
 type Metrics struct {
-	Hostname             string         `json:"hostname"`
-	OS                   string         `json:"os"`
-	Arch                 string         `json:"arch"`
-	Platform             string         `json:"platform,omitempty"`
-	Timestamp            time.Time      `json:"timestamp"`
-	CPU                  NumberMetric   `json:"cpu_percent"`
-	CPUPower             NumberMetric   `json:"cpu_power"`
-	CPUClock             NumberMetric   `json:"cpu_clock"`
-	CPUClockMax          NumberMetric   `json:"cpu_clock_max"`
-	CPUTemperature       NumberMetric   `json:"cpu_temperature"`
-	PSUOutputPower       NumberMetric   `json:"psu_output_power"`
-	Memory               CapacityMetric `json:"memory"`
-	Disks                []DiskMetric   `json:"disks"`
-	Network              NetworkSet     `json:"network"`
-	Temperatures         TemperatureSet `json:"temperatures"`
-	GPU                  GPUSet         `json:"gpu"`
-	CollectionDurationMS int64          `json:"collection_duration_ms"`
-	CollectionErrors     []string       `json:"collection_errors,omitempty"`
+	Hostname             string          `json:"hostname"`
+	OS                   string          `json:"os"`
+	Arch                 string          `json:"arch"`
+	Platform             string          `json:"platform,omitempty"`
+	Timestamp            time.Time       `json:"timestamp"`
+	CPU                  NumberMetric    `json:"cpu_percent"`
+	CPUPower             NumberMetric    `json:"cpu_power"`
+	CPUClock             NumberMetric    `json:"cpu_clock"`
+	CPUClockMax          NumberMetric    `json:"cpu_clock_max"`
+	CPUTemperature       NumberMetric    `json:"cpu_temperature"`
+	PSUOutputPower       NumberMetric    `json:"psu_output_power"`
+	Memory               CapacityMetric  `json:"memory"`
+	MemorySwap           CapacityMetric  `json:"memory_swap"`
+	Disks                []DiskMetric    `json:"disks"`
+	Network              NetworkSet      `json:"network"`
+	Tailscale            TailscaleStatus `json:"tailscale"`
+	Temperatures         TemperatureSet  `json:"temperatures"`
+	GPU                  GPUSet          `json:"gpu"`
+	CollectionDurationMS int64           `json:"collection_duration_ms"`
+	CollectionErrors     []string        `json:"collection_errors,omitempty"`
 }
 
 // pickCPUTemperature returns the best CPU package/core reading from a temperature
@@ -256,6 +269,16 @@ func summarizeCollectionErrors(metrics Metrics) []string {
 	if !metrics.Memory.Available {
 		add("memory", metrics.Memory.Error)
 	}
+	// Swap is surfaced on the RAM card's detail line and degrades independently.
+	// The common "no swap configured" state (and the unset zero value) is
+	// intentionally NOT rolled into collection_errors -- many hosts legitimately
+	// run without swap or use zram, so reporting it as a permanent error is
+	// noise, just like an absent Tailscale daemon. A genuine read failure still
+	// surfaces here.
+	if !metrics.MemorySwap.Available && metrics.MemorySwap.Error != "" &&
+		metrics.MemorySwap.Error != "no swap configured" {
+		add("swap", metrics.MemorySwap.Error)
+	}
 	for _, disk := range metrics.Disks {
 		if disk.Capacity.Available {
 			continue
@@ -266,6 +289,13 @@ func summarizeCollectionErrors(metrics Metrics) []string {
 	if !metrics.Network.Available {
 		add("network", metrics.Network.Error)
 	}
+	// Tailscale is intentionally NOT rolled into collection_errors. Unlike a
+	// sensor (CPU/disk/network), it is an optional status indicator: many hosts
+	// legitimately have no Tailscale daemon installed, and surfacing "tailscale
+	// CLI not found" as a permanent issue on every such host is pure noise. Its
+	// state is conveyed by the NET card's status pill (online/offline/absent);
+	// the Error string still ships in the JSON for direct API consumers and
+	// validateMetricsShape keeps the field's shape honest.
 	if !metrics.Temperatures.Available {
 		add("temperatures", metrics.Temperatures.Error)
 	} else {

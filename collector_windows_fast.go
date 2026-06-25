@@ -97,10 +97,12 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	var cpuClock NumberMetric
 	var cpuClockMax NumberMetric
 	var psuOutputPower NumberMetric
+	var swap CapacityMetric
 	var disks []DiskMetric
 	var network NetworkSet
 	var temperatures TemperatureSet
 	var gpu GPUSet
+	var tailscale TailscaleStatus
 
 	// One bridge invocation per slow pass feeds CPU power, clock, PSU and temps;
 	// LHM's kernel driver does not tolerate concurrent Computer.Open() calls.
@@ -143,6 +145,16 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	}, func(recovered any) GPUSet {
 		return GPUSet{Available: false, Error: fmt.Sprintf("Windows GPU collector panicked: %v", recovered)}
 	})
+	collectMetricAsync(&wg, &tailscale, func() TailscaleStatus {
+		return readTailscaleStatus(ctx)
+	}, func(recovered any) TailscaleStatus {
+		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Windows Tailscale collector panicked: %v", recovered)}
+	})
+	collectMetricAsync(&wg, &swap, func() CapacityMetric {
+		return windowsSwap(ctx)
+	}, func(recovered any) CapacityMetric {
+		return unavailableCapacity(fmt.Sprintf("Windows swap collector panicked: %v", recovered))
+	})
 	wg.Wait()
 
 	cpuTemperature := pickCPUTemperature(temperatures)
@@ -153,8 +165,10 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		m.CPUClockMax = cpuClockMax
 		m.CPUTemperature = cpuTemperature
 		m.PSUOutputPower = psuOutputPower
+		m.MemorySwap = swap
 		m.Disks = disks
 		m.Network = network
+		m.Tailscale = tailscale
 		m.Temperatures = temperatures
 		m.GPU = gpu
 	}
@@ -171,8 +185,10 @@ func windowsDegradedSlowPatch(message string) func(*Metrics) {
 		m.CPUClockMax = unavailableNumber("MHz", message)
 		m.CPUTemperature = unavailableNumber("C", message)
 		m.PSUOutputPower = unavailableNumber("W", message)
+		m.MemorySwap = unavailableCapacity(message)
 		m.Disks = unavailableDisk(message)
 		m.Network = NetworkSet{Available: false, Error: message}
+		m.Tailscale = TailscaleStatus{Available: false, Error: message}
 		m.Temperatures = TemperatureSet{Available: false, Error: message}
 		m.GPU = GPUSet{Available: false, Error: message}
 	}

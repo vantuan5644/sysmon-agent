@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REPORT_FILE="${SYSMON_VERIFY_NO_LISTEN_REPORT:-/tmp/sysmon-agent-no-listen-report.txt}"
 TEMP_DIR="$(mktemp -d -t sysmon-no-listen.XXXXXX)"
 
@@ -376,8 +377,8 @@ fi
 
 if command -v systemd-analyze >/dev/null 2>&1; then
     run_step "systemd_verify" "systemd unit syntax" systemd-analyze verify \
-        "$SCRIPT_DIR/deploy/sysmon-agent.service" \
-        "$SCRIPT_DIR/deploy/sysmon-agent.user.service"
+        "$REPO_ROOT/scripts/systemd/homelab-sysmon-agent.service" \
+        "$REPO_ROOT/scripts/systemd/homelab-tailscale-serve.service"
 else
     report "systemd_verify=skipped_systemd_analyze_unavailable"
 fi
@@ -385,11 +386,11 @@ fi
 echo ""
 echo "ok: no-listen sysmon-agent checks passed"
 echo "Manual gates still required on the real host:"
-echo "  sudo tailscale serve --bg --https=9443 http://127.0.0.1:9099   # publish the dashboard (or any HTTPS reverse proxy)"
-echo "  SYSMON_DEPLOY_VERIFY_HOLD=120 ./verify-deployed.sh"
+echo "  ./serve.sh && SYSMON_PRINT_QR=1 ./serve.sh status"
+echo "  cd apps/sysmon-agent && SYSMON_DEPLOY_VERIFY_HOLD=120 ./verify-deployed.sh"
 echo "  Add the printed deployed URL to the device Home Screen, then open that Home Screen app and tap the status strip during the hold window."
 echo "Windows installed-service equivalent:"
-echo "  .\\install-windows.ps1 -Action Install"
+echo "  cd apps\\sysmon-agent"
 echo "  .\\verify-deployed-windows.ps1 -HoldSeconds 120"
 echo "Optional isolated smoke-agent gate:"
 echo "  SYSMON_VERIFY_BIND=0.0.0.0 SYSMON_VERIFY_HOLD=120 SYSMON_VERIFY_REQUIRE_DEVICE=1 ./verify.sh"

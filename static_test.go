@@ -125,7 +125,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v102"`,
+		`const STATIC_CACHE = "sysmon-static-v107"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -295,7 +295,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 3000;`,
-		`const dashboardBuild = "sysmon-static-v102";`,
+		`const dashboardBuild = "sysmon-static-v107";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -650,17 +650,14 @@ func TestDashboardRendersMetricAlertsPanel(t *testing.T) {
 		`state.alertMessages = messages;`,
 		"summary.textContent = `${messages.length} alert${messages.length === 1 ? \"\" : \"s\"}`;",
 		`function metricAlertMessages(metrics) {`,
-		`addPercentAlert(messages, "CPU", metricPercent(metrics?.cpu_percent), thresholdValue("cpu_warn"));`,
-		`addPercentAlert(messages, "RAM", capacityPercent(metrics?.memory), thresholdValue("memory_warn"));`,
 		`addPercentAlert(messages, ` + "`Disk ${label}`" + `, capacityPercent(disk.capacity), thresholdValue("disk_warn"));`,
-		"addPercentAlert(messages, `${label} load`, metricPercent(device.usage_percent), thresholdValue(\"gpu_warn\"));",
-		"addPercentAlert(messages, `${label} VRAM`, capacityPercent(device.memory), thresholdValue(\"gpu_warn\"));",
-		"addTemperatureAlert(messages, `${label} temp`, numberMetric(device.temperature_celsius), thresholdValue(\"temp_warn_c\"));",
+		`if (isPrimaryCardTemperatureSensor(sensor.name)) {`,
 		`addTemperatureAlert(messages, sensor.name || "sensor", numberMetric(sensor.celsius), thresholdValue("temp_warn_c"));`,
+		`function isPrimaryCardTemperatureSensor(name) {`,
 		`function addPercentAlert(messages, label, metric, threshold) {`,
 		"messages.push(`${label} ${Math.round(metric.value)}% over ${threshold}%`);",
 		`function addTemperatureAlert(messages, label, metric, threshold) {`,
-		"messages.push(`${label} ${Math.round(metric.value)}C over ${threshold}C`);",
+		"messages.push(`${label} ${formatTemp(metric.value)} over ${formatTemp(threshold)}`);",
 		`function toggleAlertsPanel() {`,
 		`state.alertsExpanded = !state.alertsExpanded;`,
 		`function renderMetricAlertsFromMessages(messages) {`,

@@ -125,7 +125,7 @@ function writeFixture(root) {
   <main class="shell">
     <header class="topbar">
       <div>
-        <p class="eyebrow" id="platform">linux / amd64 / 6.8.0-generic</p>
+        <p class="eyebrow" id="platform">linux / amd64 / 6.8.0-homelab</p>
         <h1 id="hostname">labbox-mini</h1>
       </div>
       <div class="top-actions">
@@ -147,8 +147,8 @@ function writeFixture(root) {
         <span class="muted">2 alerts</span>
       </div>
       <div class="rows">
-        <div class="row alert-row">CPU 86% over 70%</div>
-        <div class="row alert-row">GPU 0 temp 82C over 70C</div>
+        <div class="row alert-row">Disk / 92% over 70%</div>
+        <div class="row alert-row">Motherboard 75C over 70C</div>
       </div>
     </section>
     <section class="panel issues-panel" role="button" tabindex="0" aria-label="Expand issue details" aria-expanded="false" aria-live="polite">
@@ -228,7 +228,7 @@ function verifyStaticLayout(fixturePath) {
     `03:16:00 / 4s / 142ms`,
     `class="panel alerts-panel"`,
     `class="row alert-row"`,
-    `CPU 86% over 70%`,
+    `Disk / 92% over 70%`,
     `class="panel issues-panel"`,
     `aria-expanded="false"`,
     `class="row issue-row"`,

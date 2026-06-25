@@ -18,7 +18,7 @@ func TestWindowsInstallerDefaults(t *testing.T) {
 		`[ValidateRange(1, 65535)]`,
 		`[ValidateRange(1, 300)]`,
 		`$ReadinessTimeoutSeconds = 20`,
-		`$ServiceName = 'SysmonAgent'`,
+		`$ServiceName = 'HomelabSysmonAgent'`,
 		`$SettingsPath = "$env:ProgramData\SysmonAgent\settings.json"`,
 		`-Profile Domain,Private`,
 		`Command-line values cannot contain double quotes`,

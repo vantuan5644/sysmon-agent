@@ -98,10 +98,12 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	var cpuClockMax NumberMetric
 	var psuOutputPower NumberMetric
 	var memory CapacityMetric
+	var swap CapacityMetric
 	var disks []DiskMetric
 	var network NetworkSet
 	var temperatures TemperatureSet
 	var gpu GPUSet
+	var tailscale TailscaleStatus
 
 	collectMetricAsync(&wg, &cpu, func() NumberMetric {
 		return windowsCPU(ctx)
@@ -135,6 +137,11 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	}, func(recovered any) CapacityMetric {
 		return unavailableCapacity(fmt.Sprintf("Windows memory collector panicked: %v", recovered))
 	})
+	collectMetricAsync(&wg, &swap, func() CapacityMetric {
+		return windowsSwap(ctx)
+	}, func(recovered any) CapacityMetric {
+		return unavailableCapacity(fmt.Sprintf("Windows swap collector panicked: %v", recovered))
+	})
 	collectMetricAsync(&wg, &disks, func() []DiskMetric {
 		return windowsDisks(ctx)
 	}, func(recovered any) []DiskMetric {
@@ -155,6 +162,11 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	}, func(recovered any) GPUSet {
 		return GPUSet{Available: false, Error: fmt.Sprintf("Windows GPU collector panicked: %v", recovered)}
 	})
+	collectMetricAsync(&wg, &tailscale, func() TailscaleStatus {
+		return readTailscaleStatus(ctx)
+	}, func(recovered any) TailscaleStatus {
+		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Windows Tailscale collector panicked: %v", recovered)}
+	})
 	wg.Wait()
 
 	metrics.CPU = cpu
@@ -164,8 +176,10 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.CPUTemperature = pickCPUTemperature(temperatures)
 	metrics.PSUOutputPower = psuOutputPower
 	metrics.Memory = memory
+	metrics.MemorySwap = swap
 	metrics.Disks = disks
 	metrics.Network = network
+	metrics.Tailscale = tailscale
 	metrics.Temperatures = temperatures
 	metrics.GPU = gpu
 	return finishMetrics(metrics, started), nil
@@ -248,6 +262,35 @@ func windowsMemory(ctx context.Context) CapacityMetric {
 		return unavailableCapacity(err.Error())
 	}
 	return windowsMemoryCapacity(result.TotalVisibleMemorySize, result.FreePhysicalMemory)
+}
+
+// windowsSwap reports pagefile (the Windows analog of swap) usage from
+// Win32_PageFileUsage, summing AllocatedBaseSize/CurrentUsage (MiB) across all
+// page files. A host with no page file reports unavailable so the dashboard
+// shows a graceful "no swap". It runs on the slow lane because it spawns a
+// PowerShell/CIM query.
+func windowsSwap(ctx context.Context) CapacityMetric {
+	var rows []struct {
+		AllocatedBaseSize uint64
+		CurrentUsage      uint64
+	}
+	err := runPowerShellJSONArray(ctx, `Get-CimInstance Win32_PageFileUsage | Select-Object AllocatedBaseSize,CurrentUsage`, &rows)
+	if err != nil {
+		return unavailableCapacity(err.Error())
+	}
+	var allocated, current uint64
+	for _, row := range rows {
+		allocated += row.AllocatedBaseSize
+		current += row.CurrentUsage
+	}
+	if allocated == 0 {
+		return unavailableCapacity("no swap configured")
+	}
+	if current > allocated {
+		current = allocated
+	}
+	const mib = 1024 * 1024
+	return availableCapacity(current*mib, allocated*mib)
 }
 
 func windowsDisks(ctx context.Context) []DiskMetric {

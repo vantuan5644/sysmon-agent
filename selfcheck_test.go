@@ -203,6 +203,7 @@ func completeCoreMetrics() Metrics {
 		Capacity:   availableCapacity(50, 100),
 	}}
 	metrics.Network = NetworkSet{Available: false, Error: "network sampler is warming up"}
+	metrics.Tailscale = TailscaleStatus{Available: false, Error: "tailscale status unavailable"}
 	metrics.Temperatures = TemperatureSet{Available: false, Error: "no supported temperature sensors found"}
 	metrics.GPU = GPUSet{Available: false, Error: "GPU telemetry unavailable"}
 	return metrics

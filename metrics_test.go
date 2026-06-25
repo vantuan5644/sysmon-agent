@@ -206,6 +206,48 @@ func TestSummarizeCollectionErrorsReturnsNilWhenEverythingIsAvailable(t *testing
 	}
 }
 
+func TestSummarizeCollectionErrorsOmitsNoSwapConfiguredButReportsFailures(t *testing.T) {
+	available := func() Metrics {
+		metrics := baseMetrics("labbox")
+		metrics.CPU = availableNumber(10, "%")
+		metrics.Memory = availableCapacity(1, 2)
+		metrics.MemorySwap = unavailableCapacity("no swap configured")
+		metrics.Disks = []DiskMetric{{Name: "root", Mountpoint: "/", Capacity: availableCapacity(1, 2)}}
+		metrics.Network = NetworkSet{Available: true, Interfaces: []NetworkInterfaceMetric{{
+			Name:             "eth0",
+			RXBytesPerSecond: availableNumber(1, "B/s"),
+			TXBytesPerSecond: availableNumber(2, "B/s"),
+		}}}
+		metrics.Temperatures = TemperatureSet{Available: true, Sensors: []TemperatureMetric{{Name: "CPU", Celsius: availableNumber(42, "C")}}}
+		metrics.GPU = GPUSet{Available: true, Devices: []GPUMetric{{
+			Name:        "GPU",
+			Usage:       availableNumber(1, "%"),
+			Memory:      availableCapacity(1, 2),
+			Temperature: availableNumber(42, "C"),
+		}}}
+		return metrics
+	}
+
+	// "no swap configured" is a normal state and must not surface as an error...
+	if got := summarizeCollectionErrors(available()); got != nil {
+		t.Fatalf("collection errors for no-swap host = %#v, want nil", got)
+	}
+	// ...nor must an unset (zero-value) swap field ...
+	zeroSwap := available()
+	zeroSwap.MemorySwap = CapacityMetric{}
+	if got := summarizeCollectionErrors(zeroSwap); got != nil {
+		t.Fatalf("collection errors for unset swap = %#v, want nil", got)
+	}
+	// ...but a genuine swap read failure still rolls up.
+	failed := available()
+	failed.MemorySwap = unavailableCapacity("/proc/meminfo read denied")
+	got := summarizeCollectionErrors(failed)
+	want := []string{"swap: /proc/meminfo read denied"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("collection errors = %#v, want %#v", got, want)
+	}
+}
+
 func TestFinishMetricsRecordsDurationAndRefreshesCollectionErrors(t *testing.T) {
 	metrics := baseMetrics("labbox")
 	metrics.CPU = unavailableNumber("%", "cpu denied")
@@ -228,6 +270,42 @@ func TestFinishMetricsRecordsDurationAndRefreshesCollectionErrors(t *testing.T) 
 	}
 	if strings.Join(got.CollectionErrors, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("collection errors = %#v, want %#v", got.CollectionErrors, want)
+	}
+}
+
+// TestSummarizeCollectionErrorsOmitsTailscale locks in the intentional design
+// that an unavailable Tailscale status never becomes a collection error.
+// Tailscale is an optional status indicator, not a sensor expected on every
+// host: surfacing "tailscale CLI not found" would permanently flag every
+// non-Tailscale machine. Its state is shown only via the NET card status pill.
+func TestSummarizeCollectionErrorsOmitsTailscale(t *testing.T) {
+	metrics := baseMetrics("labbox")
+	metrics.CPU = availableNumber(10, "%")
+	metrics.Memory = availableCapacity(1, 2)
+	metrics.Disks = []DiskMetric{{Name: "root", Mountpoint: "/", Capacity: availableCapacity(1, 2)}}
+	metrics.Network = NetworkSet{Available: true, Interfaces: []NetworkInterfaceMetric{{
+		Name:             "eth0",
+		RXBytesPerSecond: availableNumber(1, "B/s"),
+		TXBytesPerSecond: availableNumber(2, "B/s"),
+	}}}
+	metrics.Temperatures = TemperatureSet{Available: true, Sensors: []TemperatureMetric{{Name: "CPU", Celsius: availableNumber(42, "C")}}}
+	metrics.GPU = GPUSet{Available: true, Devices: []GPUMetric{{
+		Name:        "GPU",
+		Usage:       availableNumber(1, "%"),
+		Memory:      availableCapacity(1, 2),
+		Temperature: availableNumber(42, "C"),
+	}}}
+	// Tailscale not installed / unavailable with a descriptive reason.
+	metrics.Tailscale = TailscaleStatus{Available: false, Error: "tailscale CLI not found"}
+
+	got := summarizeCollectionErrors(metrics)
+	for _, msg := range got {
+		if strings.Contains(msg, "tailscale") {
+			t.Fatalf("collection errors surfaced optional Tailscale status as an issue: %q\nfull: %#v", msg, got)
+		}
+	}
+	if len(got) != 0 {
+		t.Fatalf("collection errors = %#v, want empty when only optional Tailscale is unavailable", got)
 	}
 }
 

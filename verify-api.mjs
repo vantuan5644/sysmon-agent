@@ -7,7 +7,7 @@ const settingsRoundTrip = args.includes("--settings-roundtrip");
 const clientCheckRoundTrip = args.includes("--client-check-roundtrip");
 const baseURL = normalizeBaseURL(args.find((arg) => !arg.startsWith("--")) || defaultBaseURL);
 const timeoutMS = 5000;
-const dashboardBuild = "sysmon-static-v102";
+const dashboardBuild = "sysmon-static-v97";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,
@@ -211,7 +211,7 @@ function validateStatus(status, expectedSettings = {}) {
   assertNonEmptyString(status.os, "status.os");
   assertNonEmptyString(status.arch, "status.arch");
   assert(typeof status.settings_persisted === "boolean", "status.settings_persisted must be boolean");
-  assertArrayIncludes(status.refresh_options_ms, [250, 500, 1000, 2000], "status.refresh_options_ms");
+  assertArrayIncludes(status.refresh_options_ms, [1000, 1500, 2000], "status.refresh_options_ms");
   assertArrayIncludes(status.panel_options, ["all", "performance", "storage", "network", "sensors", "gpu"], "status.panel_options");
   validateSettings(status.settings, expectedSettings);
   validateClientCheck(status.client_check);
@@ -248,7 +248,7 @@ function validateSettings(settings, expected = {}) {
   assertObject(settings, "settings");
   assert(typeof settings.dim === "boolean", "settings.dim must be boolean");
   assert(typeof settings.shift === "boolean", "settings.shift must be boolean");
-  assert([250, 500, 1000, 2000].includes(settings.refresh_ms), "settings.refresh_ms must be 250, 500, 1000, or 2000");
+  assert([1000, 1500, 2000].includes(settings.refresh_ms), "settings.refresh_ms must be 1000, 1500, or 2000");
   assert(["all", "performance", "storage", "network", "sensors", "gpu"].includes(settings.panel), "settings.panel is invalid");
   validateThresholds(settings.thresholds, expected.thresholds || {});
   assertTimestamp(settings.updated_at, "settings.updated_at", { allowStale: true });
@@ -519,7 +519,7 @@ function sampleStatus(settings = sampleSettings()) {
     os: "linux",
     arch: "amd64",
     settings_persisted: true,
-    refresh_options_ms: [250, 500, 1000, 2000],
+    refresh_options_ms: [1000, 1500, 2000],
     panel_options: ["all", "gpu", "network", "performance", "sensors", "storage"],
     settings,
     client_check: sampleClientCheck(false),
@@ -545,7 +545,7 @@ function sampleMetrics() {
     hostname: "labbox",
     os: "linux",
     arch: "amd64",
-    platform: "6.8.0-generic",
+    platform: "6.8.0-homelab",
     timestamp: new Date().toISOString(),
     collection_duration_ms: 142,
     cpu_percent: { available: true, value: 37, unit: "%" },
@@ -605,7 +605,7 @@ function sampleSettings() {
   return {
     dim: false,
     shift: true,
-    refresh_ms: 1000,
+    refresh_ms: 1500,
     panel: "gpu",
     thresholds: {
       cpu_warn: 70,

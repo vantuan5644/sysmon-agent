@@ -4,10 +4,10 @@
   and start a fresh agent.
 
 .DESCRIPTION
-  Stop any running sysmon-agent on the target port, rebuild the Go binary,
-  and start a fresh agent. Use after editing Go sources or lhm-bridge.ps1 - the
-  bridge is embedded at build time via go:embed, so a rebuild is required for
-  bridge changes to take effect.
+  Mirrors the repo-level ./serve.sh build+restart cycle for Windows hosts.
+  Use after editing Go sources or lhm-bridge.ps1 - the bridge is embedded at
+  build time via go:embed, so a rebuild is required for bridge changes to take
+  effect.
 
 .PARAMETER Bind
   Bind address passed to the agent. Defaults to 0.0.0.0.

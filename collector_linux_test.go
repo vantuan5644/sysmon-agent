@@ -64,11 +64,13 @@ func TestParseCPUTimesRejectsOverflowingTotalCounters(t *testing.T) {
 }
 
 func TestParseMemInfo(t *testing.T) {
-	total, available, err := parseMemInfo(`MemTotal:       16384000 kB
+	total, available, swapTotal, swapFree, err := parseMemInfo(`MemTotal:       16384000 kB
 MemFree:         1024000 kB
 MemAvailable:    8192000 kB
 Buffers:          100000 kB
 Cached:           200000 kB
+SwapTotal:       4194304 kB
+SwapFree:        1048576 kB
 `)
 	if err != nil {
 		t.Fatal(err)
@@ -79,10 +81,16 @@ Cached:           200000 kB
 	if available != 8192000*1024 {
 		t.Fatalf("available = %d", available)
 	}
+	if swapTotal != 4194304*1024 {
+		t.Fatalf("swapTotal = %d", swapTotal)
+	}
+	if swapFree != 1048576*1024 {
+		t.Fatalf("swapFree = %d", swapFree)
+	}
 }
 
 func TestParseMemInfoFallback(t *testing.T) {
-	_, available, err := parseMemInfo(`MemTotal: 1000 kB
+	_, available, _, _, err := parseMemInfo(`MemTotal: 1000 kB
 MemFree: 100 kB
 Buffers: 50 kB
 Cached: 25 kB
@@ -96,7 +104,7 @@ Cached: 25 kB
 }
 
 func TestParseMemInfoRejectsOverflowingKilobytes(t *testing.T) {
-	_, _, err := parseMemInfo(`MemTotal: 18014398509481984 kB
+	_, _, _, _, err := parseMemInfo(`MemTotal: 18014398509481984 kB
 MemAvailable: 1000 kB
 `)
 	if err == nil {
@@ -108,7 +116,7 @@ MemAvailable: 1000 kB
 }
 
 func TestParseMemInfoRejectsOverflowingFallbackCounters(t *testing.T) {
-	_, _, err := parseMemInfo(`MemTotal: 1000 kB
+	_, _, _, _, err := parseMemInfo(`MemTotal: 1000 kB
 MemFree: 9007199254740991 kB
 Buffers: 9007199254740991 kB
 Cached: 1000 kB
@@ -360,15 +368,15 @@ func TestShouldIncludeMount(t *testing.T) {
 
 func TestIsRAPLPackageEntry(t *testing.T) {
 	cases := map[string]bool{
-		"intel-rapl:0":   true,
-		"intel-rapl:1":   true,
-		"intel-rapl:0:0": false,
-		"intel-rapl:0:2": false,
-		"intel-rapl":     false,
-		"intel-rapl:abc": false,
-		"intel-rapl:":    false,
-		"amd-rapl:0":     false,
-		"":               false,
+		"intel-rapl:0":     true,
+		"intel-rapl:1":     true,
+		"intel-rapl:0:0":   false,
+		"intel-rapl:0:2":   false,
+		"intel-rapl":       false,
+		"intel-rapl:abc":   false,
+		"intel-rapl:":      false,
+		"amd-rapl:0":       false,
+		"":                 false,
 	}
 	for name, want := range cases {
 		if got := isRAPLPackageEntry(name); got != want {
@@ -412,13 +420,13 @@ func TestReadRAPLCountersFiltersSubDomains(t *testing.T) {
 	pkg := filepath.Join(root, "intel-rapl:0")
 	sub := filepath.Join(root, "intel-rapl:0:0")
 	for path, value := range map[string]string{
-		filepath.Join(pkg, "energy_uj"):           "5000000",
+		filepath.Join(pkg, "energy_uj"):             "5000000",
 		filepath.Join(pkg, "max_energy_range_uj"): "262143999999999",
 		filepath.Join(sub, "energy_uj"):           "1000000",
 	} {
 		if err := writeTestFile(path, value); err != nil {
 			t.Fatal(err)
-		}
+	}
 	}
 	got, err := readRAPLCounters(root)
 	if err != nil {
@@ -438,8 +446,59 @@ func TestReadRAPLCountersFiltersSubDomains(t *testing.T) {
 
 func TestReadRAPLCountersEmptyWhenMissing(t *testing.T) {
 	root := t.TempDir()
-	if _, err := readRAPLCounters(root); err == nil {
+	_, err := readRAPLCounters(root)
+	if err == nil {
 		t.Fatal("expected error when no RAPL counters found")
+	}
+	if !strings.Contains(err.Error(), "no CPU package power counters found") {
+		t.Fatalf("expected the absent-message for an empty powercap tree, got %v", err)
+	}
+}
+
+func TestReadRAPLCountersUnreadableDistinguishesFromAbsent(t *testing.T) {
+	root := t.TempDir()
+	// A directory named energy_uj makes os.ReadFile fail (EISDIR) deterministically
+	// regardless of the test uid, so this branch exercises on root CI too.
+	pkg := filepath.Join(root, "intel-rapl:0")
+	if err := os.MkdirAll(filepath.Join(pkg, "energy_uj"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := readRAPLCounters(root)
+	if err == nil {
+		t.Fatal("expected error when package energy_uj is present but unreadable")
+	}
+	if !strings.Contains(err.Error(), "not readable") {
+		t.Fatalf("expected 'not readable' error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "RAPL not exposed") {
+		t.Fatalf("must not report the absent message for present-but-unreadable counters, got %v", err)
+	}
+}
+
+func TestReadRAPLCountersPermissionDeniedSurfacesUdevHint(t *testing.T) {
+	root := t.TempDir()
+	pkg := filepath.Join(root, "intel-rapl:0")
+	energy := filepath.Join(pkg, "energy_uj")
+	if err := os.MkdirAll(pkg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeTestFile(energy, "5000000"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(energy, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(energy, 0o644) }) // restore so t.TempDir cleanup can remove it
+
+	_, err := readRAPLCounters(root)
+	if err == nil {
+		t.Skip("energy_uj stayed readable (running as root); permission branch not exercisable here")
+	}
+	if !strings.Contains(err.Error(), "not readable") {
+		t.Fatalf("expected 'not readable' error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "99-powercap-rapl.rules") {
+		t.Fatalf("expected udev rule hint in permission error, got %v", err)
 	}
 }
 

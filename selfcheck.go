@@ -180,6 +180,14 @@ func validateMetricsShape(metrics Metrics) error {
 	if err := validateCapacityMetric("memory", metrics.Memory, false); err != nil {
 		return err
 	}
+	// memory_swap is optional -- many hosts run without swap or use zram, and the
+	// warming snapshot leaves it unset -- so an unavailable value (even with an
+	// empty error) is always accepted. Only validate its shape when present.
+	if metrics.MemorySwap.Available {
+		if err := validateCapacityMetric("memory_swap", metrics.MemorySwap, false); err != nil {
+			return err
+		}
+	}
 	if len(metrics.Disks) == 0 {
 		return fmt.Errorf("disks must include at least one local filesystem or unavailable placeholder")
 	}
@@ -198,6 +206,9 @@ func validateMetricsShape(metrics Metrics) error {
 		return err
 	}
 	if err := validateGPUSet(metrics.GPU); err != nil {
+		return err
+	}
+	if err := validateTailscaleStatus(metrics.Tailscale); err != nil {
 		return err
 	}
 	if err := validateCollectionErrors(metrics.CollectionErrors); err != nil {
@@ -282,6 +293,18 @@ func validateGPUSet(gpu GPUSet) error {
 		}
 		if err := validateNumberMetric(fmt.Sprintf("gpu.devices[%d].temperature_celsius", i), device.Temperature, true, "C"); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// validateTailscaleStatus mirrors the other set validators: an unavailable status
+// must carry a non-empty error so the dashboard can explain why. When
+// available, no further shape is required (booleans have no invalid state).
+func validateTailscaleStatus(tailscale TailscaleStatus) error {
+	if !tailscale.Available {
+		if strings.TrimSpace(tailscale.Error) == "" {
+			return fmt.Errorf("tailscale unavailable without an error")
 		}
 	}
 	return nil
@@ -439,7 +462,7 @@ func checkClientCheck(handler http.Handler) error {
 		return fmt.Errorf("GET /api/client-checks was not empty before dashboard POST")
 	}
 
-	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v102","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
+	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v107","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
 	if post.Code != http.StatusOK {
 		return fmt.Errorf("POST /api/client-check returned %d: %s", post.Code, strings.TrimSpace(post.Body.String()))
 	}

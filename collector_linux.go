@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -80,10 +81,12 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	var cpuClock NumberMetric
 	var cpuClockMax NumberMetric
 	var memory CapacityMetric
+	var swap CapacityMetric
 	var disks []DiskMetric
 	var network NetworkSet
 	var temperatures TemperatureSet
 	var gpu GPUSet
+	var tailscale TailscaleStatus
 
 	collectMetricAsync(&wg, &cpu, func() NumberMetric {
 		return c.collectCPU(ctx)
@@ -104,8 +107,11 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return unavailableNumber("MHz", fmt.Sprintf("Linux CPU clock collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &memory, func() CapacityMetric {
-		return collectMemory()
+		m, s := collectMemoryAndSwap()
+		swap = s
+		return m
 	}, func(recovered any) CapacityMetric {
+		swap = unavailableCapacity(fmt.Sprintf("Linux memory collector panicked: %v", recovered))
 		return unavailableCapacity(fmt.Sprintf("Linux memory collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &disks, func() []DiskMetric {
@@ -128,6 +134,11 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	}, func(recovered any) GPUSet {
 		return GPUSet{Available: false, Error: fmt.Sprintf("Linux GPU collector panicked: %v", recovered)}
 	})
+	collectMetricAsync(&wg, &tailscale, func() TailscaleStatus {
+		return readTailscaleStatus(ctx)
+	}, func(recovered any) TailscaleStatus {
+		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Linux Tailscale collector panicked: %v", recovered)}
+	})
 	wg.Wait()
 
 	metrics.CPU = cpu
@@ -137,8 +148,10 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.CPUTemperature = pickCPUTemperature(temperatures)
 	metrics.PSUOutputPower = unavailableNumber("W", "no PSU output power sensor exposed on Linux")
 	metrics.Memory = memory
+	metrics.MemorySwap = swap
 	metrics.Disks = disks
 	metrics.Network = network
+	metrics.Tailscale = tailscale
 	metrics.Temperatures = temperatures
 	metrics.GPU = gpu
 	return finishMetrics(metrics, started), nil
@@ -157,18 +170,21 @@ func (c *systemCollector) CollectFast(ctx context.Context) (patch func(*Metrics)
 		if r := recover(); r != nil {
 			cpu := unavailableNumber("%", fmt.Sprintf("Linux CPU collector panicked: %v", r))
 			memory := unavailableCapacity(fmt.Sprintf("Linux memory collector panicked: %v", r))
+			swap := unavailableCapacity(fmt.Sprintf("Linux memory collector panicked: %v", r))
 			patch = func(m *Metrics) {
 				m.CPU = cpu
 				m.Memory = memory
+				m.MemorySwap = swap
 			}
 		}
 	}()
 
 	cpu := c.collectCPU(ctx)
-	memory := collectMemory()
+	memory, swap := collectMemoryAndSwap()
 	return func(m *Metrics) {
 		m.CPU = cpu
 		m.Memory = memory
+		m.MemorySwap = swap
 	}
 }
 
@@ -192,6 +208,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	var network NetworkSet
 	var temperatures TemperatureSet
 	var gpu GPUSet
+	var tailscale TailscaleStatus
 
 	collectMetricAsync(&wg, &cpuPower, func() NumberMetric {
 		return c.collectCPUPower(ctx)
@@ -226,6 +243,11 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	}, func(recovered any) GPUSet {
 		return GPUSet{Available: false, Error: fmt.Sprintf("Linux GPU collector panicked: %v", recovered)}
 	})
+	collectMetricAsync(&wg, &tailscale, func() TailscaleStatus {
+		return readTailscaleStatus(ctx)
+	}, func(recovered any) TailscaleStatus {
+		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Linux Tailscale collector panicked: %v", recovered)}
+	})
 	wg.Wait()
 
 	cpuTemperature := pickCPUTemperature(temperatures)
@@ -238,6 +260,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		m.PSUOutputPower = unavailableNumber("W", "no PSU output power sensor exposed on Linux")
 		m.Disks = disks
 		m.Network = network
+		m.Tailscale = tailscale
 		m.Temperatures = temperatures
 		m.GPU = gpu
 	}
@@ -256,6 +279,7 @@ func linuxDegradedSlowPatch(message string) func(*Metrics) {
 		m.PSUOutputPower = unavailableNumber("W", message)
 		m.Disks = unavailableDisk(message)
 		m.Network = NetworkSet{Available: false, Error: message}
+		m.Tailscale = TailscaleStatus{Available: false, Error: message}
 		m.Temperatures = TemperatureSet{Available: false, Error: message}
 		m.GPU = GPUSet{Available: false, Error: message}
 	}
@@ -391,9 +415,7 @@ func computeRAPLPower(prev, current map[string]raplCounter, elapsed float64) Num
 			return unavailableNumber("W", "CPU energy counter wrapped without a known range")
 		}
 		totalDeltaUJ += delta
-		if delta > 0 {
-			advanced = true
-		}
+		advanced = true
 	}
 	if !advanced {
 		return unavailableNumber("W", "CPU energy counters did not advance")
@@ -424,22 +446,55 @@ func readRAPLCounters(root string) (map[string]raplCounter, error) {
 		return nil, err
 	}
 	counters := map[string]raplCounter{}
+	packageEntries := 0
+	var firstEnergyErr error
 	for _, dir := range matches {
 		if !isRAPLPackageEntry(filepath.Base(dir)) {
 			continue
 		}
+		packageEntries++
 		energyPath := filepath.Join(dir, "energy_uj")
-		energy, ok := readUint64File(energyPath)
-		if !ok {
+		energy, readErr := readRAPLEnergyUJ(energyPath)
+		if readErr != nil {
+			if firstEnergyErr == nil {
+				firstEnergyErr = readErr
+			}
 			continue
 		}
 		maxUJ, _ := readUint64File(filepath.Join(dir, "max_energy_range_uj"))
 		counters[energyPath] = raplCounter{energyUJ: energy, maxUJ: maxUJ}
 	}
 	if len(counters) == 0 {
-		return nil, fmt.Errorf("no CPU package power counters found")
+		// Distinguish "no RAPL interface exposed" (VMs, locked BIOS) from
+		// "interface present but unreadable". The latter is almost always the
+		// kernel's default 0400 root-only mode on energy_uj hitting an
+		// unprivileged agent; surface that cause and the udev fix explicitly so
+		// the error string is actionable instead of the misleading "no counters".
+		if packageEntries > 0 && firstEnergyErr != nil {
+			msg := fmt.Sprintf("RAPL package energy counters present but not readable: %v", firstEnergyErr)
+			if errors.Is(firstEnergyErr, os.ErrPermission) {
+				msg += " (check access to /sys/class/powercap/intel-rapl:*/energy_uj; install scripts/udev/99-powercap-rapl.rules for unprivileged access)"
+			}
+			return nil, errors.New(msg)
+		}
+		return nil, errors.New("no CPU package power counters found (RAPL not exposed; common inside VMs or with a locked-down BIOS)")
 	}
 	return counters, nil
+}
+
+// readRAPLEnergyUJ reads a RAPL energy_uj counter, returning the underlying
+// error (e.g. EACCES) so readRAPLCounters can tell "present but unreadable"
+// from "absent". Unlike readUint64File, it does not swallow the cause.
+func readRAPLEnergyUJ(path string) (uint64, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	value, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
 }
 
 // isRAPLPackageEntry matches package-level RAPL directories such as
@@ -615,7 +670,7 @@ func parseCPUTimes(data string) (cpuTimes, error) {
 }
 
 func collectMemory() CapacityMetric {
-	total, available, err := readMemInfo()
+	total, available, _, _, err := readMemInfo()
 	if err != nil {
 		return unavailableCapacity(err.Error())
 	}
@@ -625,15 +680,40 @@ func collectMemory() CapacityMetric {
 	return availableCapacity(total-available, total)
 }
 
-func readMemInfo() (total uint64, available uint64, err error) {
+// collectMemoryAndSwap parses /proc/meminfo once and returns both the physical
+// memory and swap capacity metrics, so the fast lane does not read the file
+// twice. Swap used = SwapTotal - SwapFree; a host with no swap (SwapTotal == 0)
+// reports unavailable so the dashboard shows a graceful "no swap".
+func collectMemoryAndSwap() (memory, swap CapacityMetric) {
+	total, available, swapTotal, swapFree, err := readMemInfo()
+	if err != nil {
+		msg := err.Error()
+		return unavailableCapacity(msg), unavailableCapacity(msg)
+	}
+	if total == 0 || available > total {
+		memory = unavailableCapacity("invalid memory counters")
+	} else {
+		memory = availableCapacity(total-available, total)
+	}
+	if swapTotal == 0 {
+		swap = unavailableCapacity("no swap configured")
+	} else if swapFree > swapTotal {
+		swap = unavailableCapacity("invalid swap counters")
+	} else {
+		swap = availableCapacity(swapTotal-swapFree, swapTotal)
+	}
+	return memory, swap
+}
+
+func readMemInfo() (total, available, swapTotal, swapFree uint64, err error) {
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	return parseMemInfo(string(data))
 }
 
-func parseMemInfo(data string) (total uint64, available uint64, err error) {
+func parseMemInfo(data string) (total, available, swapTotal, swapFree uint64, err error) {
 	values := map[string]uint64{}
 	scanner := bufio.NewScanner(strings.NewReader(data))
 	for scanner.Scan() {
@@ -648,12 +728,12 @@ func parseMemInfo(data string) (total uint64, available uint64, err error) {
 		}
 		bytes, ok := kibToBytes(value)
 		if !ok {
-			return 0, 0, fmt.Errorf("invalid /proc/meminfo value for %s", key)
+			return 0, 0, 0, 0, fmt.Errorf("invalid /proc/meminfo value for %s", key)
 		}
 		values[key] = bytes
 	}
 	if err := scanner.Err(); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 
 	total = values["MemTotal"]
@@ -662,13 +742,13 @@ func parseMemInfo(data string) (total uint64, available uint64, err error) {
 		var ok bool
 		available, ok = sumUint64(values["MemFree"], values["Buffers"], values["Cached"])
 		if !ok {
-			return 0, 0, fmt.Errorf("invalid /proc/meminfo fallback counters")
+			return 0, 0, 0, 0, fmt.Errorf("invalid /proc/meminfo fallback counters")
 		}
 	}
 	if total == 0 {
-		return 0, 0, fmt.Errorf("MemTotal missing from /proc/meminfo")
+		return 0, 0, 0, 0, fmt.Errorf("MemTotal missing from /proc/meminfo")
 	}
-	return total, available, nil
+	return total, available, values["SwapTotal"], values["SwapFree"], nil
 }
 
 type mountInfo struct {

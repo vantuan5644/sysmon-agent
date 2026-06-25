@@ -377,6 +377,7 @@ h2 {
 .gauge-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-rows: 1fr;
   gap: 12px;
 }
 
@@ -400,6 +401,8 @@ h2 {
   min-width: 0;
   padding: 10px 6px 8px;
   text-align: center;
+  display: flex;
+  flex-direction: column;
 }
 
 .gauge {
@@ -503,13 +506,36 @@ h2 {
   color: var(--bad);
 }
 
+/* Tailscale status pills in the NET card detail line: a single row of
+   colour-coded icons with no visible text, so the line never wraps. Each pill
+   carries its state via the icon colour (currentColor) and an aria-label. */
+.ts-pill {
+  display: inline-flex;
+  align-items: center;
+}
+.ts-pill + .ts-pill {
+  margin-left: 0.55em;
+}
+.ts-pill svg {
+  display: block;
+}
+.ts-on {
+  color: var(--good);
+}
+.ts-bad {
+  color: var(--bad);
+}
+.ts-dim {
+  color: var(--muted);
+}
+
 .sparkline {
   display: grid;
   grid-template-columns: repeat(24, minmax(0, 1fr));
   align-items: end;
   gap: 2px;
   height: 18px;
-  margin-top: 7px;
+  margin-top: auto;
   padding: 0 2px;
 }
 

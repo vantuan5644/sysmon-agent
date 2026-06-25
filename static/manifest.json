@@ -1,7 +1,7 @@
 {
-  "name": "Sysmon",
+  "name": "Homelab Sysmon",
   "short_name": "Sysmon",
-  "description": "Live CPU, GPU, RAM, disk, network, and temperature dashboard for your computer, installable as an app on any device.",
+  "description": "Live CPU, GPU, RAM, disk, network, and temperature dashboard for homelab hosts, installable on any device.",
   "id": "/",
   "start_url": "/",
   "scope": "/",

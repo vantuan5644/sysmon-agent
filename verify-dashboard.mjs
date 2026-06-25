@@ -68,7 +68,17 @@ class Element {
   }
 
   get textContent() {
-    return this._textContent;
+    if (this.children.length === 0) {
+      return this._textContent;
+    }
+    // Real browsers concatenate every descendant's text; mirror that so
+    // detail lines built from child spans (e.g. the NET Tailscale pills)
+    // read back as a single string.
+    let text = this._textContent;
+    for (const child of this.children) {
+      text += child && typeof child === "object" ? (child.textContent ?? "") : String(child);
+    }
+    return text;
   }
 
   set textContent(value) {
@@ -142,6 +152,10 @@ class Document {
     return new Element(tagName);
   }
 
+  createElementNS(_ns, tagName) {
+    return new Element(tagName);
+  }
+
   getElementById(id) {
     const element = this.elements.get(id);
     if (!element) {
@@ -192,7 +206,7 @@ function sampleMetrics() {
     hostname: "labbox",
     os: "linux",
     arch: "amd64",
-    platform: "6.8.0-generic",
+    platform: "6.8.0-homelab",
     timestamp: new Date().toISOString(),
     collection_duration_ms: 142,
     cpu_percent: { available: true, value: 37, unit: "%" },
@@ -202,6 +216,7 @@ function sampleMetrics() {
     cpu_clock_max: { available: true, value: 5200, unit: "MHz" },
     cpu_temperature: { available: true, value: 52.0, unit: "C" },
     memory: { available: true, used_bytes: 8589934592, total_bytes: 17179869184, percent: 50 },
+    memory_swap: { available: true, used_bytes: 2147483648, total_bytes: 8589934592, percent: 25 },
     disks: [{
       name: "root",
       mountpoint: "/",
@@ -218,6 +233,7 @@ function sampleMetrics() {
         tx_bytes_per_second: { available: true, value: 1024, unit: "B/s" },
       }],
     },
+    tailscale: { available: true, online: true, exit_node_enabled: false },
     temperatures: {
       available: true,
       sensors: [
@@ -277,8 +293,17 @@ function manyIssueMetrics() {
 
 function alertMetrics() {
   const metrics = sampleMetrics();
+  // Primary-gauge readings are pushed high on purpose: CPU/RAM/GPU usage and
+  // the CPU/GPU die temperatures already turn their own rings/detail lines red,
+  // so they must NOT also flood the alerts panel. Only disk usage and auxiliary
+  // temperature sensors (board, water, PSU) -- none of which have a card --
+  // should surface as alerts here.
   metrics.cpu_percent = { available: true, value: 86, unit: "%" };
+  metrics.cpu_temperature = { available: true, value: 82, unit: "C" };
   metrics.memory = { available: true, used_bytes: 80, total_bytes: 100, percent: 80 };
+  metrics.gpu.devices[0].usage_percent = { available: true, value: 92, unit: "%" };
+  metrics.gpu.devices[0].memory = { available: true, used_bytes: 90, total_bytes: 100, percent: 90 };
+  metrics.gpu.devices[0].temperature_celsius = { available: true, value: 82, unit: "C" };
   metrics.disks = [
     {
       name: "root",
@@ -292,11 +317,26 @@ function alertMetrics() {
       fs_type: "ext4",
       capacity: { available: true, used_bytes: 91, total_bytes: 100, percent: 91 },
     },
+    {
+      name: "media",
+      mountpoint: "/media",
+      fs_type: "ext4",
+      capacity: { available: true, used_bytes: 90, total_bytes: 100, percent: 90 },
+    },
+    {
+      name: "photos",
+      mountpoint: "/photos",
+      fs_type: "ext4",
+      capacity: { available: true, used_bytes: 89, total_bytes: 100, percent: 89 },
+    },
   ];
-  metrics.gpu.devices[0].usage_percent = { available: true, value: 92, unit: "%" };
-  metrics.gpu.devices[0].memory = { available: true, used_bytes: 90, total_bytes: 100, percent: 90 };
-  metrics.gpu.devices[0].temperature_celsius = { available: true, value: 82, unit: "C" };
-  metrics.temperatures.sensors = [{ name: "CPU", celsius: { available: true, value: 82, unit: "C" } }];
+  metrics.temperatures.sensors = [
+    { name: "CPU Package", celsius: { available: true, value: 82, unit: "C" } },
+    { name: "GPU Core", celsius: { available: true, value: 82, unit: "C" } },
+    { name: "Motherboard", celsius: { available: true, value: 75, unit: "C" } },
+    { name: "Water In", celsius: { available: true, value: 74, unit: "C" } },
+    { name: "PSU", celsius: { available: true, value: 73, unit: "C" } },
+  ];
   return metrics;
 }
 
@@ -417,7 +457,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v102",
+    dashboard_build: "sysmon-static-v107",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -435,7 +475,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v102",
+    dashboard_build: "sysmon-static-v107",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -697,16 +737,24 @@ const initialClientCheckRequestCount = clientCheckRequests;
 assert(document.getElementById("hostname").textContent === "labbox", "hostname did not render");
 assert(document.getElementById("cpuValue").textContent === "37%", "CPU gauge did not render");
 assert(document.getElementById("cpuSub").textContent === "3.60 GHz", "CPU gauge sub did not render live clock");
-assert(document.getElementById("cpuDetail").textContent === "52C · 88.5 W", "CPU card detail did not render temp + power");
+assert(document.getElementById("cpuDetail").textContent === "52°C · 88.5 W", "CPU card detail did not render temp + power");
 assert(document.getElementById("memValue").textContent === "50%", "memory gauge did not render");
 assert(document.getElementById("memSub").textContent === "8.0 GB / 16 GB", "memory gauge sub did not render used/total");
-assert(document.getElementById("memDetail").textContent === "8.0 GB free", "memory card detail did not render free headroom");
+assert(document.getElementById("memDetail").textContent === "⇅ 2.0 GB swap", "memory card detail did not render live swap used");
 assert(document.getElementById("gpuValue").textContent === "25%", "GPU gauge did not render");
 assert(document.getElementById("gpuSub").textContent === "2.0 GB / 8.0 GB", "GPU gauge sub did not render VRAM used/total");
-assert(document.getElementById("gpuDetail").textContent === "49C · 112 W", "GPU card detail did not render temp + power");
+assert(document.getElementById("gpuDetail").textContent === "49°C · 112 W", "GPU card detail did not render temp + power");
 assert(document.getElementById("netValue").textContent.includes("2.0K"), "NET gauge did not render download rate");
 assert(document.getElementById("netSub").textContent.includes("1.0K"), "NET gauge sub did not render upload rate");
-assert(document.getElementById("netDetail").textContent === "2.0 KB/s down / 1.0 KB/s up", "NET card detail did not render throughput");
+assert(document.getElementById("netDetail").textContent === "", "NET card detail rendered unexpected text (icons should carry no visible text)");
+{
+  const tsPills = document.getElementById("netDetail").children;
+  assert(tsPills.length === 2, "NET card detail did not render two Tailscale status pills");
+  assert(tsPills[0].getAttribute("aria-label") === "Tailscale online", "NET Tailscale pill did not report online state");
+  assert(tsPills[0].classList.values.has("ts-on") === true, "NET Tailscale pill was not coloured online");
+  assert(tsPills[1].getAttribute("aria-label") === "Exit node off", "NET exit-node pill did not report off state");
+  assert(tsPills[1].classList.values.has("ts-dim") === true, "NET exit-node pill was not coloured off");
+}
 assert(sparklineBars("cpuTrend").length === 24, "CPU sparkline did not render fixed sample slots");
 assert(sparklineBars("memTrend").length === 24, "memory sparkline did not render fixed sample slots");
 assert(sparklineBars("gpuTrend").length === 24, "GPU sparkline did not render fixed sample slots");
@@ -727,7 +775,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v102, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v107, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 await document.getElementById("statusStrip").click();
 await flushMicrotasks();
 assert(context.reloadCount() === 1, "stale dashboard status-strip tap did not reload the app");
@@ -762,7 +810,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v102; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v107; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -772,7 +820,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v102",
+    dashboard_build: "sysmon-static-v107",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -782,7 +830,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v102",
+    dashboard_build: "sysmon-static-v107",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -822,14 +870,14 @@ context.render(alertMetrics());
 const alertsPanel = document.getElementById("alertsPanel");
 const alertsList = document.getElementById("alertsList");
 assert(alertsPanel.hidden === false, "threshold breaches did not show alerts panel");
-assert(document.getElementById("alertsSummary").textContent === "8 alerts", "threshold alerts summary did not render count");
+assert(document.getElementById("alertsSummary").textContent === "7 alerts", "threshold alerts summary did not render count");
 assert(alertsPanel.getAttribute("aria-expanded") === "false", "many threshold alerts started expanded");
 assert(alertsList.children.length === 6, "collapsed alerts did not show five rows plus overflow count");
-assert(alertsList.children[0].textContent === "CPU 86% over 70%", "alert row did not render CPU threshold breach");
-assert(alertsList.children[5].textContent === "3 more", "collapsed alerts did not show remaining count");
+assert(alertsList.children[0].textContent === "Disk / 92% over 70%", "alert row did not render disk threshold breach");
+assert(alertsList.children[5].textContent === "2 more", "collapsed alerts did not show remaining count");
 await alertsPanel.click();
 assert(alertsPanel.getAttribute("aria-expanded") === "true", "alert panel tap did not expand details");
-assert(alertsList.children.length === 8, "expanded alerts did not render every alert");
+assert(alertsList.children.length === 7, "expanded alerts did not render every alert");
 const alertCollapseKey = await alertsPanel.dispatch("keydown", { key: " " });
 assert(alertCollapseKey.defaultPrevented === true, "alert panel space key did not prevent default scrolling");
 assert(alertsPanel.getAttribute("aria-expanded") === "false", "alert panel space key did not collapse details");
@@ -861,7 +909,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v102", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v107", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");

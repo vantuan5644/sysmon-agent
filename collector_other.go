@@ -32,6 +32,7 @@ func (c unsupportedCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.Memory = unavailableCapacity("unsupported operating system")
 	metrics.Disks = unavailableDisk("unsupported operating system")
 	metrics.Network = NetworkSet{Available: false, Error: "unsupported operating system"}
+	metrics.Tailscale = TailscaleStatus{Available: false, Error: "unsupported operating system"}
 	metrics.Temperatures = TemperatureSet{Available: false, Error: "unsupported operating system"}
 	metrics.GPU = GPUSet{Available: false, Error: "unsupported operating system"}
 	return finishMetrics(metrics, started), nil
