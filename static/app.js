@@ -56,7 +56,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v107";
+const dashboardBuild = "sysmon-static-v108";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 const defaultThresholds = {
@@ -102,6 +102,10 @@ const clientCheckDebounceMS = 500;
 const collapsedIssueLimit = 5;
 const sparklineSampleLimit = 24;
 const wakePreferenceKey = "sysmon:wake-wanted";
+
+// Set by setupPager so content re-renders (e.g. the Issues list growing) can ask
+// the pager to re-measure the active page and resize to fit it.
+let pagerSyncHeight = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -160,8 +164,44 @@ function setupPager() {
   if (!pager || dots.some((dot) => !dot)) {
     return;
   }
+  // querySelectorAll is feature-guarded so the headless verifier's id-only DOM
+  // mock yields an empty list (syncHeight then no-ops) instead of throwing.
+  const pages =
+    typeof pager.querySelectorAll === "function"
+      ? Array.from(pager.querySelectorAll(".page"))
+      : [];
   const pageCount = dots.length;
   let activePage = 0;
+
+  // Landscape kiosk mode (CSS `@media (orientation: landscape) and
+  // (max-height: 500px)`) deliberately flexes the pager to fill the viewport
+  // height, so leave its height to CSS there and only pin a height in the
+  // portrait/desktop layout.
+  const landscapeQuery =
+    typeof window.matchMedia === "function"
+      ? window.matchMedia("(orientation: landscape) and (max-height: 500px)")
+      : null;
+
+  // syncHeight pins the pager to the ACTIVE page's natural height. Because the
+  // CSS uses `align-items: flex-start`, each page keeps its own content height
+  // (it is never stretched to the taller sibling), so offsetHeight here is the
+  // real height of the page we are showing. Setting it on the flex container
+  // collapses the dead space the taller page would otherwise leave below the
+  // shorter one. Guarded so the headless verifier's layout-less DOM is a no-op.
+  const syncHeight = () => {
+    if (!pages.length || typeof pager.getBoundingClientRect !== "function") {
+      return;
+    }
+    if (landscapeQuery && landscapeQuery.matches) {
+      pager.style.height = "";
+      return;
+    }
+    const active = pages[activePage];
+    if (active && active.offsetHeight > 0) {
+      pager.style.height = `${active.offsetHeight}px`;
+    }
+  };
+  pagerSyncHeight = syncHeight;
 
   const setActive = (index) => {
     const clamped = Math.max(0, Math.min(pageCount - 1, index));
@@ -176,11 +216,19 @@ function setupPager() {
     });
   };
 
+  // Re-measure once the horizontal swipe settles rather than mid-scroll, so a
+  // taller incoming page only grows the pager after it has snapped into place
+  // (the swipe itself stays at the outgoing page's height and looks smooth).
+  let settleTimer = null;
   pager.addEventListener("scroll", () => {
     const width = pager.clientWidth || 0;
     if (width > 0) {
       setActive(Math.round((pager.scrollLeft || 0) / width));
     }
+    if (settleTimer) {
+      clearTimeout(settleTimer);
+    }
+    settleTimer = setTimeout(syncHeight, 90);
   });
 
   dots.forEach((dot, index) => {
@@ -192,8 +240,22 @@ function setupPager() {
         pager.scrollLeft = width * index;
       }
       setActive(index);
+      syncHeight();
     });
   });
+
+  if (landscapeQuery) {
+    const onModeChange = () => syncHeight();
+    if (typeof landscapeQuery.addEventListener === "function") {
+      landscapeQuery.addEventListener("change", onModeChange);
+    } else if (typeof landscapeQuery.addListener === "function") {
+      landscapeQuery.addListener(onModeChange);
+    }
+  }
+
+  window.addEventListener("resize", syncHeight);
+  window.addEventListener("orientationchange", syncHeight);
+  syncHeight();
 }
 
 function schedulePolling() {
@@ -1200,6 +1262,7 @@ function renderIssuesPanel() {
   list.textContent = "";
   if (messages.length === 0) {
     summary.textContent = "--";
+    syncPagerAfterRender();
     return;
   }
 
@@ -1210,6 +1273,16 @@ function renderIssuesPanel() {
   }
   if (!state.issuesExpanded && messages.length > collapsedIssueLimit) {
     list.append(issueRow(`${messages.length - collapsedIssueLimit} more`));
+  }
+  syncPagerAfterRender();
+}
+
+// renderIssuesPanel changes the height of the second pager page (the issue list
+// grows/shrinks, or expands on tap), so let the pager re-measure and resize to
+// the active page. No-op until setupPager has run / in the layout-less verifier.
+function syncPagerAfterRender() {
+  if (typeof pagerSyncHeight === "function") {
+    pagerSyncHeight();
   }
 }
 

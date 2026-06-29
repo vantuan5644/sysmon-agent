@@ -291,6 +291,14 @@ h2 {
    so the pager re-enables horizontal panning for the swipe. */
 .pager {
   display: flex;
+  /* Pages have different natural heights (the gauges page is fixed; the Issues
+     page grows with the issue count). A flex row sizes itself to the TALLER page
+     and stretches the shorter one, leaving dead space below it -- the "blank
+     below the gauges" when issues pile up. flex-start keeps each page at its
+     natural height so it stays measurable, and app.js (setupPager) pins the
+     pager to the ACTIVE page's height so neither page shows filler. */
+  align-items: flex-start;
+  transition: height 0.18s ease;
   margin-top: 4px;
   overflow-x: auto;
   overflow-y: hidden;

@@ -1,4 +1,4 @@
-const STATIC_CACHE = "sysmon-static-v107";
+const STATIC_CACHE = "sysmon-static-v108";
 const STATIC_ASSETS = ["/", "/styles.css", "/app.js", "/manifest.json", "/icon.svg", "/icon-180.png", "/icon-512.png"];
 const STATIC_ASSET_SET = new Set(STATIC_ASSETS);
 

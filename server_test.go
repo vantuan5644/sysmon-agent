@@ -581,7 +581,7 @@ func TestClientCheckHandlerRecordsDashboardVisit(t *testing.T) {
 	}
 
 	post := httptest.NewRecorder()
-	postReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v107","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
+	postReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v108","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
 	postReq.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
 	postReq.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile Safari")
 	handler.ServeHTTP(post, postReq)
@@ -686,7 +686,7 @@ func TestStatusKeepsDeviceClientCheckAfterHistoryRotates(t *testing.T) {
 	}
 
 	device := httptest.NewRecorder()
-	deviceReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v107","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
+	deviceReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v108","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
 	deviceReq.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
 	deviceReq.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile Safari")
 	handler.ServeHTTP(device, deviceReq)

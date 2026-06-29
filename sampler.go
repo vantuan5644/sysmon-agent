@@ -159,6 +159,15 @@ func (s *sampler) Start() {
 	s.cancel = cancel
 	s.mu.Unlock()
 
+	// Enable the persistent platform bridge (the LibreHardwareMonitor daemon on
+	// Windows) now that the sampler is entering steady-state serving. This is
+	// gated on Start() rather than lazy creation so one-shot modes such as
+	// -self-check - which never Start() the sampler - keep the per-sample bridge
+	// and spawn nothing long-lived.
+	if br, ok := s.inner.(interface{ EnablePersistentBridge() }); ok {
+		br.EnablePersistentBridge()
+	}
+
 	if s.lanes == nil {
 		s.wg.Add(1)
 		go s.runWholeLoop(ctx)
@@ -180,6 +189,11 @@ func (s *sampler) Stop() {
 	}
 	cancel()
 	s.wg.Wait()
+	// Tear down persistent resources the inner collector owns (the LHM daemon on
+	// Windows) so a graceful stop / service STOP leaves no orphaned child.
+	if closer, ok := s.inner.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
 }
 
 func (s *sampler) runFastLoop(ctx context.Context) {

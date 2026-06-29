@@ -7,6 +7,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -56,11 +57,19 @@ type systemCollector struct {
 	lhmBridgeResult   lhmBridgeResult
 	lhmBridgeErr      error
 	lhmBridgeAt       time.Time
-	mu                sync.Mutex
-	prevNet           map[string]netCounter
-	prevNetAt         time.Time
-	prevCPUFast       cpuFastSample
-	prevCPUFastSet    bool
+	// useDaemon selects the persistent LibreHardwareMonitor bridge daemon over
+	// the one-shot bridge. It is set by EnablePersistentBridge() when the
+	// sampler starts (and SYSMON_LHM_DAEMON is not explicitly disabled), so
+	// one-shot modes such as -self-check - which never start the sampler - keep
+	// using the per-sample bridge and spawn nothing long-lived. Guarded by
+	// lhmMu alongside the cache fields below it.
+	useDaemon      bool
+	daemon         *lhmDaemon
+	mu             sync.Mutex
+	prevNet        map[string]netCounter
+	prevNetAt      time.Time
+	prevCPUFast    cpuFastSample
+	prevCPUFastSet bool
 }
 
 type netCounter struct {
@@ -83,6 +92,34 @@ func NewSystemCollector() MetricsCollector {
 // Hostname exposes the resolved hostname so the sampler's warming snapshot can
 // carry it before the first lane pass (see collectorHostname in sampler.go).
 func (c *systemCollector) Hostname() string { return c.hostname }
+
+// EnablePersistentBridge switches the LibreHardwareMonitor path from the
+// per-sample one-shot bridge to the long-lived daemon (see lhm_bridge_windows.go).
+// It is gated on SYSMON_LHM_DAEMON (default on) and is called by the sampler on
+// Start(), so -self-check - which never starts the sampler - keeps the one-shot
+// path and spawns no daemon.
+func (c *systemCollector) EnablePersistentBridge() {
+	if !envBool("SYSMON_LHM_DAEMON", true) {
+		return
+	}
+	c.lhmMu.Lock()
+	c.useDaemon = true
+	c.lhmMu.Unlock()
+}
+
+// Close tears down any persistent resource owned by the collector - the LHM
+// daemon on Windows. It implements io.Closer so the sampler's Stop() closes the
+// inner collector on graceful shutdown, sending stdin EOF (clean pwsh exit) and
+// best-effort-killing any lingering process so a service stop leaves no orphan.
+func (c *systemCollector) Close() error {
+	c.lhmMu.Lock()
+	daemon := c.daemon
+	c.lhmMu.Unlock()
+	if daemon == nil {
+		return nil
+	}
+	return daemon.Close()
+}
 
 func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	started := time.Now()
@@ -452,13 +489,18 @@ type lhmBridgeTemp struct {
 // bridge requires PowerShell 7+ because modern LibreHardwareMonitorLib.dll is
 // built for .NET and cannot be loaded by Windows PowerShell 5.1, so the bridge
 // host prefers pwsh and falls back to powershell.exe only as a last resort.
-func runLhmBridge(ctx context.Context) (lhmBridgeResult, error) {
+//
+// It is a package var so tests can stub the one-shot fallback exercised when
+// the persistent daemon disables itself.
+var runLhmBridge = runLhmBridgeOnce
+
+func runLhmBridgeOnce(ctx context.Context) (lhmBridgeResult, error) {
 	scriptPath, err := lhmBridgePath()
 	if err != nil {
 		return lhmBridgeResult{}, err
 	}
 
-	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	queryCtx, cancel := context.WithTimeout(ctx, lhmBridgeTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(
@@ -573,17 +615,38 @@ func lhmTemperatureMetrics(temps []lhmBridgeTemp, existing []TemperatureMetric) 
 	return out
 }
 
-// lhmBridgeCacheTTL bounds how often the agent re-invokes the LibreHardwareMonitor
-// bridge within a single metrics refresh cycle. Concurrent metric groups all
-// share the cached payload because LHM's kernel driver fails when more than one
-// Computer.Open() runs at the same time. The TTL is kept comfortably above the
-// metrics cache window and the default dashboard interval so the driver is
-// recycled at most once every couple of seconds; faster recycling starves the
-// driver and degrades readings to stale/partial values.
-const lhmBridgeCacheTTL = 2500 * time.Millisecond
+// lhmBridgeCacheTTL bounds how often the agent re-reads the LibreHardwareMonitor
+// bridge within a burst of requests. With the persistent daemon (default on at
+// sampler Start) reads are sub-second, so this window is kept short: it merely
+// coalesces a cold direct-Collect() racing a slow-lane pass into a single read.
+// The slow lane (default 1.5 s) therefore refreshes CPU power / clocks / PSU /
+// temperatures every pass instead of serving a stale payload. The serialization
+// mutex (c.lhmMu) plus the daemon's own lock still guarantee the LHM kernel
+// driver is never opened twice at once.
+const lhmBridgeCacheTTL = 500 * time.Millisecond
 
-// fetchLhmBridge runs the embedded lhm-bridge.ps1 at most once per cache window
-// so parallel CPU power and temperature collectors share a single payload. The
+// lhmBridgeTimeout bounds the one-shot bridge invocation (runLhmBridge) and the
+// daemon's cold first read after a (re)start - both still pay Computer.Open()
+// up front, which loads the ring0 driver and enumerates the SuperIO/SMBus/PSU/
+// CPU/GPU/memory sensors. One one-shot run is intrinsically slow: spawn pwsh,
+// load LibreHardwareMonitorLib.dll, Open(), then a 400 ms sensor-prime settle.
+// Measured warm cost is ~4-5 s and the very first call after boot (cold driver
+// load) is slower still, which is why the rest of the agent already budgets 8 s
+// for a cold sample (metricsCollectTimeout). The previous 5 s ceiling sat right
+// on top of the warm cost, so under the LocalSystem service it was routinely
+// exceeded; Go's CommandContext kills a timed-out child with
+// TerminateProcess(handle, 1), so the kill surfaced as a bare "exit status 1"
+// with no stdout/stderr and took CPU power, CPU/board temperatures and PSU
+// output power down together. 12 s gives the warm (~5 s) and cold (~8 s) cases
+// comfortable headroom. Steady-state daemon reads use the much shorter
+// lhmDaemonWarmReadTimeout instead; this constant only bounds the cold first
+// read / one-shot fallback path.
+const lhmBridgeTimeout = 12 * time.Second
+
+// fetchLhmBridge returns the shared LibreHardwareMonitor payload for a metrics
+// refresh, at most once per cache window. When the persistent daemon is enabled
+// (EnablePersistentBridge, default on at sampler Start) it reads from the
+// long-lived process; otherwise it falls back to the one-shot bridge. The
 // serialization also protects the underlying LibreHardwareMonitorLib driver,
 // which errors out if two host processes open it simultaneously.
 func (c *systemCollector) fetchLhmBridge(ctx context.Context) (lhmBridgeResult, error) {
@@ -593,12 +656,40 @@ func (c *systemCollector) fetchLhmBridge(ctx context.Context) (lhmBridgeResult, 
 	if c.lhmBridgeCached && now.Sub(c.lhmBridgeAt) < lhmBridgeCacheTTL {
 		return c.lhmBridgeResult, c.lhmBridgeErr
 	}
-	result, err := runLhmBridge(ctx)
+	var result lhmBridgeResult
+	var err error
+	if c.useDaemon {
+		result, err = c.fetchDaemonLhmBridgeLocked(ctx)
+	} else {
+		result, err = runLhmBridge(ctx)
+	}
 	c.lhmBridgeResult = result
 	c.lhmBridgeErr = err
 	c.lhmBridgeAt = now
 	c.lhmBridgeCached = true
 	return result, err
+}
+
+// fetchDaemonLhmBridgeLocked reads one payload from the persistent LHM daemon,
+// lazily creating it on first use. On a permanent daemon failure (pwsh / DLL
+// missing -> errLhmDaemonDisabled) it falls back to the one-shot bridge, which
+// itself degrades to available:false with the install hint, so a broken daemon
+// is never worse than today's behavior. On a transient transport failure
+// (timeout / crash / EOF / backoff) it degrades just this sample to unavailable
+// rather than spawn a second pwsh (the one-shot would race the same driver);
+// the daemon has already scheduled a restart and the next slow pass heals.
+func (c *systemCollector) fetchDaemonLhmBridgeLocked(ctx context.Context) (lhmBridgeResult, error) {
+	if c.daemon == nil {
+		c.daemon = &lhmDaemon{}
+	}
+	result, derr := c.daemon.read(ctx)
+	if derr == nil {
+		return result, nil
+	}
+	if errors.Is(derr, errLhmDaemonDisabled) {
+		return runLhmBridge(ctx)
+	}
+	return lhmBridgeResult{Available: false, Error: "LibreHardwareMonitor daemon read failed: " + derr.Error()}, nil
 }
 
 func windowsCPUPowerFromBridge(result lhmBridgeResult, err error) NumberMetric {
