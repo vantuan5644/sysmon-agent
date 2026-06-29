@@ -19,6 +19,11 @@ settings.json
 # Logs
 *.log
 
+# Showcase source videos — only the smaller GIFs in assets/ are committed
+/assets/*.mov
+/assets/*.MOV
+/assets/*.mp4
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db
