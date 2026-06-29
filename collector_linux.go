@@ -21,11 +21,24 @@ type systemCollector struct {
 	hostname    string
 	mu          sync.Mutex
 	prevCPU     cpuTimes
+	prevPerCore []cpuTimes
 	prevNet     map[string]netCounter
 	prevNetAt   time.Time
 	prevRAPL    map[string]raplCounter
 	prevRAPLAt  time.Time
 	prevRAPLSet bool
+
+	// hardwareOnce resolves the static identity strings (CPU model, RAM
+	// type/speed) exactly once -- they never change at runtime and RAM needs a
+	// dmidecode spawn -- so the slow lane reuses the cached values every pass.
+	hardwareOnce sync.Once
+	cpuName      string
+	memoryName   string
+
+	// uplink caches the active network identity (Wi-Fi SSID / wired link) with a
+	// short TTL so the slow lane does not spawn `iw`/`nmcli` on every pass.
+	uplink   NetworkUplink
+	uplinkAt time.Time
 }
 
 type cpuTimes struct {
@@ -59,6 +72,9 @@ func NewSystemCollector() MetricsCollector {
 	if cpu, err := readCPUTimes(); err == nil {
 		c.prevCPU = cpu
 	}
+	if perCore, err := readPerCoreCPUTimes(); err == nil {
+		c.prevPerCore = perCore
+	}
 	if netCounters, err := readNetCounters(); err == nil {
 		c.prevNet = netCounters
 	}
@@ -74,6 +90,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	started := time.Now()
 	metrics := baseMetrics(c.hostname)
 	metrics.Platform = readFirstLine("/proc/sys/kernel/osrelease")
+	metrics.CPUName, metrics.MemoryName = c.resolveHardwareNames(ctx)
 
 	var wg sync.WaitGroup
 	var cpu NumberMetric
@@ -142,6 +159,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	wg.Wait()
 
 	metrics.CPU = cpu
+	metrics.CPUCores = c.collectCPUCores(ctx)
 	metrics.CPUPower = cpuPower
 	metrics.CPUClock = cpuClock
 	metrics.CPUClockMax = cpuClockMax
@@ -169,10 +187,12 @@ func (c *systemCollector) CollectFast(ctx context.Context) (patch func(*Metrics)
 	defer func() {
 		if r := recover(); r != nil {
 			cpu := unavailableNumber("%", fmt.Sprintf("Linux CPU collector panicked: %v", r))
+			cores := unavailableCPUCores(fmt.Sprintf("Linux CPU collector panicked: %v", r))
 			memory := unavailableCapacity(fmt.Sprintf("Linux memory collector panicked: %v", r))
 			swap := unavailableCapacity(fmt.Sprintf("Linux memory collector panicked: %v", r))
 			patch = func(m *Metrics) {
 				m.CPU = cpu
+				m.CPUCores = cores
 				m.Memory = memory
 				m.MemorySwap = swap
 			}
@@ -180,9 +200,11 @@ func (c *systemCollector) CollectFast(ctx context.Context) (patch func(*Metrics)
 	}()
 
 	cpu := c.collectCPU(ctx)
+	cores := c.collectCPUCores(ctx)
 	memory, swap := collectMemoryAndSwap()
 	return func(m *Metrics) {
 		m.CPU = cpu
+		m.CPUCores = cores
 		m.Memory = memory
 		m.MemorySwap = swap
 	}
@@ -199,6 +221,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	}()
 
 	platform := readFirstLine("/proc/sys/kernel/osrelease")
+	cpuName, memoryName := c.resolveHardwareNames(ctx)
 
 	var wg sync.WaitGroup
 	var cpuPower NumberMetric
@@ -253,6 +276,8 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	cpuTemperature := pickCPUTemperature(temperatures)
 	return func(m *Metrics) {
 		m.Platform = platform
+		m.CPUName = cpuName
+		m.MemoryName = memoryName
 		m.CPUPower = cpuPower
 		m.CPUClock = cpuClock
 		m.CPUClockMax = cpuClockMax
@@ -328,6 +353,61 @@ func (c *systemCollector) sampleCPUAfterDelayWithReader(ctx context.Context, pre
 		return unavailableNumber("%", "CPU sampler is warming up")
 	}
 	return availableNumber(value, "%")
+}
+
+// collectCPUCores reports per-core utilization by deltaing the per-core jiffy
+// counters against the previous sample. It mirrors collectCPU: with no prior
+// per-core sample (first call) or a changed core count (CPU hot-plug) it takes a
+// brief second read so the first snapshot still carries real values, then
+// degrades the whole set to unavailable rather than returning a hard error.
+func (c *systemCollector) collectCPUCores(ctx context.Context) CPUCoreSet {
+	now, err := readPerCoreCPUTimes()
+	if err != nil {
+		return unavailableCPUCores(err.Error())
+	}
+
+	c.mu.Lock()
+	prev := c.prevPerCore
+	c.prevPerCore = now
+	c.mu.Unlock()
+
+	if len(prev) == 0 || len(prev) != len(now) {
+		return c.samplePerCoreAfterDelay(ctx, now, 100*time.Millisecond)
+	}
+	return perCoreUsage(prev, now)
+}
+
+func (c *systemCollector) samplePerCoreAfterDelay(ctx context.Context, prev []cpuTimes, delay time.Duration) CPUCoreSet {
+	if err := waitForSample(ctx, delay); err != nil {
+		return unavailableCPUCores("per-core sampler canceled: " + err.Error())
+	}
+	later, err := readPerCoreCPUTimes()
+	if err != nil {
+		return unavailableCPUCores(err.Error())
+	}
+	c.mu.Lock()
+	c.prevPerCore = later
+	c.mu.Unlock()
+
+	if len(prev) == 0 || len(prev) != len(later) {
+		return unavailableCPUCores("per-core sampler is warming up")
+	}
+	return perCoreUsage(prev, later)
+}
+
+// perCoreUsage turns two equal-length per-core samples into busy percentages
+// (one per core, rounded to one decimal). A core whose counters did not advance
+// is reported as idle rather than dropped, so Cores stays index-aligned.
+func perCoreUsage(prev, now []cpuTimes) CPUCoreSet {
+	cores := make([]float64, len(now))
+	for i := range now {
+		value, ok := cpuUsagePercent(prev[i], now[i])
+		if !ok {
+			value = 0
+		}
+		cores[i] = round(value, 1)
+	}
+	return availableCPUCores(cores)
 }
 
 func cpuUsagePercent(prev, now cpuTimes) (float64, bool) {
@@ -415,7 +495,12 @@ func computeRAPLPower(prev, current map[string]raplCounter, elapsed float64) Num
 			return unavailableNumber("W", "CPU energy counter wrapped without a known range")
 		}
 		totalDeltaUJ += delta
-		advanced = true
+		// Only count the counter as advanced when energy actually accrued. A
+		// matched package with a zero delta means the counter is stuck (the CPU
+		// is always drawing some power), so it must degrade rather than report 0 W.
+		if delta > 0 {
+			advanced = true
+		}
 	}
 	if !advanced {
 		return unavailableNumber("W", "CPU energy counters did not advance")
@@ -634,39 +719,95 @@ func parseCPUTimes(data string) (cpuTimes, error) {
 		if !strings.HasPrefix(line, "cpu ") {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 5 {
-			return cpuTimes{}, fmt.Errorf("invalid /proc/stat cpu line")
-		}
-
-		var total uint64
-		values := make([]uint64, 0, len(fields)-1)
-		for _, field := range fields[1:] {
-			value, err := strconv.ParseUint(field, 10, 64)
-			if err != nil {
-				return cpuTimes{}, fmt.Errorf("invalid /proc/stat value %q", field)
-			}
-			values = append(values, value)
-			nextTotal, ok := sumUint64(total, value)
-			if !ok {
-				return cpuTimes{}, fmt.Errorf("invalid /proc/stat cpu counters")
-			}
-			total = nextTotal
-		}
-		idle := values[3]
-		if len(values) > 4 {
-			combinedIdle, ok := sumUint64(idle, values[4])
-			if !ok {
-				return cpuTimes{}, fmt.Errorf("invalid /proc/stat idle counters")
-			}
-			idle = combinedIdle
-		}
-		return cpuTimes{idle: idle, total: total}, nil
+		return parseCPULineFields(strings.Fields(line)[1:])
 	}
 	if err := scanner.Err(); err != nil {
 		return cpuTimes{}, err
 	}
 	return cpuTimes{}, fmt.Errorf("missing cpu line in /proc/stat")
+}
+
+// parseCPULineFields converts the numeric jiffy counters of a /proc/stat cpu
+// line (the fields after the "cpu"/"cpuN" label) into an idle+total pair. It is
+// shared by the aggregate (parseCPUTimes) and per-core (parsePerCoreCPUTimes)
+// paths so both apply the same overflow checks and idle = idle+iowait rule.
+func parseCPULineFields(numbers []string) (cpuTimes, error) {
+	if len(numbers) < 4 {
+		return cpuTimes{}, fmt.Errorf("invalid /proc/stat cpu line")
+	}
+	var total uint64
+	values := make([]uint64, 0, len(numbers))
+	for _, field := range numbers {
+		value, err := strconv.ParseUint(field, 10, 64)
+		if err != nil {
+			return cpuTimes{}, fmt.Errorf("invalid /proc/stat value %q", field)
+		}
+		values = append(values, value)
+		nextTotal, ok := sumUint64(total, value)
+		if !ok {
+			return cpuTimes{}, fmt.Errorf("invalid /proc/stat cpu counters")
+		}
+		total = nextTotal
+	}
+	idle := values[3]
+	if len(values) > 4 {
+		combinedIdle, ok := sumUint64(idle, values[4])
+		if !ok {
+			return cpuTimes{}, fmt.Errorf("invalid /proc/stat idle counters")
+		}
+		idle = combinedIdle
+	}
+	return cpuTimes{idle: idle, total: total}, nil
+}
+
+func readPerCoreCPUTimes() ([]cpuTimes, error) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return nil, err
+	}
+	return parsePerCoreCPUTimes(string(data))
+}
+
+// parsePerCoreCPUTimes returns one cpuTimes per logical core from the "cpu0",
+// "cpu1", ... lines of /proc/stat, ordered by their appearance (core index).
+// The aggregate "cpu " line and any non-"cpuN" line are skipped.
+func parsePerCoreCPUTimes(data string) ([]cpuTimes, error) {
+	var cores []cpuTimes
+	scanner := bufio.NewScanner(strings.NewReader(data))
+	for scanner.Scan() {
+		fields := strings.Fields(strings.TrimSpace(scanner.Text()))
+		if len(fields) == 0 {
+			continue
+		}
+		label := fields[0]
+		if len(label) <= 3 || label[:3] != "cpu" || !isAllDigits(label[3:]) {
+			continue
+		}
+		core, err := parseCPULineFields(fields[1:])
+		if err != nil {
+			return nil, err
+		}
+		cores = append(cores, core)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if len(cores) == 0 {
+		return nil, fmt.Errorf("no per-core cpu lines in /proc/stat")
+	}
+	return cores, nil
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func collectMemory() CapacityMetric {
@@ -926,7 +1067,15 @@ func diskName(device string) string {
 	return device
 }
 
+// collectNetwork builds the per-interface throughput set and attaches the
+// active-network identity (Wi-Fi SSID / wired link) for the NET card.
 func (c *systemCollector) collectNetwork(ctx context.Context) NetworkSet {
+	set := c.collectNetworkRates(ctx)
+	set.Uplink = c.collectNetworkUplink(ctx)
+	return set
+}
+
+func (c *systemCollector) collectNetworkRates(ctx context.Context) NetworkSet {
 	nowCounters, err := readNetCounters()
 	if err != nil {
 		return NetworkSet{Available: false, Error: err.Error()}

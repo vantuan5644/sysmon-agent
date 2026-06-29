@@ -163,10 +163,10 @@ function writeFixture(root) {
       </div>
     </section>
     <section class="gauge-grid" aria-label="Primary metrics">
-      ${gaugeCard("CPU", 37, "37%", "var(--good)")}
-      ${gaugeCard("RAM", 61, "61%", "var(--good)")}
-      ${gaugeCard("GPU", 74, "74%", "var(--warn)")}
-      ${gaugeCard("TEMP", 68, "68C", "var(--good)")}
+      ${gaugeCard("CPU", 37, "37%", "var(--good)", "AMD Ryzen 9 7950X", "52°C · 88 W", coreGridMock())}
+      ${gaugeCard("GPU", 74, "74%", "var(--warn)", "NVIDIA GeForce RTX 4090", "61°C · 320 W", sparkline(74, "var(--warn)"))}
+      ${gaugeCard("RAM", 61, "61%", "var(--good)", "DDR5 · 6000 MT/s", "⇅ 1.2 GB swap", sparkline(61, "var(--good)"))}
+      ${gaugeCard("NET", 30, "3.0M", "var(--accent)", "BiBi-Pro-Max", netDetailMock(), sparkline(30, "var(--accent)"))}
     </section>
     ${panel("Performance", "CPU 37% / RAM 61%", [
       rowWithBar("CPU", "", "37%", 37, "var(--good)"),
@@ -346,15 +346,35 @@ function assertNarrowPhoneLayoutFits() {
   }
 }
 
-function gaugeCard(label, percent, value, color) {
+function gaugeCard(label, percent, value, color, identity, detail, bottom) {
   return `<article class="metric-card" role="button" tabindex="0" aria-label="${label}">
     <div class="gauge" style="--p:${percent}; --c:${color}">
       <div class="gauge-ring-inner" style="--inner-p:${percent}; --inner-c:${color}"></div>
       <div class="gauge-center"><span class="gauge-value">${value}</span><span class="gauge-sub">--</span></div>
     </div>
     <div class="metric-label">${label}</div>
-    ${sparkline(percent, color)}
+    <div class="card-id">${identity}</div>
+    <div class="card-detail">${detail}</div>
+    ${bottom}
   </article>`;
+}
+
+// coreGridMock mirrors the CPU card's per-core bottom row (renderCoreGrid): a
+// "busy N/M" count plus one bar per core, a couple highlighted as busy.
+function coreGridMock() {
+  const bars = [];
+  for (let index = 0; index < 16; index += 1) {
+    const value = index % 5 === 0 ? 92 : 6 + ((index * 7) % 28);
+    const busyClass = value >= 80 ? " busy" : "";
+    bars.push(`<span class="core-bar${busyClass}" style="--h:${Math.max(8, value)}%"></span>`);
+  }
+  return `<div class="core-grid"><span class="core-grid-label busy">busy 4/16</span><span class="core-grid-bars">${bars.join("")}</span></div>`;
+}
+
+// netDetailMock mirrors the NET card's detail line (renderNetDetail): the
+// leading "Tailscale" label followed by two coloured connectivity pills.
+function netDetailMock() {
+  return `<span class="ts-label">Tailscale</span><span class="ts-pill ts-on" role="img" aria-label="Tailscale online">&#9651;</span><span class="ts-pill ts-dim" role="img" aria-label="Exit node off">&#8690;</span>`;
 }
 
 function sparkline(percent, color) {

@@ -30,7 +30,11 @@ func TestPWAInstallMetadata(t *testing.T) {
 		`id="issuesPanel" class="panel issues-panel" role="button" tabindex="0" aria-label="Issue details" aria-expanded="false" aria-live="polite" hidden`,
 		`id="issuesSummary"`,
 		`id="issuesList"`,
-		`id="cpuTrend" aria-hidden="true"`,
+		`id="cpuCores" aria-live="polite"`,
+		`id="cpuName" aria-live="polite"`,
+		`id="gpuName" aria-live="polite"`,
+		`id="memName" aria-live="polite"`,
+		`id="netName" aria-live="polite"`,
 		`id="memTrend" aria-hidden="true"`,
 		`id="gpuTrend" aria-hidden="true"`,
 		`id="netTrend" aria-hidden="true"`,
@@ -125,7 +129,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v108"`,
+		`const STATIC_CACHE = "sysmon-static-v111"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -295,7 +299,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 3000;`,
-		`const dashboardBuild = "sysmon-static-v108";`,
+		`const dashboardBuild = "sysmon-static-v111";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -1247,13 +1251,13 @@ func TestDashboardRendersPrimaryMetricSparklines(t *testing.T) {
 	}
 	indexHTML := string(index)
 	for _, needle := range []string{
-		`<div class="sparkline" id="cpuTrend" aria-hidden="true"></div>`,
+		`<div class="core-grid" id="cpuCores" aria-live="polite"></div>`,
 		`<div class="sparkline" id="memTrend" aria-hidden="true"></div>`,
 		`<div class="sparkline" id="gpuTrend" aria-hidden="true"></div>`,
 		`<div class="sparkline" id="netTrend" aria-hidden="true"></div>`,
 	} {
 		if !strings.Contains(indexHTML, needle) {
-			t.Fatalf("index.html missing primary metric sparkline markup %q", needle)
+			t.Fatalf("index.html missing primary metric bottom-row markup %q", needle)
 		}
 	}
 
@@ -1268,7 +1272,6 @@ func TestDashboardRendersPrimaryMetricSparklines(t *testing.T) {
 		`appendPrimaryMetricHistory({`,
 		`net: net.available ? { available: true, value: netRingPercent(net.rx) } : unavailable(),`,
 		`function appendPrimaryMetricHistory(metrics) {`,
-		`renderSparkline("cpuTrend", state.history.cpu, thresholdValue("cpu_warn"));`,
 		`renderSparkline("netTrend", state.history.net, netRingWarnPercent);`,
 		`function appendMetricHistory(key, metric) {`,
 		`metric?.available ? clamp(metric.value, 0, 100) : null`,

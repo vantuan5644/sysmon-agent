@@ -130,6 +130,7 @@ func warmingMetrics(hostname string) Metrics {
 	m := baseMetrics(hostname)
 	const warming = "sampler is warming up"
 	m.CPU = unavailableNumber("%", warming)
+	m.CPUCores = unavailableCPUCores(warming)
 	m.CPUPower = unavailableNumber("W", warming)
 	m.CPUClock = unavailableNumber("MHz", warming)
 	m.CPUClockMax = unavailableNumber("MHz", warming)

@@ -63,6 +63,7 @@ func (c *systemCollector) CollectFast(ctx context.Context) (patch func(*Metrics)
 			memory := unavailableCapacity(fmt.Sprintf("Windows memory collector panicked: %v", r))
 			patch = func(m *Metrics) {
 				m.CPU = cpu
+				m.CPUCores = windowsCPUCores()
 				m.Memory = memory
 			}
 		}
@@ -72,8 +73,17 @@ func (c *systemCollector) CollectFast(ctx context.Context) (patch func(*Metrics)
 	memory := windowsMemoryFast()
 	return func(m *Metrics) {
 		m.CPU = cpu
+		m.CPUCores = windowsCPUCores()
 		m.Memory = memory
 	}
+}
+
+// windowsCPUCores degrades per-core utilization on Windows. GetSystemTimes (the
+// fast lane's CPU source) reports only aggregate times; per-core data needs an
+// NtQuerySystemInformation(SystemProcessorPerformanceInformation) walk that is
+// not yet wired up, so the set reports unavailable rather than a wrong value.
+func windowsCPUCores() CPUCoreSet {
+	return unavailableCPUCores("per-core utilization not yet implemented on Windows")
 }
 
 // CollectSlow gathers the expensive metrics (platform string, CPU power/clock,

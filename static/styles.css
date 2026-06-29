@@ -496,6 +496,23 @@ h2 {
   font-weight: 700;
 }
 
+/* Per-card identity line (CPU model, GPU model, RAM type/speed, Wi-Fi SSID or
+   wired link). One non-wrapping line with ellipsis so long model names never
+   change the card height; min-height reserves the row even when a field is
+   unavailable, keeping all four cards the same height. */
+.card-id {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 650;
+  line-height: 1.15;
+  min-height: 0.95rem;
+  margin: 1px 0 0;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .card-detail {
   color: var(--text);
   font-size: 1.02rem;
@@ -517,6 +534,14 @@ h2 {
 /* Tailscale status pills in the NET card detail line: a single row of
    colour-coded icons with no visible text, so the line never wraps. Each pill
    carries its state via the icon colour (currentColor) and an aria-label. */
+/* Leading "Tailscale" label naming the connectivity icons that follow. */
+.ts-label {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 650;
+  margin-right: 0.5em;
+}
+
 .ts-pill {
   display: inline-flex;
   align-items: center;
@@ -561,6 +586,60 @@ h2 {
   height: 3px;
   background: #394656;
   opacity: 0.56;
+}
+
+/* CPU per-core utilization grid: a "busy N/M" count next to one thin bar per
+   logical core (bar height = that core's busy %). A glance shows whether load
+   sits on one core (single-threaded) or spreads across many (multi-threaded).
+   Bars at/above the busy threshold are highlighted. Hidden when unavailable
+   (the renderer leaves the element empty). */
+/* The CPU card's bottom row (per-core bars). It occupies the same slot the
+   other cards give their trend sparkline -- pinned to the card bottom with a
+   matching min-height -- so the four cards stay the same height even while the
+   grid is empty (warmup, or platforms without per-core data). */
+.core-grid {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 18px;
+  margin-top: auto;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.core-grid-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.core-grid-label.busy {
+  color: var(--accent);
+}
+
+.core-grid-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 14px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.core-bar {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 2px;
+  height: var(--h, 2px);
+  border-radius: 1px;
+  background: var(--muted);
+  opacity: 0.45;
+}
+
+.core-bar.busy {
+  background: var(--accent);
+  opacity: 0.95;
 }
 
 .panel {

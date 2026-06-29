@@ -209,12 +209,15 @@ function sampleMetrics() {
     platform: "6.8.0-homelab",
     timestamp: new Date().toISOString(),
     collection_duration_ms: 142,
+    cpu_name: "AMD Ryzen 9 7950X",
+    memory_name: "DDR5 · 6000 MT/s",
     cpu_percent: { available: true, value: 37, unit: "%" },
     cpu_power: { available: true, value: 88.5, unit: "W" },
     psu_output_power: { available: true, value: 312.5, unit: "W" },
     cpu_clock: { available: true, value: 3600, unit: "MHz" },
     cpu_clock_max: { available: true, value: 5200, unit: "MHz" },
     cpu_temperature: { available: true, value: 52.0, unit: "C" },
+    cpu_cores: { available: true, cores: [95, 12, 88, 4, 70, 3, 2, 1], count: 8, busy: 2, busy_threshold: 80 },
     memory: { available: true, used_bytes: 8589934592, total_bytes: 17179869184, percent: 50 },
     memory_swap: { available: true, used_bytes: 2147483648, total_bytes: 8589934592, percent: 25 },
     disks: [{
@@ -225,6 +228,7 @@ function sampleMetrics() {
     }],
     network: {
       available: true,
+      uplink: { available: true, kind: "wifi", name: "BiBi-Pro-Max" },
       interfaces: [{
         name: "eth0",
         rx_bytes_total: 100000,
@@ -379,6 +383,7 @@ function resetNetworkMetrics() {
 function malformedNumericMetrics() {
   const metrics = sampleMetrics();
   metrics.cpu_percent = { available: true, value: Number.NaN, unit: "%" };
+  metrics.cpu_clock = { available: true, value: Number.NaN, unit: "MHz" };
   metrics.cpu_temperature = { available: true, value: Number.NaN, unit: "C" };
   metrics.memory = { available: true, used_bytes: "bad", total_bytes: Number.POSITIVE_INFINITY, percent: Number.POSITIVE_INFINITY };
   metrics.disks = [{
@@ -457,7 +462,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v108",
+    dashboard_build: "sysmon-static-v111",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -475,7 +480,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v108",
+    dashboard_build: "sysmon-static-v111",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -737,7 +742,12 @@ const initialClientCheckRequestCount = clientCheckRequests;
 assert(document.getElementById("hostname").textContent === "labbox", "hostname did not render");
 assert(document.getElementById("cpuValue").textContent === "37%", "CPU gauge did not render");
 assert(document.getElementById("cpuSub").textContent === "3.60 GHz", "CPU gauge sub did not render live clock");
+assert(!document.getElementById("cpuGauge").classList.contains("hide-inner"), "available CPU clock did not show the inner ring");
+assert(document.getElementById("cpuGauge").style.values.get("--inner-p") === String(3600 / 5200 * 100), "CPU clock inner ring fill did not scale clock against max clock");
+assert(document.getElementById("cpuGauge").style.values.get("--inner-c") === "var(--accent)", "CPU clock inner ring did not use the steady accent color");
 assert(document.getElementById("cpuDetail").textContent === "52°C · 88.5 W", "CPU card detail did not render temp + power");
+assert(document.getElementById("cpuCores").children[0].textContent === "busy 2/8", "CPU core grid did not render busy count");
+assert(document.getElementById("cpuCores").children[1].children.length === 8, "CPU core grid did not render one bar per core");
 assert(document.getElementById("memValue").textContent === "50%", "memory gauge did not render");
 assert(document.getElementById("memSub").textContent === "8.0 GB / 16 GB", "memory gauge sub did not render used/total");
 assert(document.getElementById("memDetail").textContent === "⇅ 2.0 GB swap", "memory card detail did not render live swap used");
@@ -746,20 +756,24 @@ assert(document.getElementById("gpuSub").textContent === "2.0 GB / 8.0 GB", "GPU
 assert(document.getElementById("gpuDetail").textContent === "49°C · 112 W", "GPU card detail did not render temp + power");
 assert(document.getElementById("netValue").textContent.includes("2.0K"), "NET gauge did not render download rate");
 assert(document.getElementById("netSub").textContent.includes("1.0K"), "NET gauge sub did not render upload rate");
-assert(document.getElementById("netDetail").textContent === "", "NET card detail rendered unexpected text (icons should carry no visible text)");
+assert(document.getElementById("cpuName").textContent === "AMD Ryzen 9 7950X", "CPU identity line did not render the CPU model");
+assert(document.getElementById("gpuName").textContent === "GPU 0", "GPU identity line did not render the GPU model");
+assert(document.getElementById("memName").textContent === "DDR5 · 6000 MT/s", "RAM identity line did not render type + speed");
+assert(document.getElementById("netName").textContent === "BiBi-Pro-Max", "NET identity line did not render the Wi-Fi SSID");
+assert(document.getElementById("netDetail").textContent === "Tailscale", "NET card detail did not render the Tailscale label");
 {
-  const tsPills = document.getElementById("netDetail").children;
-  assert(tsPills.length === 2, "NET card detail did not render two Tailscale status pills");
+  const netChildren = document.getElementById("netDetail").children;
+  assert(netChildren.length === 3, "NET card detail did not render a Tailscale label plus two status pills");
+  assert(netChildren[0].textContent === "Tailscale", "NET card detail did not lead with the 'Tailscale' label");
+  const tsPills = [netChildren[1], netChildren[2]];
   assert(tsPills[0].getAttribute("aria-label") === "Tailscale online", "NET Tailscale pill did not report online state");
   assert(tsPills[0].classList.values.has("ts-on") === true, "NET Tailscale pill was not coloured online");
   assert(tsPills[1].getAttribute("aria-label") === "Exit node off", "NET exit-node pill did not report off state");
   assert(tsPills[1].classList.values.has("ts-dim") === true, "NET exit-node pill was not coloured off");
 }
-assert(sparklineBars("cpuTrend").length === 24, "CPU sparkline did not render fixed sample slots");
 assert(sparklineBars("memTrend").length === 24, "memory sparkline did not render fixed sample slots");
 assert(sparklineBars("gpuTrend").length === 24, "GPU sparkline did not render fixed sample slots");
 assert(sparklineBars("netTrend").length === 24, "network sparkline did not render fixed sample slots");
-assert(lastSparklineBar("cpuTrend").style.values.get("--h") === "37%", "CPU sparkline did not render latest value");
 assert(lastSparklineBar("memTrend").style.values.get("--h") === "50%", "memory sparkline did not render latest value");
 assert(lastSparklineBar("gpuTrend").style.values.get("--h") === "25%", "GPU sparkline did not render latest value");
 assert(lastSparklineBar("netTrend").style.values.get("--h") === "6%", "network sparkline did not render floored latest value");
@@ -775,7 +789,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v108, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v111, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 await document.getElementById("statusStrip").click();
 await flushMicrotasks();
 assert(context.reloadCount() === 1, "stale dashboard status-strip tap did not reload the app");
@@ -810,7 +824,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v108; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v111; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -820,7 +834,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v108",
+    dashboard_build: "sysmon-static-v111",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -830,7 +844,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v108",
+    dashboard_build: "sysmon-static-v111",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -909,7 +923,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v108", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v111", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -1595,7 +1609,7 @@ assert(document.getElementById("cpuGauge").classList.contains("unavailable"), "m
 assert(document.getElementById("cpuGauge").style.values.get("--p") === "100", "malformed CPU gauge did not use full muted ring");
 assert(document.getElementById("cpuGauge").style.values.get("--c") === "#394656", "malformed CPU gauge did not use muted color");
 assert(document.getElementById("memGauge").classList.contains("unavailable"), "malformed memory gauge did not get unavailable class");
-assert(document.getElementById("cpuGauge").classList.contains("hide-inner"), "malformed CPU temperature did not hide the inner ring");
+assert(document.getElementById("cpuGauge").classList.contains("hide-inner"), "malformed CPU clock did not hide the inner ring");
 
 context.render(malformedCapacityCountersMetrics());
 assert(document.getElementById("memValue").textContent === "NA", "malformed memory byte counters did not render as NA");
@@ -1615,7 +1629,7 @@ assert(document.getElementById("gpuDetail").textContent === "--", "partial GPU f
 context.render(degradedMetrics());
 assert(document.getElementById("gpuValue").textContent === "NA", "unavailable GPU gauge did not render as NA");
 assert(document.getElementById("netValue").textContent === "NA", "unavailable network did not mute the NET gauge");
-assert(document.getElementById("cpuGauge").classList.contains("hide-inner"), "unavailable CPU temperature did not hide the inner ring");
+assert(!document.getElementById("cpuGauge").classList.contains("hide-inner"), "unavailable CPU temperature wrongly hid the clock-driven inner ring");
 assert(lastSparklineBar("gpuTrend").classList.contains("unavailable"), "unavailable GPU sample did not render muted sparkline bar");
 assert(lastSparklineBar("netTrend").classList.contains("unavailable"), "unavailable network sample did not render muted sparkline bar");
 assert(document.getElementById("gpuGauge").classList.contains("unavailable"), "unavailable GPU gauge did not get unavailable class");

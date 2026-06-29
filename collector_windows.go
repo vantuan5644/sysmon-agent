@@ -207,6 +207,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	wg.Wait()
 
 	metrics.CPU = cpu
+	metrics.CPUCores = windowsCPUCores()
 	metrics.CPUPower = cpuPower
 	metrics.CPUClock = cpuClock
 	metrics.CPUClockMax = cpuClockMax

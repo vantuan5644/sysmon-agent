@@ -56,9 +56,13 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v108";
+const dashboardBuild = "sysmon-static-v111";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
+// clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
+// CPU's max/boost clock isn't reported, so the ring still has a sensible 0-100
+// scale. ~5 GHz covers current desktop boost clocks.
+const clockRingReferenceMHz = 5000;
 const defaultThresholds = {
   cpu_warn: 70,
   memory_warn: 70,
@@ -1063,7 +1067,6 @@ function render(metrics) {
   const memoryMetric = capacityPercent(metrics.memory);
   const primaryGPU = firstAvailableGPU(metrics.gpu);
   const gpuMetric = primaryGPU ? metricPercent(primaryGPU.usage_percent) : unavailable();
-  const cpuTempMetric = numberMetric(metrics.cpu_temperature);
   const net = networkTotals(metrics.network);
 
   appendPrimaryMetricHistory({
@@ -1073,11 +1076,11 @@ function render(metrics) {
     net: net.available ? { available: true, value: netRingPercent(net.rx) } : unavailable(),
   });
 
-  // CPU: outer ring = utilization, inner ring = temperature, center = util %,
-  // sub = live GHz. Temperature + package power show on the detail line below.
-  const tempWarn = thresholdValue("temp_warn_c");
+  // CPU: outer ring = utilization, inner ring = core clock (filled against the
+  // max/boost clock), center = util %, sub = live GHz. Temperature + package
+  // power show on the detail line below.
   setGauge("cpuGauge", "cpuValue", cpuMetric, "%", thresholdValue("cpu_warn"));
-  setInnerRing("cpuGauge", tempRingMetric(cpuTempMetric, tempWarn));
+  setInnerRing("cpuGauge", clockRingMetric(metrics.cpu_clock, metrics.cpu_clock_max));
   const cpuClock = numberMetric(metrics.cpu_clock);
   setGaugeSub("cpuSub", cpuClock.available ? (formatClock(cpuClock.value) || "--") : "--");
 
@@ -1183,14 +1186,19 @@ function vramRingMetric(vram, warnThreshold) {
   return { available: true, value: vram.value, color: colorFor(vram.value, warnThreshold) };
 }
 
-// tempRingMetric scales a Celsius reading to a 0-100 ring fill (100C = full
-// ring) and colors it with the temperature threshold so hot readings warn.
-function tempRingMetric(tempMetric, warnThreshold) {
-  const temp = numberMetric(tempMetric);
-  if (!temp.available) {
+// clockRingMetric scales the live CPU clock against its max/boost clock (both
+// MHz) into a 0-100 ring fill, so the inner ring fills as the CPU ramps toward
+// peak frequency. Falls back to a fixed reference when the max isn't reported.
+// Clock isn't an alert metric, so the ring keeps the steady accent colour rather
+// than warning by threshold like utilization/temperature do.
+function clockRingMetric(clockMetric, maxClockMetric) {
+  const clock = numberMetric(clockMetric);
+  if (!clock.available || clock.value <= 0) {
     return { available: false };
   }
-  return { available: true, value: temp.value, color: colorFor(temp.value, warnThreshold) };
+  const max = numberMetric(maxClockMetric);
+  const reference = max.available && max.value > 0 ? max.value : clockRingReferenceMHz;
+  return { available: true, value: clamp((clock.value / reference) * 100, 0, 100), color: "var(--accent)" };
 }
 
 function renderCollectionErrors(errors) {
@@ -1470,7 +1478,7 @@ function appendPrimaryMetricHistory(metrics) {
   appendMetricHistory("mem", metrics.mem);
   appendMetricHistory("gpu", metrics.gpu);
   appendMetricHistory("net", metrics.net);
-  renderSparkline("cpuTrend", state.history.cpu, thresholdValue("cpu_warn"));
+  // CPU's trend sparkline is replaced by the per-core grid (renderCoreGrid).
   renderSparkline("memTrend", state.history.mem, thresholdValue("memory_warn"));
   renderSparkline("gpuTrend", state.history.gpu, thresholdValue("gpu_warn"));
   renderSparkline("netTrend", state.history.net, netRingWarnPercent);
@@ -1511,6 +1519,41 @@ function sparklineBar(sample, warnThreshold) {
   return bar;
 }
 
+// renderCoreGrid fills the CPU card's per-core strip from metrics.cpu_cores: a
+// "busy N/M" count next to one thin bar per logical core (bar height = that
+// core's busy %, highlighted when at/above the busy threshold). It answers
+// "single- or multi-threaded?" -- a question the averaged cpu_percent hides. The
+// element is left empty (CSS-hidden) when per-core data is unavailable.
+function renderCoreGrid(cores) {
+  const el = $("cpuCores");
+  if (!el) { return; }
+  el.textContent = "";
+  if (!cores || !cores.available || !Array.isArray(cores.cores) || cores.cores.length === 0) {
+    return;
+  }
+  const count = Number.isFinite(cores.count) ? cores.count : cores.cores.length;
+  const busy = Number.isFinite(cores.busy) ? cores.busy : 0;
+  const threshold = finiteNumber(cores.busy_threshold);
+
+  const label = document.createElement("span");
+  label.className = "core-grid-label";
+  label.textContent = `busy ${busy}/${count}`;
+  if (busy > 0) { label.classList.add("busy"); }
+  el.append(label);
+
+  const bars = document.createElement("span");
+  bars.className = "core-grid-bars";
+  for (const raw of cores.cores) {
+    const bar = document.createElement("span");
+    bar.className = "core-bar";
+    const value = clamp(raw, 0, 100);
+    bar.style.setProperty("--h", `${Math.max(8, Math.round(value))}%`);
+    if (threshold !== null && value >= threshold) { bar.classList.add("busy"); }
+    bars.append(bar);
+  }
+  el.append(bars);
+}
+
 // renderPrimaryCardDetails fills the small detail line under each gauge with the
 // readings NOT already shown by the rings/center labels: CPU/GPU temperature and
 // power draw, RAM headroom, and the host's Tailscale connectivity (online +
@@ -1519,12 +1562,15 @@ function sparklineBar(sample, warnThreshold) {
 function renderPrimaryCardDetails(metrics, primaryGPU) {
   const tempWarn = thresholdValue("temp_warn_c");
 
+  renderCardIdentities(metrics, primaryGPU);
+
   const cpuTemp = numberMetric(metrics.cpu_temperature);
   const cpuPower = numberMetric(metrics.cpu_power);
   setCardDetail("cpuDetail", joinDetail([
     cpuTemp.available ? formatTemp(cpuTemp.value) : "",
     cpuPower.available ? formatPower(cpuPower.value) : "",
   ]), cpuTemp, tempWarn);
+  renderCoreGrid(metrics.cpu_cores);
 
   const gpuTemp = primaryGPU ? numberMetric(primaryGPU.temperature_celsius) : unavailable();
   const gpuPower = primaryGPU ? numberMetric(primaryGPU.power_watts) : unavailable();
@@ -1542,10 +1588,38 @@ function renderPrimaryCardDetails(metrics, primaryGPU) {
   renderNetDetail(metrics.tailscale);
 }
 
-// renderNetDetail fills the NET card's detail line with Tailscale connectivity
-// state -- a mesh icon (online/offline) and an exit-node icon (on/off) -- shown
-// as pure colour-coded icons with no visible text, so the line never wraps. The
-// state is carried by each icon's colour plus an aria-label for assistive tech.
+// renderCardIdentities fills each card's identity line: CPU model, GPU model,
+// RAM type+speed (falling back to total size when the type/speed isn't readable,
+// e.g. a non-root user-session service), and the active network (Wi-Fi SSID or
+// wired link). Missing values leave the line blank; its reserved height keeps all
+// four cards aligned.
+function renderCardIdentities(metrics, primaryGPU) {
+  setCardId("cpuName", metrics.cpu_name);
+  setCardId("gpuName", primaryGPU ? primaryGPU.name : "");
+
+  const memory = capacityPercent(metrics.memory);
+  const memName = nonEmptyText(metrics.memory_name)
+    || (memory.available ? formatBytes(memory.totalBytes) : "");
+  setCardId("memName", memName);
+
+  const uplink = metrics.network && metrics.network.uplink;
+  setCardId("netName", uplink && uplink.available ? uplink.name : "");
+}
+
+function setCardId(id, text) {
+  const el = $(id);
+  if (!el) { return; }
+  el.textContent = nonEmptyText(text);
+}
+
+function nonEmptyText(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+// renderNetDetail fills the NET card's detail line with a "Tailscale" label
+// followed by two connectivity icons -- a mesh icon (online/offline) and an
+// exit-node icon (on/off). The icons carry no text of their own; their state is
+// the colour plus an aria-label, and the leading label names what they describe.
 function renderNetDetail(tailscale) {
   const el = $("netDetail");
   if (!el) { return; }
@@ -1555,7 +1629,11 @@ function renderNetDetail(tailscale) {
     el.textContent = "--";
     return;
   }
+  const label = document.createElement("span");
+  label.className = "ts-label";
+  label.textContent = "Tailscale";
   el.append(
+    label,
     statusPill(meshIcon(), tailscale.online ? "Tailscale online" : "Tailscale offline", tailscale.online ? "on" : "bad"),
     statusPill(exitNodeIcon(), tailscale.exit_node_enabled ? "Exit node on" : "Exit node off", tailscale.exit_node_enabled ? "on" : "dim"),
   );

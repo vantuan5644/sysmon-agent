@@ -368,15 +368,15 @@ func TestShouldIncludeMount(t *testing.T) {
 
 func TestIsRAPLPackageEntry(t *testing.T) {
 	cases := map[string]bool{
-		"intel-rapl:0":     true,
-		"intel-rapl:1":     true,
-		"intel-rapl:0:0":   false,
-		"intel-rapl:0:2":   false,
-		"intel-rapl":       false,
-		"intel-rapl:abc":   false,
-		"intel-rapl:":      false,
-		"amd-rapl:0":       false,
-		"":                 false,
+		"intel-rapl:0":   true,
+		"intel-rapl:1":   true,
+		"intel-rapl:0:0": false,
+		"intel-rapl:0:2": false,
+		"intel-rapl":     false,
+		"intel-rapl:abc": false,
+		"intel-rapl:":    false,
+		"amd-rapl:0":     false,
+		"":               false,
 	}
 	for name, want := range cases {
 		if got := isRAPLPackageEntry(name); got != want {
@@ -420,13 +420,13 @@ func TestReadRAPLCountersFiltersSubDomains(t *testing.T) {
 	pkg := filepath.Join(root, "intel-rapl:0")
 	sub := filepath.Join(root, "intel-rapl:0:0")
 	for path, value := range map[string]string{
-		filepath.Join(pkg, "energy_uj"):             "5000000",
+		filepath.Join(pkg, "energy_uj"):           "5000000",
 		filepath.Join(pkg, "max_energy_range_uj"): "262143999999999",
 		filepath.Join(sub, "energy_uj"):           "1000000",
 	} {
 		if err := writeTestFile(path, value); err != nil {
 			t.Fatal(err)
-	}
+		}
 	}
 	got, err := readRAPLCounters(root)
 	if err != nil {

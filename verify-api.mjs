@@ -226,6 +226,7 @@ function validateMetrics(metrics) {
   assertTimestamp(metrics.timestamp, "metrics.timestamp", { allowStale: false });
   assertInteger(metrics.collection_duration_ms, "metrics.collection_duration_ms", { min: 0 });
   validateNumberMetric(metrics.cpu_percent, "metrics.cpu_percent", { unit: "%", allowUnavailable: false, min: 0, max: 100 });
+  validateCPUCores(metrics.cpu_cores);
   validateCapacityMetric(metrics.memory, "metrics.memory", { allowUnavailable: false });
 
   assert(Array.isArray(metrics.disks) && metrics.disks.length > 0, "metrics.disks must include at least one item");
@@ -242,6 +243,32 @@ function validateMetrics(metrics) {
   validateTemperatures(metrics.temperatures);
   validateGPU(metrics.gpu);
   validateCollectionErrors(metrics.collection_errors);
+}
+
+// validateCPUCores checks the optional per-core utilization set. It degrades as
+// a whole (available:false on hosts/platforms that cannot read it), so an
+// unavailable set is accepted; an available one must carry one busy percent per
+// core with a consistent busy count and threshold.
+function validateCPUCores(cores) {
+  assertObject(cores, "metrics.cpu_cores");
+  assert(typeof cores.available === "boolean", "metrics.cpu_cores.available must be boolean");
+  if (!cores.available) {
+    assertNonEmptyString(cores.error, "metrics.cpu_cores.error");
+    return;
+  }
+  assert(Array.isArray(cores.cores) && cores.cores.length > 0, "metrics.cpu_cores.cores must be a non-empty array when available");
+  assertInteger(cores.count, "metrics.cpu_cores.count", { min: 1 });
+  assert(cores.count === cores.cores.length, `metrics.cpu_cores.count = ${cores.count}, want ${cores.cores.length}`);
+  assert(typeof cores.busy_threshold === "number" && cores.busy_threshold > 0, "metrics.cpu_cores.busy_threshold must be a positive number");
+  assertInteger(cores.busy, "metrics.cpu_cores.busy", { min: 0, max: cores.count });
+  let busy = 0;
+  cores.cores.forEach((percent, index) => {
+    assert(typeof percent === "number" && percent >= 0 && percent <= 100, `metrics.cpu_cores.cores[${index}] must be 0-100`);
+    if (percent >= cores.busy_threshold) {
+      busy += 1;
+    }
+  });
+  assert(busy === cores.busy, `metrics.cpu_cores.busy = ${cores.busy}, want ${busy} (cores at/above ${cores.busy_threshold}%)`);
 }
 
 function validateSettings(settings, expected = {}) {
@@ -377,6 +404,24 @@ function validateNetwork(network) {
       min: 0,
     });
   });
+  validateNetworkUplink(network.uplink);
+}
+
+// validateNetworkUplink checks the optional active-network identity. It degrades
+// (available:false) when there is no default route or the SSID can't be read, so
+// an unavailable uplink is accepted; an available one must name a kind + label.
+function validateNetworkUplink(uplink) {
+  if (uplink === undefined) {
+    return;
+  }
+  assertObject(uplink, "metrics.network.uplink");
+  assert(typeof uplink.available === "boolean", "metrics.network.uplink.available must be boolean");
+  if (!uplink.available) {
+    assertNonEmptyString(uplink.error, "metrics.network.uplink.error");
+    return;
+  }
+  assert(["wifi", "ethernet"].includes(uplink.kind), `metrics.network.uplink.kind = ${uplink.kind}, want wifi or ethernet`);
+  assertNonEmptyString(uplink.name, "metrics.network.uplink.name");
 }
 
 function validateTemperatures(temperatures) {
@@ -548,12 +593,15 @@ function sampleMetrics() {
     platform: "6.8.0-homelab",
     timestamp: new Date().toISOString(),
     collection_duration_ms: 142,
+    cpu_name: "AMD Ryzen 9 7950X",
+    memory_name: "DDR5 · 6000 MT/s",
     cpu_percent: { available: true, value: 37, unit: "%" },
     cpu_power: { available: false, unit: "W", error: "no CPU package power counters found" },
     psu_output_power: { available: false, unit: "W", error: "no PSU output power sensor exposed on Linux" },
     cpu_clock: { available: false, unit: "MHz", error: "CPU clock frequency not exposed" },
     cpu_clock_max: { available: false, unit: "MHz", error: "CPU max clock frequency not exposed" },
     cpu_temperature: { available: false, unit: "C", error: "no CPU temperature sensor reported" },
+    cpu_cores: { available: true, cores: [95, 12, 88, 4], count: 4, busy: 2, busy_threshold: 80 },
     memory: { available: true, used_bytes: 8_589_934_592, total_bytes: 17_179_869_184, percent: 50 },
     disks: [{
       name: "root",
@@ -563,6 +611,7 @@ function sampleMetrics() {
     }],
     network: {
       available: true,
+      uplink: { available: true, kind: "wifi", name: "BiBi-Pro-Max" },
       interfaces: [{
         name: "tailscale0",
         rx_bytes_total: 1000,

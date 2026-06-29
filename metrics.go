@@ -22,6 +22,22 @@ type CapacityMetric struct {
 	Error      string  `json:"error,omitempty"`
 }
 
+// CPUCoreSet reports per-logical-core utilization so the dashboard can show how
+// many cores are carrying real load -- the signal for whether a workload is
+// single- or multi-threaded, which the aggregate cpu_percent average hides (one
+// pegged core on a 16-core host reads as ~6%). It degrades as a whole
+// (Available:false + Error) like the other *Set metrics, since every core comes
+// from one read. Cores holds each core's busy percent ordered by core index;
+// Busy counts cores at or above BusyThreshold; Count is len(Cores).
+type CPUCoreSet struct {
+	Available     bool      `json:"available"`
+	Cores         []float64 `json:"cores,omitempty"`
+	Count         int       `json:"count"`
+	Busy          int       `json:"busy"`
+	BusyThreshold float64   `json:"busy_threshold"`
+	Error         string    `json:"error,omitempty"`
+}
+
 type DiskMetric struct {
 	Name       string         `json:"name"`
 	Mountpoint string         `json:"mountpoint"`
@@ -40,7 +56,20 @@ type NetworkInterfaceMetric struct {
 type NetworkSet struct {
 	Available  bool                     `json:"available"`
 	Interfaces []NetworkInterfaceMetric `json:"interfaces"`
+	Uplink     NetworkUplink            `json:"uplink"`
 	Error      string                   `json:"error,omitempty"`
+}
+
+// NetworkUplink names the host's active default-route network so the NET card
+// can show what it is connected to: a Wi-Fi SSID or a wired link. Kind is
+// "wifi" or "ethernet"; Name is the SSID or a wired label (e.g. "Ethernet" with
+// an optional link speed). It degrades independently (Available:false + Error)
+// when there is no default route or the SSID cannot be read.
+type NetworkUplink struct {
+	Available bool   `json:"available"`
+	Kind      string `json:"kind,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 type TemperatureMetric struct {
@@ -85,11 +114,14 @@ type Metrics struct {
 	Arch                 string          `json:"arch"`
 	Platform             string          `json:"platform,omitempty"`
 	Timestamp            time.Time       `json:"timestamp"`
+	CPUName              string          `json:"cpu_name,omitempty"`
+	MemoryName           string          `json:"memory_name,omitempty"`
 	CPU                  NumberMetric    `json:"cpu_percent"`
 	CPUPower             NumberMetric    `json:"cpu_power"`
 	CPUClock             NumberMetric    `json:"cpu_clock"`
 	CPUClockMax          NumberMetric    `json:"cpu_clock_max"`
 	CPUTemperature       NumberMetric    `json:"cpu_temperature"`
+	CPUCores             CPUCoreSet      `json:"cpu_cores"`
 	PSUOutputPower       NumberMetric    `json:"psu_output_power"`
 	Memory               CapacityMetric  `json:"memory"`
 	MemorySwap           CapacityMetric  `json:"memory_swap"`
@@ -180,6 +212,38 @@ func availableNumber(value float64, unit string) NumberMetric {
 
 func unavailableNumber(unit, message string) NumberMetric {
 	return NumberMetric{Available: false, Unit: unit, Error: message}
+}
+
+// cpuCoreBusyPercent is the per-core utilization at or above which a logical
+// core counts as "busy" in CPUCoreSet.Busy. 80% counts a saturated core without
+// flicker from background scheduler noise on otherwise-idle cores.
+const cpuCoreBusyPercent = 80.0
+
+// availableCPUCores builds a populated CPUCoreSet from per-core busy percentages
+// (ordered by core index), counting how many sit at or above cpuCoreBusyPercent.
+// An empty slice degrades to unavailable so the dashboard never renders a 0/0
+// grid.
+func availableCPUCores(cores []float64) CPUCoreSet {
+	if len(cores) == 0 {
+		return unavailableCPUCores("no per-core utilization reported")
+	}
+	busy := 0
+	for _, percent := range cores {
+		if percent >= cpuCoreBusyPercent {
+			busy++
+		}
+	}
+	return CPUCoreSet{
+		Available:     true,
+		Cores:         cores,
+		Count:         len(cores),
+		Busy:          busy,
+		BusyThreshold: cpuCoreBusyPercent,
+	}
+}
+
+func unavailableCPUCores(message string) CPUCoreSet {
+	return CPUCoreSet{Available: false, BusyThreshold: cpuCoreBusyPercent, Error: message}
 }
 
 func availableCapacity(used, total uint64) CapacityMetric {

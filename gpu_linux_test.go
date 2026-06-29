@@ -12,11 +12,11 @@ func TestCollectLinuxDRMGPUAMD(t *testing.T) {
 	root := t.TempDir()
 	device := filepath.Join(root, "class", "drm", "card0", "device")
 	files := map[string]string{
-		filepath.Join(device, "vendor"):                         "0x1002\n",
-		filepath.Join(device, "gpu_busy_percent"):               "17\n",
-		filepath.Join(device, "mem_info_vram_used"):             "1073741824\n",
-		filepath.Join(device, "mem_info_vram_total"):            "4294967296\n",
-		filepath.Join(device, "hwmon", "hwmon3", "temp1_input"): "65000\n",
+		filepath.Join(device, "vendor"):                            "0x1002\n",
+		filepath.Join(device, "gpu_busy_percent"):                  "17\n",
+		filepath.Join(device, "mem_info_vram_used"):                "1073741824\n",
+		filepath.Join(device, "mem_info_vram_total"):               "4294967296\n",
+		filepath.Join(device, "hwmon", "hwmon3", "temp1_input"):    "65000\n",
 		filepath.Join(device, "hwmon", "hwmon3", "power1_average"): "225000000\n",
 	}
 	for path, value := range files {
