@@ -30,6 +30,7 @@
 !define REGKEY         "Software\${APPNAME_SHORT}"
 !define UNINSTKEY      "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME_SHORT}"
 !define SERVICE_URL    "http://localhost:9099/"
+!define SERVICE_NAME   "SysmonAgent"
 
 Name "${APPNAME} ${VERSION}"
 OutFile "out\${APPNAME_SHORT}Agent-Setup-${VERSION}.exe"
@@ -91,14 +92,27 @@ Section "!${APPNAME} (required)" SecCore
   WriteRegDWORD HKLM "${UNINSTKEY}" "NoRepair" 1
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
-  DetailPrint "Registering and starting the SysmonAgent service..."
+  DetailPrint "Registering and starting the ${SERVICE_NAME} service..."
   nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-windows.ps1" -Action Install'
-  Pop $0 ; exit code
-  ${If} $0 != 0
-    DetailPrint "WARNING: install-windows.ps1 exited with code $0."
-    DetailPrint "The files were installed, but the service may not be running."
-    DetailPrint "Re-run from an admin PowerShell:  .\install-windows.ps1 -Action Install"
-    MessageBox MB_ICONEXCLAMATION|MB_OK "The service setup script reported an error (code $0).$\r$\n$\r$\nFiles were installed to $INSTDIR, but the service may not be running.$\r$\nOpen the details window to see the script output, or re-run:$\r$\n  install-windows.ps1 -Action Install"
+  Pop $0 ; install-windows.ps1 exit code
+
+  ; The running service is the source of truth. install-windows.ps1 now
+  ; downgrades a slow first-boot readiness check and firewall hiccups to
+  ; warnings, so a non-zero exit code no longer means the install failed.
+  ; Confirm the service actually reports RUNNING before alarming the user.
+  nsExec::Exec 'cmd /c sc query "${SERVICE_NAME}" | find "RUNNING"'
+  Pop $1 ; 0 when the service is RUNNING
+
+  ${If} $1 == 0
+    DetailPrint "Service ${SERVICE_NAME} is running."
+    ${If} $0 != 0
+      DetailPrint "(Setup script reported warnings, code $0 - see output above; the service is running.)"
+    ${EndIf}
+  ${Else}
+    DetailPrint "WARNING: the ${SERVICE_NAME} service is not running (script exit code $0)."
+    DetailPrint "The files were installed. Re-run from an admin PowerShell:"
+    DetailPrint "  .\install-windows.ps1 -Action Install"
+    MessageBox MB_ICONEXCLAMATION|MB_OK "Setup installed the files to $INSTDIR, but the ${SERVICE_NAME} service is not running yet.$\r$\n$\r$\nOpen the details window to see the script output, or re-run from an elevated PowerShell:$\r$\n  install-windows.ps1 -Action Install"
   ${EndIf}
 SectionEnd
 

@@ -9,7 +9,7 @@ param(
     [ValidateRange(1, 65535)]
     [int]$Port = 9099,
     [ValidateRange(1, 300)]
-    [int]$ReadinessTimeoutSeconds = 20,
+    [int]$ReadinessTimeoutSeconds = 45,
     [string]$SettingsPath = "$env:ProgramData\SysmonAgent\settings.json",
     [switch]$NoFirewall
 )
@@ -250,6 +250,42 @@ function Wait-AgentReady {
     } while ((Get-Date) -lt $deadline)
 
     throw "Service $ServiceName did not become ready at $readyUrl within ${ReadinessTimeoutSeconds}s. Last readiness error: $lastError"
+}
+
+function Start-AgentService {
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($null -eq $service) {
+        throw "Service $ServiceName was not registered; cannot start it."
+    }
+    if ($service.Status -eq 'Running') {
+        return
+    }
+    try {
+        Start-Service -Name $ServiceName
+    } catch {
+        # The SCM start request can report a timeout on the very first boot while
+        # the LibreHardwareMonitor kernel driver loads, even though the service
+        # process is alive and reaches Running a moment later. Re-check before
+        # treating it as a genuine failure.
+        Start-Sleep -Seconds 2
+        $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($null -eq $service -or $service.Status -eq 'Stopped') {
+            throw "Service $ServiceName failed to start: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Wait-AgentReadyAdvisory {
+    # Readiness is best-effort: once the service is registered and Running the
+    # install has succeeded. The first cold boot can take longer than the
+    # readiness window while sensor drivers load, so a slow warmup must not fail
+    # the install (and force a manual re-run); the service self-heals and its
+    # recovery actions restart it if it ever crashes.
+    try {
+        Wait-AgentReady
+    } catch {
+        Write-Warning "The service is installed and running, but did not report ready within ${ReadinessTimeoutSeconds}s. This is normal on the first boot while sensor drivers load; it should become ready shortly. Check 'install-windows.ps1 -Action Status' if it does not. Details: $($_.Exception.Message)"
+    }
 }
 
 function Show-AgentReadiness {
@@ -843,23 +879,30 @@ function Install-Agent {
     }
     Set-ServiceRecovery
 
-    if (-not $NoFirewall) {
-        Remove-ServiceFirewallRules
-        $ruleName = Get-FirewallRuleName
-        New-NetFirewallRule `
-            -Name $ruleName `
-            -DisplayName "$DisplayName ($Port)" `
-            -Direction Inbound `
-            -Action Allow `
-            -Protocol TCP `
-            -LocalPort $Port `
-            -Profile Domain,Private | Out-Null
-    } else {
-        Remove-ServiceFirewallRules
+    try {
+        if (-not $NoFirewall) {
+            Remove-ServiceFirewallRules
+            $ruleName = Get-FirewallRuleName
+            New-NetFirewallRule `
+                -Name $ruleName `
+                -DisplayName "$DisplayName ($Port)" `
+                -Direction Inbound `
+                -Action Allow `
+                -Protocol TCP `
+                -LocalPort $Port `
+                -Profile Domain,Private | Out-Null
+        } else {
+            Remove-ServiceFirewallRules
+        }
+    } catch {
+        # A firewall failure must not fail the whole install: the service is
+        # already configured and the dashboard still works on this machine. Warn
+        # so the user can open TCP $Port by hand if LAN devices cannot reach it.
+        Write-Warning "Could not configure the Windows firewall rule for TCP port $Port. The service is still installed; open the port manually if other devices cannot reach the dashboard. Details: $($_.Exception.Message)"
     }
 
-    Start-Service -Name $ServiceName
-    Wait-AgentReady
+    Start-AgentService
+    Wait-AgentReadyAdvisory
     Get-Service -Name $ServiceName
     Show-LhmLibraryStatus
     Show-PwshStatus
@@ -908,8 +951,18 @@ function Show-Status {
     }
 }
 
-switch ($Action) {
-    'Install' { Install-Agent }
-    'Uninstall' { Uninstall-Agent }
-    'Status' { Show-Status }
+try {
+    switch ($Action) {
+        'Install' { Install-Agent }
+        'Uninstall' { Uninstall-Agent }
+        'Status' { Show-Status }
+    }
+} catch {
+    # Surface a clear, non-zero exit only for genuine failures (cannot register
+    # or start the service, missing admin/binary). Firewall and readiness are
+    # already downgraded to warnings inside Install-Agent, so a healthy-but-slow
+    # install no longer reports failure to the NSIS post-install step.
+    Write-Error $_
+    exit 1
 }
+exit 0
