@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -19,8 +20,10 @@ import (
 // intact as the fallback used before the first sample and during -self-check.
 
 var (
-	procGetSystemTimes       = kernel32.NewProc("GetSystemTimes")
-	procGlobalMemoryStatusEx = kernel32.NewProc("GlobalMemoryStatusEx")
+	procGetSystemTimes           = kernel32.NewProc("GetSystemTimes")
+	procGlobalMemoryStatusEx     = kernel32.NewProc("GlobalMemoryStatusEx")
+	ntdll                        = syscall.NewLazyDLL("ntdll.dll")
+	procNtQuerySystemInformation = ntdll.NewProc("NtQuerySystemInformation")
 )
 
 // cpuFastWarmup is the brief delay between the two GetSystemTimes reads on the
@@ -60,30 +63,155 @@ func (c *systemCollector) CollectFast(ctx context.Context) (patch func(*Metrics)
 	defer func() {
 		if r := recover(); r != nil {
 			cpu := unavailableNumber("%", fmt.Sprintf("Windows CPU collector panicked: %v", r))
+			cores := unavailableCPUCores(fmt.Sprintf("Windows CPU cores collector panicked: %v", r))
 			memory := unavailableCapacity(fmt.Sprintf("Windows memory collector panicked: %v", r))
 			patch = func(m *Metrics) {
 				m.CPU = cpu
-				m.CPUCores = windowsCPUCores()
+				m.CPUCores = cores
 				m.Memory = memory
 			}
 		}
 	}()
 
 	cpu := c.windowsCPUFast(ctx)
+	cores := c.windowsCPUCores(ctx)
 	memory := windowsMemoryFast()
 	return func(m *Metrics) {
 		m.CPU = cpu
-		m.CPUCores = windowsCPUCores()
+		m.CPUCores = cores
 		m.Memory = memory
 	}
 }
 
-// windowsCPUCores degrades per-core utilization on Windows. GetSystemTimes (the
-// fast lane's CPU source) reports only aggregate times; per-core data needs an
-// NtQuerySystemInformation(SystemProcessorPerformanceInformation) walk that is
-// not yet wired up, so the set reports unavailable rather than a wrong value.
-func windowsCPUCores() CPUCoreSet {
-	return unavailableCPUCores("per-core utilization not yet implemented on Windows")
+// SystemProcessorPerformanceInformation is NtQuerySystemInformation class 8; it
+// returns one record per logical processor with the same cumulative 100 ns
+// counters GetSystemTimes exposes for the whole machine.
+const systemProcessorPerformanceInformationClass = 8
+
+// statusInfoLengthMismatch (STATUS_INFO_LENGTH_MISMATCH) means the supplied
+// buffer was too small for all processor records; we grow and retry.
+const statusInfoLengthMismatch = uintptr(0xC0000004)
+
+// systemProcessorPerformanceInformation mirrors the Win32
+// SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION struct. KernelTime includes IdleTime,
+// matching GetSystemTimes semantics, so the shared cpuUsagePercent delta math
+// applies unchanged. The trailing pad keeps the struct at its native 48-byte
+// size (8-byte aligned because of the int64 members).
+type systemProcessorPerformanceInformation struct {
+	IdleTime       int64
+	KernelTime     int64
+	UserTime       int64
+	DpcTime        int64
+	InterruptTime  int64
+	InterruptCount uint32
+	_              uint32
+}
+
+// windowsCPUCores reports per-logical-core utilization by deltaing the per-core
+// NtQuerySystemInformation counters against the previous fast-lane sample. It
+// mirrors windowsCPUFast/collectCPUCores: with no prior sample (first call) or a
+// changed core count (CPU hot-plug) it takes a brief second read so the first
+// snapshot still carries real values, and degrades the whole set to unavailable
+// rather than returning a hard error.
+func (c *systemCollector) windowsCPUCores(ctx context.Context) CPUCoreSet {
+	cur, err := readPerCoreSystemTimes()
+	if err != nil {
+		return unavailableCPUCores(err.Error())
+	}
+
+	c.mu.Lock()
+	prev := c.prevCPUCores
+	c.prevCPUCores = cur
+	c.mu.Unlock()
+
+	if len(prev) == 0 || len(prev) != len(cur) {
+		return c.windowsCPUCoresAfterDelay(ctx, cur, cpuFastWarmup)
+	}
+	return windowsPerCoreUsage(prev, cur)
+}
+
+func (c *systemCollector) windowsCPUCoresAfterDelay(ctx context.Context, prev []cpuFastSample, delay time.Duration) CPUCoreSet {
+	if err := waitForSample(ctx, delay); err != nil {
+		return unavailableCPUCores("per-core sampler canceled: " + err.Error())
+	}
+	later, err := readPerCoreSystemTimes()
+	if err != nil {
+		return unavailableCPUCores(err.Error())
+	}
+	c.mu.Lock()
+	c.prevCPUCores = later
+	c.mu.Unlock()
+	if len(prev) == 0 || len(prev) != len(later) {
+		return unavailableCPUCores("per-core sampler is warming up")
+	}
+	return windowsPerCoreUsage(prev, later)
+}
+
+// windowsPerCoreUsage turns two equal-length per-core samples into busy
+// percentages (one per core, rounded to one decimal). A core whose counters did
+// not advance is reported as idle rather than dropped, so Cores stays
+// index-aligned with the logical core numbering.
+func windowsPerCoreUsage(prev, cur []cpuFastSample) CPUCoreSet {
+	cores := make([]float64, len(cur))
+	for i := range cur {
+		value, ok := cpuUsagePercent(prev[i], cur[i])
+		if !ok {
+			value = 0
+		}
+		cores[i] = round(value, 1)
+	}
+	return availableCPUCores(cores)
+}
+
+// readPerCoreSystemTimes returns one cpuFastSample per logical processor from
+// NtQuerySystemInformation. It sizes the buffer from runtime.NumCPU() and grows
+// on STATUS_INFO_LENGTH_MISMATCH (more processors than NumCPU reported, e.g.
+// processor-group affinity), using the returned length to determine the real
+// core count.
+func readPerCoreSystemTimes() ([]cpuFastSample, error) {
+	n := runtime.NumCPU()
+	if n < 1 {
+		n = 1
+	}
+	recordSize := int(unsafe.Sizeof(systemProcessorPerformanceInformation{}))
+	for attempts := 0; attempts < 4; attempts++ {
+		buf := make([]systemProcessorPerformanceInformation, n)
+		var returnLen uint32
+		status, _, _ := procNtQuerySystemInformation.Call(
+			uintptr(systemProcessorPerformanceInformationClass),
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(len(buf))*unsafe.Sizeof(buf[0]),
+			uintptr(unsafe.Pointer(&returnLen)),
+		)
+		if status == statusInfoLengthMismatch {
+			needed := int(returnLen) / recordSize
+			if needed <= n {
+				needed = n * 2
+			}
+			n = needed
+			continue
+		}
+		if status != 0 {
+			return nil, fmt.Errorf("NtQuerySystemInformation(SystemProcessorPerformanceInformation) failed: 0x%X", status)
+		}
+		count := int(returnLen) / recordSize
+		if count < 1 {
+			return nil, fmt.Errorf("NtQuerySystemInformation returned no processor records")
+		}
+		if count > len(buf) {
+			count = len(buf)
+		}
+		samples := make([]cpuFastSample, count)
+		for i := 0; i < count; i++ {
+			samples[i] = cpuFastSample{
+				idle:   uint64(buf[i].IdleTime),
+				kernel: uint64(buf[i].KernelTime),
+				user:   uint64(buf[i].UserTime),
+			}
+		}
+		return samples, nil
+	}
+	return nil, fmt.Errorf("NtQuerySystemInformation processor buffer kept growing")
 }
 
 // CollectSlow gathers the expensive metrics (platform string, CPU power/clock,

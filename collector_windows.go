@@ -70,6 +70,7 @@ type systemCollector struct {
 	prevNetAt      time.Time
 	prevCPUFast    cpuFastSample
 	prevCPUFastSet bool
+	prevCPUCores   []cpuFastSample
 }
 
 type netCounter struct {
@@ -207,7 +208,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	wg.Wait()
 
 	metrics.CPU = cpu
-	metrics.CPUCores = windowsCPUCores()
+	metrics.CPUCores = c.windowsCPUCores(ctx)
 	metrics.CPUPower = cpuPower
 	metrics.CPUClock = cpuClock
 	metrics.CPUClockMax = cpuClockMax
