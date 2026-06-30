@@ -6,7 +6,13 @@ installable web app you add to your Home Screen. The host does all the work; the
 just paints the screen.
 
 <p align="center">
-  <img src="assets/screenshot.JPEG" alt="Sysmon Agent dashboard" width="760">
+  <img src="assets/screenshot-linux.JPEG" alt="Sysmon Agent dashboard monitoring a Linux host" width="760">
+  <br>
+  <em>Linux host</em>
+  <br><br>
+  <img src="assets/screenshot-windows.png" alt="Sysmon Agent dashboard monitoring a Windows host" width="760">
+  <br>
+  <em>Windows host</em>
 </p>
 
 ---
