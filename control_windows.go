@@ -93,6 +93,13 @@ func (windowsController) Apply(ctx context.Context, action ControlAction) Contro
 		return unavailableControlResult(action, err.Error())
 	}
 
+	// media_toggle / lock_screen are injected into the active console session by
+	// relaunching this same native binary with -control-emit (powershell.exe will
+	// not run across the session boundary). Hand the bridge our own exe path so it
+	// has a native PE to launch; os.Executable rarely fails, and if it does the
+	// bridge degrades that action to applied=false rather than failing the request.
+	selfExe, _ := os.Executable()
+
 	cmd := exec.CommandContext(
 		ctx,
 		windowsPowerShellCommand(exec.LookPath),
@@ -105,6 +112,8 @@ func (windowsController) Apply(ctx context.Context, action ControlAction) Contro
 		scriptPath,
 		"-Action",
 		arg,
+		"-ExePath",
+		selfExe,
 	)
 	// An empty, immediately-EOF stdin keeps the -File host from blocking on a
 	// null device when the agent runs without a console (service session).

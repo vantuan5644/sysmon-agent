@@ -15,8 +15,12 @@
 # Core Audio endpoint mute is a global device property, so mic_mute / volume_mute
 # work even when this runs as the LocalSystem service in session 0. media_toggle
 # and lock_screen need the interactive desktop: when run non-interactively they
-# are relaunched in the active console session via CreateProcessAsUser (the
-# *_local variants run the action directly in the calling session).
+# are injected into the active console session via CreateProcessAsUser, which
+# relaunches the agent's own native binary (-ExePath) with -control-emit. A
+# native PE runs reliably across the session boundary; powershell.exe does not
+# (it is created but dies in early init before executing any code), so the prior
+# -EncodedCommand media path silently did nothing. The agent exe does its one
+# Win32 input call and exits, needing no read access to this script.
 #
 # NOTE: ASCII only -- see the PowerShell scripting notes in the repo root
 # CLAUDE.md. Embedded via //go:embed in collector/control_windows.go, so edits
@@ -25,8 +29,13 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('mic_mute', 'volume_mute', 'media_toggle', 'lock_screen', 'media_toggle_local', 'lock_screen_local')]
-    [string]$Action
+    [ValidateSet('mic_mute', 'volume_mute', 'media_toggle', 'lock_screen')]
+    [string]$Action,
+
+    # Full path to the agent executable, supplied by the Go layer. Used as the
+    # native process injected into the active console session for media_toggle /
+    # lock_screen when this bridge runs non-interactively (session 0).
+    [string]$ExePath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -173,7 +182,15 @@ namespace Sysmon {
         }
 
         // ---- launch a command in the active console session (session-0 service) ----
-        [StructLayout(LayoutKind.Sequential)]
+        // CharSet.Unicode is REQUIRED: CreateProcessAsUser is bound as the W
+        // (Unicode) entry point, so its STARTUPINFO string members (notably
+        // lpDesktop = "winsta0\\default") must marshal as wide strings. With the
+        // default ANSI marshaling the W function reads lpDesktop as garbage UTF-16,
+        // the injected child attaches to a bogus desktop, and user32.dll fails to
+        // initialize (ERROR_DLL_INIT_FAILED) the moment the child touches it -- so
+        // keybd_event / LockWorkStation never run and media_toggle / lock_screen
+        // silently do nothing even though CreateProcessAsUser reported success.
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         struct STARTUPINFO {
             public int cb;
             public string lpReserved;
@@ -204,6 +221,10 @@ namespace Sysmon {
         static extern bool CreateProcessAsUser(IntPtr hToken, string lpApplicationName, string lpCommandLine, IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory, ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool CloseHandle(IntPtr hObject);
+        [DllImport("kernel32.dll")]
+        static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
 
         const uint MAXIMUM_ALLOWED = 0x02000000;
         const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
@@ -235,8 +256,20 @@ namespace Sysmon {
                 if (!CreateProcessAsUser(primaryToken, null, commandLine, IntPtr.Zero, IntPtr.Zero, false, flags, env, null, ref si, out pi)) {
                     throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "CreateProcessAsUser failed");
                 }
+                // CreateProcessAsUser reports success as soon as the process object
+                // exists, before the child finishes initializing -- so a launch that
+                // "succeeds" can still crash on startup (the way a bad lpDesktop made
+                // user32 fail to load). The injected child does one Win32 input call
+                // and exits immediately, so wait briefly and treat a confirmed
+                // non-zero exit as a failure instead of reporting a false "applied".
+                uint waitRc = WaitForSingleObject(pi.hProcess, 4000);
+                uint exitCode = 0;
+                bool gotExit = GetExitCodeProcess(pi.hProcess, out exitCode);
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
+                if (waitRc == 0 && gotExit && exitCode != 0) {
+                    throw new Exception("injected session process exited with code 0x" + exitCode.ToString("X8"));
+                }
             } finally {
                 if (env != IntPtr.Zero) { DestroyEnvironmentBlock(env); }
                 if (primaryToken != IntPtr.Zero) { CloseHandle(primaryToken); }
@@ -253,12 +286,33 @@ function Initialize-ControlType {
     }
 }
 
-function Invoke-InActiveSession {
-    param([string]$LocalAction)
-    $interpreter = (Get-Process -Id $PID).Path
-    $scriptFile = $PSCommandPath
-    $commandLine = '"' + $interpreter + '" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $scriptFile + '" -Action ' + $LocalAction
+function Assert-ExePath {
+    if ([string]::IsNullOrWhiteSpace($ExePath)) {
+        throw 'agent executable path (-ExePath) was not supplied; cannot inject into the active session'
+    }
+    if (-not (Test-Path -LiteralPath $ExePath)) {
+        throw ('agent executable not found at -ExePath: ' + $ExePath)
+    }
+}
+
+function Invoke-ControlEmitInActiveSession {
+    # Relaunch the agent's own native binary in the active console session with
+    # -control-emit <action>; it runs the single Win32 input call (media key or
+    # LockWorkStation) on the logged-in user's interactive desktop, then exits.
+    # A native PE runs across the session-0 -> session-N boundary where
+    # powershell.exe does not.
+    param([string]$EmitAction)
+    Assert-ExePath
+    $commandLine = '"' + $ExePath + '" -control-emit ' + $EmitAction
     [Sysmon.HostControl]::RunInActiveSession($commandLine)
+}
+
+function Invoke-MediaToggleInActiveSession {
+    Invoke-ControlEmitInActiveSession -EmitAction 'media_play_pause'
+}
+
+function Invoke-LockScreenInActiveSession {
+    Invoke-ControlEmitInActiveSession -EmitAction 'lock_screen'
 }
 
 try {
@@ -272,19 +326,11 @@ try {
             $state = [Sysmon.HostControl]::ToggleRenderMute()
             Write-ControlResult -Available $true -Applied $true -State $state
         }
-        'media_toggle_local' {
-            [Sysmon.HostControl]::MediaPlayPause()
-            Write-ControlResult -Available $true -Applied $true -State 'toggled'
-        }
-        'lock_screen_local' {
-            [Sysmon.HostControl]::LockScreen()
-            Write-ControlResult -Available $true -Applied $true -State 'locked'
-        }
         'media_toggle' {
             if ([Environment]::UserInteractive) {
                 [Sysmon.HostControl]::MediaPlayPause()
             } else {
-                Invoke-InActiveSession -LocalAction 'media_toggle_local'
+                Invoke-MediaToggleInActiveSession
             }
             Write-ControlResult -Available $true -Applied $true -State 'toggled'
         }
@@ -292,7 +338,7 @@ try {
             if ([Environment]::UserInteractive) {
                 [Sysmon.HostControl]::LockScreen()
             } else {
-                Invoke-InActiveSession -LocalAction 'lock_screen_local'
+                Invoke-LockScreenInActiveSession
             }
             Write-ControlResult -Available $true -Applied $true -State 'locked'
         }

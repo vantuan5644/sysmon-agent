@@ -41,7 +41,21 @@ func main() {
 	waitHealthTimeout := flag.Duration("wait-health-timeout", envDuration("SYSMON_WAIT_HEALTH_TIMEOUT", 10*time.Second), "maximum time to wait with -wait-health")
 	waitReady := flag.Bool("wait-ready", envBool("SYSMON_WAIT_READY", false), "wait until the configured /readyz endpoint responds and exit")
 	waitReadyTimeout := flag.Duration("wait-ready-timeout", envDuration("SYSMON_WAIT_READY_TIMEOUT", 15*time.Second), "maximum time to wait with -wait-ready")
+	controlEmit := flag.String("control-emit", "", "internal: emit one host input (media_play_pause|lock_screen) in the current session, then exit")
 	flag.Parse()
+
+	// -control-emit is the native injection target for the Windows host-control
+	// bridge: the session-0 service launches "sysmon-agent.exe -control-emit <action>"
+	// into the active console session via CreateProcessAsUser. A native PE runs
+	// reliably across that session boundary (powershell.exe does not), so this is
+	// how the media key / lock reach the interactive desktop. It does its one
+	// Win32 call and exits before any server/service setup.
+	if *controlEmit != "" {
+		if err := emitControlInput(*controlEmit); err != nil {
+			log.Fatalf("control-emit %q: %v", *controlEmit, err)
+		}
+		return
+	}
 
 	listen := listenConfig{
 		bind:       *bind,
