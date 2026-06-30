@@ -56,7 +56,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v111";
+const dashboardBuild = "sysmon-static-v112";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -1080,7 +1080,7 @@ function render(metrics) {
   // max/boost clock), center = util %, sub = live GHz. Temperature + package
   // power show on the detail line below.
   setGauge("cpuGauge", "cpuValue", cpuMetric, "%", thresholdValue("cpu_warn"));
-  setInnerRing("cpuGauge", clockRingMetric(metrics.cpu_clock, metrics.cpu_clock_max));
+  setInnerRing("cpuGauge", clockRingMetric(metrics.cpu_clock, metrics.cpu_clock_max, metrics.cpu_clock_base));
   const cpuClock = numberMetric(metrics.cpu_clock);
   setGaugeSub("cpuSub", cpuClock.available ? (formatClock(cpuClock.value) || "--") : "--");
 
@@ -1186,19 +1186,31 @@ function vramRingMetric(vram, warnThreshold) {
   return { available: true, value: vram.value, color: colorFor(vram.value, warnThreshold) };
 }
 
-// clockRingMetric scales the live CPU clock against its max/boost clock (both
-// MHz) into a 0-100 ring fill, so the inner ring fills as the CPU ramps toward
-// peak frequency. Falls back to a fixed reference when the max isn't reported.
-// Clock isn't an alert metric, so the ring keeps the steady accent colour rather
-// than warning by threshold like utilization/temperature do.
-function clockRingMetric(clockMetric, maxClockMetric) {
+// clockRingMetric scales the live CPU clock into a 0-100 ring fill so the inner
+// ring fills as the CPU ramps toward peak frequency. When both base and max
+// (boost ceiling) are reported it scales base->max, so the visible travel spans
+// the actual boost headroom instead of 0->max (idle base clock would otherwise
+// sit near the bottom). It degrades to clock/max, then to a fixed reference,
+// when those aren't reported. A ~5% floor keeps a thin sliver visible whenever
+// the CPU is clocking, so the ring is never fully empty at idle. Clock isn't an
+// alert metric, so the ring keeps the steady accent colour rather than warning
+// by threshold like utilization/temperature do.
+function clockRingMetric(clockMetric, maxClockMetric, baseClockMetric) {
   const clock = numberMetric(clockMetric);
   if (!clock.available || clock.value <= 0) {
     return { available: false };
   }
   const max = numberMetric(maxClockMetric);
-  const reference = max.available && max.value > 0 ? max.value : clockRingReferenceMHz;
-  return { available: true, value: clamp((clock.value / reference) * 100, 0, 100), color: "var(--accent)" };
+  const base = numberMetric(baseClockMetric);
+  let value;
+  if (base.available && base.value > 0 && max.available && max.value > base.value) {
+    value = ((clock.value - base.value) / (max.value - base.value)) * 100; // base -> max
+  } else if (max.available && max.value > 0) {
+    value = (clock.value / max.value) * 100; // degenerate/missing base
+  } else {
+    value = (clock.value / clockRingReferenceMHz) * 100; // last-resort fixed reference
+  }
+  return { available: true, value: clamp(Math.max(5, value), 0, 100), color: "var(--accent)" };
 }
 
 function renderCollectionErrors(errors) {
@@ -1603,7 +1615,26 @@ function renderCardIdentities(metrics, primaryGPU) {
   setCardId("memName", memName);
 
   const uplink = metrics.network && metrics.network.uplink;
-  setCardId("netName", uplink && uplink.available ? uplink.name : "");
+  setCardId("netName", uplinkDisplay(uplink));
+}
+
+// uplinkDisplay renders the active network identity with a leading glyph for the
+// link kind -- signal bars for Wi-Fi, a wired-network plug for Ethernet -- so the
+// NET card shows at a glance how the host is connected. The name is the SSID
+// (Wi-Fi) or "Ethernet [+ link speed]" (wired); a degraded/absent uplink leaves
+// the line blank. Glyph-only fallbacks cover a known kind with no resolved name.
+function uplinkDisplay(uplink) {
+  if (!uplink || !uplink.available) {
+    return "";
+  }
+  const name = nonEmptyText(uplink.name);
+  if (uplink.kind === "wifi") {
+    return name ? `📶 ${name}` : "📶 Wi-Fi";
+  }
+  if (uplink.kind === "ethernet") {
+    return name ? `🖧 ${name}` : "🖧 Ethernet";
+  }
+  return name;
 }
 
 function setCardId(id, text) {

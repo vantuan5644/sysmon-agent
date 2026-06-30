@@ -134,6 +134,7 @@ func warmingMetrics(hostname string) Metrics {
 	m.CPUPower = unavailableNumber("W", warming)
 	m.CPUClock = unavailableNumber("MHz", warming)
 	m.CPUClockMax = unavailableNumber("MHz", warming)
+	m.CPUClockBase = unavailableNumber("MHz", warming)
 	m.CPUTemperature = unavailableNumber("C", warming)
 	m.PSUOutputPower = unavailableNumber("W", warming)
 	m.Memory = unavailableCapacity(warming)

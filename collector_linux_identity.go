@@ -13,12 +13,6 @@ import (
 	"time"
 )
 
-// uplinkCacheTTL bounds how often the active-network identity (SSID / wired
-// link) is re-resolved. The SSID rarely changes, and resolving it spawns
-// `iw`/`nmcli`, so the slow lane reuses a cached value within this window
-// instead of spawning every pass.
-const uplinkCacheTTL = 15 * time.Second
-
 // resolveHardwareNames returns the host's static identity strings -- the CPU
 // model and the RAM type/speed -- resolving them exactly once and caching the
 // result. They never change at runtime, and the RAM lookup spawns dmidecode
@@ -49,29 +43,6 @@ func readCPUModelName() string {
 		}
 	}
 	return ""
-}
-
-// cleanCPUModelName trims the marketing noise CPUs report in /proc/cpuinfo --
-// "(R)"/"(TM)" marks, the "CPU @ x.xGHz" tail, and a trailing "N-Core
-// Processor" -- leaving just the recognizable model.
-func cleanCPUModelName(raw string) string {
-	name := strings.TrimSpace(raw)
-	for _, noise := range []string{"(R)", "(r)", "(TM)", "(tm)"} {
-		name = strings.ReplaceAll(name, noise, "")
-	}
-	if idx := strings.Index(name, " CPU @"); idx >= 0 {
-		name = name[:idx]
-	}
-	tokens := strings.Fields(name)
-	kept := make([]string, 0, len(tokens))
-	for _, token := range tokens {
-		lower := strings.ToLower(token)
-		if lower == "processor" || lower == "cpu" || strings.HasSuffix(lower, "-core") {
-			continue
-		}
-		kept = append(kept, token)
-	}
-	return strings.Join(kept, " ")
 }
 
 // readMemoryName returns the RAM type + speed (e.g. "DDR5 · 6000 MT/s") from
@@ -116,14 +87,7 @@ func parseDmidecodeMemory(out string) string {
 	if speed == "" {
 		speed = base
 	}
-	switch {
-	case memType != "" && speed != "":
-		return memType + " · " + speed
-	case memType != "":
-		return memType
-	default:
-		return speed
-	}
+	return composeMemoryName(memType, speed, "")
 }
 
 // parseDmiSpeed normalizes a dmidecode speed field ("6000 MT/s", "3200 MHz") to

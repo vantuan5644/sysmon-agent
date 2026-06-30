@@ -229,11 +229,13 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	platform := c.platformCache.Get(func() string {
 		return windowsPlatform(ctx)
 	})
+	cpuName, memoryName := c.resolveHardwareNames(ctx)
 
 	var wg sync.WaitGroup
 	var cpuPower NumberMetric
 	var cpuClock NumberMetric
 	var cpuClockMax NumberMetric
+	var cpuClockBase NumberMetric
 	var psuOutputPower NumberMetric
 	var swap CapacityMetric
 	var disks []DiskMetric
@@ -256,11 +258,13 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		return unavailableNumber("W", fmt.Sprintf("Windows PSU output power collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &cpuClock, func() NumberMetric {
-		cur, mx := windowsCPUClocks(ctx, bridgeResult, bridgeErr)
+		cur, mx, base := c.windowsCPUClocks(ctx, bridgeResult, bridgeErr)
 		cpuClockMax = mx
+		cpuClockBase = base
 		return cur
 	}, func(recovered any) NumberMetric {
 		cpuClockMax = unavailableNumber("MHz", fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
+		cpuClockBase = unavailableNumber("MHz", fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
 		return unavailableNumber("MHz", fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &disks, func() []DiskMetric {
@@ -298,9 +302,12 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	cpuTemperature := pickCPUTemperature(temperatures)
 	return func(m *Metrics) {
 		m.Platform = platform
+		m.CPUName = cpuName
+		m.MemoryName = memoryName
 		m.CPUPower = cpuPower
 		m.CPUClock = cpuClock
 		m.CPUClockMax = cpuClockMax
+		m.CPUClockBase = cpuClockBase
 		m.CPUTemperature = cpuTemperature
 		m.PSUOutputPower = psuOutputPower
 		m.MemorySwap = swap
@@ -321,6 +328,7 @@ func windowsDegradedSlowPatch(message string) func(*Metrics) {
 		m.CPUPower = unavailableNumber("W", message)
 		m.CPUClock = unavailableNumber("MHz", message)
 		m.CPUClockMax = unavailableNumber("MHz", message)
+		m.CPUClockBase = unavailableNumber("MHz", message)
 		m.CPUTemperature = unavailableNumber("C", message)
 		m.PSUOutputPower = unavailableNumber("W", message)
 		m.MemorySwap = unavailableCapacity(message)

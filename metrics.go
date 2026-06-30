@@ -120,6 +120,7 @@ type Metrics struct {
 	CPUPower             NumberMetric    `json:"cpu_power"`
 	CPUClock             NumberMetric    `json:"cpu_clock"`
 	CPUClockMax          NumberMetric    `json:"cpu_clock_max"`
+	CPUClockBase         NumberMetric    `json:"cpu_clock_base"`
 	CPUTemperature       NumberMetric    `json:"cpu_temperature"`
 	CPUCores             CPUCoreSet      `json:"cpu_cores"`
 	PSUOutputPower       NumberMetric    `json:"psu_output_power"`

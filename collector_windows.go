@@ -71,6 +71,22 @@ type systemCollector struct {
 	prevCPUFast    cpuFastSample
 	prevCPUFastSet bool
 	prevCPUCores   []cpuFastSample
+	// hardwareOnce resolves the static identity strings (CPU model, RAM
+	// type/speed/channel) exactly once -- they never change at runtime and the
+	// lookups spawn CIM queries, so this keeps the cost off every slow pass.
+	hardwareOnce sync.Once
+	cpuName      string
+	memoryName   string
+	// uplink caches the active default-route identity (Wi-Fi SSID / wired link)
+	// behind uplinkCacheTTL so the slow lane does not spawn Get-NetRoute/netsh
+	// every pass. Guarded by mu.
+	uplink   NetworkUplink
+	uplinkAt time.Time
+	// cpuClockPeakMHz is the highest live CPU clock observed this process. It is
+	// the boost ceiling the dashboard clock ring scales to, because
+	// Win32_Processor.MaxClockSpeed reports only the rated base clock. Guarded by
+	// mu.
+	cpuClockPeakMHz float64
 }
 
 type netCounter struct {
@@ -128,12 +144,14 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.Platform = c.platformCache.Get(func() string {
 		return windowsPlatform(ctx)
 	})
+	metrics.CPUName, metrics.MemoryName = c.resolveHardwareNames(ctx)
 
 	var wg sync.WaitGroup
 	var cpu NumberMetric
 	var cpuPower NumberMetric
 	var cpuClock NumberMetric
 	var cpuClockMax NumberMetric
+	var cpuClockBase NumberMetric
 	var psuOutputPower NumberMetric
 	var memory CapacityMetric
 	var swap CapacityMetric
@@ -163,11 +181,13 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return unavailableNumber("W", fmt.Sprintf("Windows PSU output power collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &cpuClock, func() NumberMetric {
-		cur, mx := windowsCPUClocks(ctx, bridgeResult, bridgeErr)
+		cur, mx, base := c.windowsCPUClocks(ctx, bridgeResult, bridgeErr)
 		cpuClockMax = mx
+		cpuClockBase = base
 		return cur
 	}, func(recovered any) NumberMetric {
 		cpuClockMax = unavailableNumber("MHz", fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
+		cpuClockBase = unavailableNumber("MHz", fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
 		return unavailableNumber("MHz", fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &memory, func() CapacityMetric {
@@ -212,6 +232,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.CPUPower = cpuPower
 	metrics.CPUClock = cpuClock
 	metrics.CPUClockMax = cpuClockMax
+	metrics.CPUClockBase = cpuClockBase
 	metrics.CPUTemperature = pickCPUTemperature(temperatures)
 	metrics.PSUOutputPower = psuOutputPower
 	metrics.Memory = memory
@@ -247,41 +268,79 @@ func windowsCPU(ctx context.Context) NumberMetric {
 	return windowsCPULoadMetric(result.Average)
 }
 
-// windowsCPUClocks reports the live processor clock and the advertised maximum
-// clock in megahertz. The current clock comes from the LibreHardwareMonitor
-// bridge when available, because Win32_Processor.CurrentClockSpeed is NOT a live
-// frequency: Windows refreshes it rarely (often only at boot) and many systems
-// just echo the rated speed, so it pins at a constant value and never reflects
-// idle/boost. LHM reads the per-core MSRs each sample, so it tracks the real
-// frequency. WMI still supplies MaxClockSpeed (the base/rated clock) and is the
-// current-clock fallback on hosts without LibreHardwareMonitor.
-func windowsCPUClocks(ctx context.Context, bridge lhmBridgeResult, bridgeErr error) (current, max NumberMetric) {
+// windowsCPUClocks reports the live processor clock, an observed boost ceiling,
+// and the rated base clock in megahertz. The current clock comes from the
+// LibreHardwareMonitor bridge when available, because
+// Win32_Processor.CurrentClockSpeed is NOT a live frequency: Windows refreshes
+// it rarely (often only at boot) and many systems just echo the rated speed, so
+// it pins at a constant value and never reflects idle/boost. LHM reads the
+// per-core MSRs each sample, so it tracks the real frequency, and WMI
+// CurrentClockSpeed is the current-clock fallback on hosts without it.
+//
+// Win32_Processor.MaxClockSpeed is the rated BASE clock on modern CPUs, not the
+// turbo ceiling, so it is reported as `base`. The ring's upper bound (`max`) is
+// instead a peak-hold of the live clock (see observedCPUClockCeiling): seeded
+// near base on the first sample so the ring has a sane scale immediately, then
+// ratcheted up -- never down -- as boost clocks are observed.
+func (c *systemCollector) windowsCPUClocks(ctx context.Context, bridge lhmBridgeResult, bridgeErr error) (current, max, base NumberMetric) {
 	var result struct {
 		CurrentClockSpeed *float64
 		MaxClockSpeed     *float64
 	}
-	err := runPowerShellJSON(ctx, `Get-CimInstance Win32_Processor | Select-Object CurrentClockSpeed,MaxClockSpeed`, &result)
+	err := runPowerShellJSON(ctx, `Get-CimInstance Win32_Processor | Select-Object -First 1 CurrentClockSpeed,MaxClockSpeed`, &result)
+
+	var baseMHz float64
+	var baseOK bool
 	if err != nil {
-		max = unavailableNumber("MHz", err.Error())
+		base = unavailableNumber("MHz", err.Error())
 	} else if value, ok := windowsClockMHz(result.MaxClockSpeed); ok {
-		max = availableNumber(value, "MHz")
+		baseMHz, baseOK = value, true
+		base = availableNumber(value, "MHz")
 	} else {
-		max = unavailableNumber("MHz", "Win32_Processor did not report MaxClockSpeed")
+		base = unavailableNumber("MHz", "Win32_Processor did not report MaxClockSpeed")
 	}
 
-	// Prefer the live LibreHardwareMonitor core clock for the current frequency.
+	// Resolve the live current clock: prefer the LibreHardwareMonitor core clock,
+	// fall back to the (static) WMI CurrentClockSpeed.
 	if bridgeErr == nil && bridge.Available {
 		if metric := lhmClockMetric(bridge.CPUClock); metric.Available {
-			return metric, max
+			current = metric
 		}
 	}
-	if err != nil {
-		return unavailableNumber("MHz", err.Error()), max
+	if !current.Available {
+		if err != nil {
+			current = unavailableNumber("MHz", err.Error())
+		} else if value, ok := windowsClockMHz(result.CurrentClockSpeed); ok {
+			current = availableNumber(value, "MHz")
+		} else {
+			current = unavailableNumber("MHz", "Win32_Processor CurrentClockSpeed is not a live frequency; install LibreHardwareMonitor for live CPU clock")
+		}
 	}
-	if value, ok := windowsClockMHz(result.CurrentClockSpeed); ok {
-		return availableNumber(value, "MHz"), max
+
+	max = c.observedCPUClockCeiling(current, baseMHz, baseOK)
+	return current, max, base
+}
+
+// observedCPUClockCeiling maintains the peak-hold boost ceiling the dashboard
+// clock ring scales to. On the first call with a known base it seeds the peak
+// near base (base * 1.08) so the ring has a sane upper bound before any boost is
+// seen; thereafter it ratchets the peak up to the live clock whenever that reads
+// a sane value (200..8000 MHz, rejecting transient garbage), never lowering it.
+// Peak is process state -- a daemon rebridge does not reset it; only an agent
+// restart clears it, and the seed re-establishes scale at once. Guarded by mu.
+func (c *systemCollector) observedCPUClockCeiling(current NumberMetric, baseMHz float64, baseOK bool) NumberMetric {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cpuClockPeakMHz == 0 && baseOK && baseMHz > 0 {
+		c.cpuClockPeakMHz = round(baseMHz*1.08, 0)
 	}
-	return unavailableNumber("MHz", "Win32_Processor CurrentClockSpeed is not a live frequency; install LibreHardwareMonitor for live CPU clock"), max
+	if current.Available && current.Value >= 200 && current.Value <= 8000 && current.Value > c.cpuClockPeakMHz {
+		c.cpuClockPeakMHz = current.Value
+	}
+	if c.cpuClockPeakMHz > 0 {
+		return availableNumber(c.cpuClockPeakMHz, "MHz")
+	}
+	return unavailableNumber("MHz", "CPU boost ceiling not yet observed")
 }
 
 func windowsClockMHz(value *float64) (float64, bool) {
@@ -361,7 +420,16 @@ func windowsDisks(ctx context.Context) []DiskMetric {
 	return ensureDiskMetrics(disks, "no fixed disks found")
 }
 
+// windowsNetwork builds the per-interface throughput set and attaches the
+// active-network identity (Wi-Fi SSID / wired link) for the NET card. It mirrors
+// the Linux collectNetwork wrapper.
 func (c *systemCollector) windowsNetwork(ctx context.Context) NetworkSet {
+	set := c.windowsNetworkRates(ctx)
+	set.Uplink = c.collectNetworkUplink(ctx)
+	return set
+}
+
+func (c *systemCollector) windowsNetworkRates(ctx context.Context) NetworkSet {
 	nowCounters, err := windowsNetCounters(ctx)
 	if err != nil {
 		return NetworkSet{Available: false, Error: err.Error()}

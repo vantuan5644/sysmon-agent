@@ -462,7 +462,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v111",
+    dashboard_build: "sysmon-static-v112",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -480,7 +480,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v111",
+    dashboard_build: "sysmon-static-v112",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -759,7 +759,7 @@ assert(document.getElementById("netSub").textContent.includes("1.0K"), "NET gaug
 assert(document.getElementById("cpuName").textContent === "AMD Ryzen 9 7950X", "CPU identity line did not render the CPU model");
 assert(document.getElementById("gpuName").textContent === "GPU 0", "GPU identity line did not render the GPU model");
 assert(document.getElementById("memName").textContent === "DDR5 · 6000 MT/s", "RAM identity line did not render type + speed");
-assert(document.getElementById("netName").textContent === "BiBi-Pro-Max", "NET identity line did not render the Wi-Fi SSID");
+assert(document.getElementById("netName").textContent === "📶 BiBi-Pro-Max", "NET identity line did not render the Wi-Fi glyph + SSID");
 assert(document.getElementById("netDetail").textContent === "Tailscale", "NET card detail did not render the Tailscale label");
 {
   const netChildren = document.getElementById("netDetail").children;
@@ -789,7 +789,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v111, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v112, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 await document.getElementById("statusStrip").click();
 await flushMicrotasks();
 assert(context.reloadCount() === 1, "stale dashboard status-strip tap did not reload the app");
@@ -824,7 +824,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v111; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v112; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -834,7 +834,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v111",
+    dashboard_build: "sysmon-static-v112",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -844,7 +844,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v111",
+    dashboard_build: "sysmon-static-v112",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -906,6 +906,24 @@ assert(document.getElementById("dimBtn").getAttribute("aria-pressed") === "false
 context.applySettings({ ...defaultSettings(), thresholds: { ...defaultThresholds, cpu_warn: 80 } });
 context.render({ ...sampleMetrics(), cpu_percent: { available: true, value: 76, unit: "%" } });
 assert(document.getElementById("cpuGauge").style.values.get("--c") === "var(--good)", "raised CPU warning threshold did not affect gauge color");
+// base -> max ring scaling with the user-chosen idle floor: when both base and a
+// higher max are reported, the inner ring spans base..max so boost headroom is
+// visible; a clock below base still keeps a ~5% sliver rather than emptying.
+context.render({
+  ...sampleMetrics(),
+  cpu_clock: { available: true, value: 4900, unit: "MHz" },
+  cpu_clock_max: { available: true, value: 5600, unit: "MHz" },
+  cpu_clock_base: { available: true, value: 4200, unit: "MHz" },
+});
+assert(document.getElementById("cpuGauge").style.values.get("--inner-p") === String((4900 - 4200) / (5600 - 4200) * 100), "CPU clock inner ring did not scale base->max when base is reported");
+context.render({
+  ...sampleMetrics(),
+  cpu_clock: { available: true, value: 3600, unit: "MHz" },
+  cpu_clock_max: { available: true, value: 5600, unit: "MHz" },
+  cpu_clock_base: { available: true, value: 4200, unit: "MHz" },
+});
+assert(document.getElementById("cpuGauge").style.values.get("--inner-p") === "5", "CPU clock inner ring below base did not clamp to the 5% idle floor");
+context.render(sampleMetrics());
 const settingsAfterLocalUpdates = settings;
 settings = mergeDashboardSettings(settings, { refresh_ms: 1000, panel: "network" });
 context.renderStatus(sampleStatus());
@@ -923,7 +941,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v111", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v112", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
