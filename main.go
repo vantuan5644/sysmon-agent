@@ -42,7 +42,13 @@ func main() {
 	waitReady := flag.Bool("wait-ready", envBool("SYSMON_WAIT_READY", false), "wait until the configured /readyz endpoint responds and exit")
 	waitReadyTimeout := flag.Duration("wait-ready-timeout", envDuration("SYSMON_WAIT_READY_TIMEOUT", 15*time.Second), "maximum time to wait with -wait-ready")
 	controlEmit := flag.String("control-emit", "", "internal: emit one host input (media_play_pause|lock_screen) in the current session, then exit")
+	showVersion := flag.Bool("version", false, "print the build version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	// -control-emit is the native injection target for the Windows host-control
 	// bridge: the session-0 service launches "sysmon-agent.exe -control-emit <action>"
@@ -146,6 +152,11 @@ func main() {
 		log.Fatalf("server error: %v", err)
 	}
 }
+
+// version is the build version string, injected at link time by the release
+// build scripts via -ldflags "-X main.version=<v>" (see dist/build-windows.sh).
+// Plain `go build` / `go run` leave it at "dev". Surfaced by the -version flag.
+var version = "dev"
 
 // serviceName is the Windows service name registered by install-windows.ps1. It
 // is also passed to the SCM dispatcher and control-handler registration on
