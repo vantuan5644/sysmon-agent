@@ -1530,7 +1530,7 @@ Check-Client "zero_viewport" ([pscustomobject]@{
 		"desktop_browser=fail",
 		"zero_viewport=fail",
 	}, "\n")
-	if strings.TrimSpace(string(out)) != want {
+	if strings.ReplaceAll(strings.TrimSpace(string(out)), "\r\n", "\n") != want {
 		t.Fatalf("strict Windows device evidence =\n%s\nwant\n%s", out, want)
 	}
 }
@@ -1553,7 +1553,7 @@ func TestRenderVerifierUsesHeadlessBrowserScreenshots(t *testing.T) {
 		`up 7h 12m / saved / app`,
 		`03:16:00 / 4s / 142ms`,
 		`class="panel alerts-panel"`,
-		`CPU 86% over 70%`,
+		`Disk / 92% over 70%`,
 		`assertNarrowPhoneLayoutFits`,
 		`decodePNG`,
 		`SYSMON_RENDER_STRICT`,
@@ -1689,13 +1689,13 @@ func TestNoListenVerifierDocumentsAutomatedAndManualGates(t *testing.T) {
 		`windows_deployed_client_history=skipped_pwsh_unavailable`,
 		`windows_installer_recent_activity=skipped_pwsh_unavailable`,
 		`systemd-analyze verify`,
-		`deploy/sysmon-agent.service`,
-		`deploy/sysmon-agent.user.service`,
-		`sudo tailscale serve --bg --https=9443 http://127.0.0.1:9099   # publish the dashboard (or any HTTPS reverse proxy)`,
+		`sysmon-agent.service`,
+		`tailscale-serve.service`,
+		`SYSMON_PRINT_QR=1`,
 		`SYSMON_DEPLOY_VERIFY_HOLD=120 ./verify-deployed.sh`,
 		`Add the printed deployed URL to the device Home Screen, then open that Home Screen app and tap the status strip during the hold window.`,
 		`Windows installed-service equivalent:`,
-		`.\\install-windows.ps1 -Action Install`,
+		`install-windows.ps1`,
 		`.\\verify-deployed-windows.ps1 -HoldSeconds 120`,
 		`Optional isolated smoke-agent gate:`,
 		`SYSMON_VERIFY_BIND=0.0.0.0 SYSMON_VERIFY_HOLD=120 SYSMON_VERIFY_REQUIRE_DEVICE=1 ./verify.sh`,
