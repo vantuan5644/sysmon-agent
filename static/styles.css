@@ -733,6 +733,154 @@ h2 {
   color: var(--warn);
 }
 
+/* App details page (third pager page): a Task-Manager + nvitop hybrid table. */
+.processes-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.processes-panel.processes-unavailable {
+  opacity: 0.7;
+}
+
+.processes-toolbar {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.processes-tab {
+  flex: 0 0 auto;
+  padding: 5px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-strong);
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+  touch-action: manipulation;
+  cursor: pointer;
+}
+
+.processes-tab.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #04121d;
+}
+
+.processes-head,
+.processes-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 0.7fr) minmax(0, 0.95fr) minmax(0, 0.95fr) minmax(0, 0.95fr);
+  align-items: center;
+  gap: 6px;
+}
+
+.processes-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 5px 4px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.processes-head .processes-cell {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  text-align: right;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  touch-action: manipulation;
+  cursor: pointer;
+}
+
+.processes-head .processes-name {
+  text-align: left;
+}
+
+.processes-head .processes-sort.sorted {
+  color: var(--text);
+}
+
+.processes-head .processes-sort.sorted[data-proc-dir="asc"]::after {
+  content: " ▲";
+}
+
+.processes-head .processes-sort.sorted[data-proc-dir="desc"]::after {
+  content: " ▼";
+}
+
+.processes-row {
+  padding: 6px 4px;
+  border-radius: 7px;
+  background: var(--panel-strong);
+  font-size: 0.86rem;
+}
+
+.processes-row + .processes-row {
+  margin-top: 4px;
+}
+
+.processes-cell {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.processes-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-weight: 550;
+}
+
+.processes-value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.processes-value.unavailable {
+  color: var(--muted);
+}
+
+.processes-cpu {
+  color: var(--c, var(--text));
+}
+
+.processes-message {
+  padding: 18px 8px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+@media (max-width: 380px) {
+  .processes-head,
+  .processes-row {
+    grid-template-columns: minmax(0, 1.4fr) minmax(0, 0.7fr) minmax(0, 0.9fr) minmax(0, 0.9fr) minmax(0, 0.9fr);
+    gap: 4px;
+  }
+
+  .processes-row {
+    font-size: 0.78rem;
+  }
+
+  .processes-head {
+    font-size: 0.62rem;
+  }
+}
+
 @media (max-width: 480px) {
   .shell {
     --pad-x: 10px;

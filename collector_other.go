@@ -37,5 +37,6 @@ func (c unsupportedCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.Tailscale = TailscaleStatus{Available: false, Error: "unsupported operating system"}
 	metrics.Temperatures = TemperatureSet{Available: false, Error: "unsupported operating system"}
 	metrics.GPU = GPUSet{Available: false, Error: "unsupported operating system"}
+	metrics.Processes = unavailableProcessSet("per-process metrics not supported on this platform")
 	return finishMetrics(metrics, started), nil
 }

@@ -134,3 +134,64 @@ func parseNonNegativeFloat(raw string) (float64, bool) {
 	}
 	return value, true
 }
+
+// nvidiaProcessGPUMemory returns pid -> used GPU memory bytes for the compute
+// processes currently occupying the GPU, via
+// `nvidia-smi --query-compute-apps=pid,used_memory`. The --query-compute-apps
+// surface covers CUDA/compute processes only (not graphics/game workloads), so
+// non-CUDA processes are absent from the map and their rows degrade to
+// unavailable per field -- this matches nvitop's compute-focused surface and
+// the graceful-degradation invariant. AMD/Intel have no equivalent query. A
+// missing nvidia-smi or a failed invocation returns nil (no GPU memory for any
+// PID); joined onto the process rows as fully unavailable GPU memory.
+func nvidiaProcessGPUMemory(ctx context.Context) map[int]int64 {
+	if _, err := exec.LookPath("nvidia-smi"); err != nil {
+		return nil
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(
+		queryCtx,
+		"nvidia-smi",
+		"--query-compute-apps=pid,used_memory",
+		"--format=csv,noheader,nounits",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	return parseNVIDIAProcessGPUMemory(string(out))
+}
+
+// parseNVIDIAProcessGPUMemory parses the pid,used_memory CSV emitted by
+// nvidia-smi into a pid -> bytes map. used_memory is reported in MiB. Rows that
+// fail to parse are skipped rather than failing the whole map.
+func parseNVIDIAProcessGPUMemory(out string) map[int]int64 {
+	reader := csv.NewReader(strings.NewReader(out))
+	reader.TrimLeadingSpace = true
+	rows, err := reader.ReadAll()
+	if err != nil {
+		return nil
+	}
+	result := map[int]int64{}
+	for _, row := range rows {
+		if len(row) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(row[0]))
+		if err != nil || pid <= 0 {
+			continue
+		}
+		memMiB, ok := parseNonNegativeFloat(row[1])
+		if !ok {
+			continue
+		}
+		bytes, ok := mibFloatToBytes(memMiB)
+		if !ok {
+			continue
+		}
+		result[pid] = int64(bytes)
+	}
+	return result
+}

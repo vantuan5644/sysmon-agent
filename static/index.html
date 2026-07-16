@@ -114,11 +114,32 @@
           <span class="page-empty-sub">No issues reported</span>
         </section>
       </section>
+      <section class="page" aria-label="App details">
+        <section id="processesPanel" class="panel processes-panel">
+          <div class="section-head">
+            <h2>Apps</h2>
+            <span id="processesSummary" class="muted">--</span>
+          </div>
+          <div class="processes-toolbar" role="tablist" aria-label="App details view">
+            <button id="processesViewApps" class="processes-tab active" type="button" role="tab" aria-selected="true" aria-controls="processesBody">Apps</button>
+            <button id="processesViewProcs" class="processes-tab" type="button" role="tab" aria-selected="false" aria-controls="processesBody">Processes</button>
+          </div>
+          <div class="processes-head" role="row" aria-label="Sort processes">
+            <button class="processes-cell processes-name processes-sort" type="button" data-proc-sort="name" aria-label="Sort by name">Name</button>
+            <button class="processes-cell processes-sort" type="button" data-proc-sort="cpu" aria-label="Sort by CPU">CPU</button>
+            <button class="processes-cell processes-sort" type="button" data-proc-sort="memory" aria-label="Sort by RAM">RAM</button>
+            <button class="processes-cell processes-sort" type="button" data-proc-sort="gpu" aria-label="Sort by GPU memory">GPU</button>
+            <button class="processes-cell processes-sort" type="button" data-proc-sort="disk" aria-label="Sort by Disk I/O">Disk</button>
+          </div>
+          <div id="processesBody" class="processes-body" role="rowgroup"></div>
+        </section>
+      </section>
     </div>
 
     <nav id="pageDots" class="page-dots" aria-label="Dashboard pages">
       <button id="pageDot0" class="page-dot active" type="button" aria-label="Live metrics" aria-current="true"></button>
       <button id="pageDot1" class="page-dot" type="button" aria-label="More status" aria-current="false"></button>
+      <button id="pageDot2" class="page-dot" type="button" aria-label="App details" aria-current="false"></button>
     </nav>
 
     <footer class="bottom-controls" aria-label="Host controls">

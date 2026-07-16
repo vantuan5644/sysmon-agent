@@ -208,6 +208,9 @@ func validateMetricsShape(metrics Metrics) error {
 	if err := validateGPUSet(metrics.GPU); err != nil {
 		return err
 	}
+	if err := validateProcessSet(metrics.Processes); err != nil {
+		return err
+	}
 	if err := validateTailscaleStatus(metrics.Tailscale); err != nil {
 		return err
 	}
@@ -306,6 +309,90 @@ func validateTailscaleStatus(tailscale TailscaleStatus) error {
 		if strings.TrimSpace(tailscale.Error) == "" {
 			return fmt.Errorf("tailscale unavailable without an error")
 		}
+	}
+	return nil
+}
+
+// validateProcessSet tolerantly shape-checks the optional per-process set,
+// mirroring the MemorySwap handling: it degrades as a whole on platforms that cannot
+// enumerate processes (and during sampler warmup), so an unavailable set is
+// accepted without requiring an error (the field is optional like swap). When
+// available it validates that each row carries a PID/name and that every numeric
+// field is a well-formed NumberMetric with the right unit, but it does not
+// require any field to be present -- per-field degradation is the point.
+func validateProcessSet(processes ProcessSet) error {
+	if !processes.Available {
+		return nil
+	}
+	for i, proc := range processes.Processes {
+		if proc.PID <= 0 {
+			return fmt.Errorf("processes.processes[%d] missing pid", i)
+		}
+		if strings.TrimSpace(proc.Name) == "" {
+			return fmt.Errorf("processes.processes[%d] missing name", i)
+		}
+		if err := validateProcessNumberMetric(fmt.Sprintf("processes.processes[%d].cpu_percent", i), proc.CPU, "%"); err != nil {
+			return err
+		}
+		if err := validateProcessNumberMetric(fmt.Sprintf("processes.processes[%d].memory_bytes", i), proc.Memory, "B"); err != nil {
+			return err
+		}
+		if err := validateProcessNumberMetric(fmt.Sprintf("processes.processes[%d].gpu_memory", i), proc.GPUMemory, "B"); err != nil {
+			return err
+		}
+		if err := validateProcessNumberMetric(fmt.Sprintf("processes.processes[%d].disk_read", i), proc.DiskRead, "B/s"); err != nil {
+			return err
+		}
+		if err := validateProcessNumberMetric(fmt.Sprintf("processes.processes[%d].disk_write", i), proc.DiskWrite, "B/s"); err != nil {
+			return err
+		}
+	}
+	for i, app := range processes.Apps {
+		if strings.TrimSpace(app.Name) == "" {
+			return fmt.Errorf("processes.apps[%d] missing name", i)
+		}
+		if app.Count <= 0 {
+			return fmt.Errorf("processes.apps[%d] count must be positive", i)
+		}
+		if err := validateProcessNumberMetric(fmt.Sprintf("processes.apps[%d].cpu_percent", i), app.CPU, "%"); err != nil {
+			return err
+		}
+		if err := validateProcessNumberMetric(fmt.Sprintf("processes.apps[%d].memory_bytes", i), app.Memory, "B"); err != nil {
+			return err
+		}
+		if err := validateProcessNumberMetric(fmt.Sprintf("processes.apps[%d].gpu_memory", i), app.GPUMemory, "B"); err != nil {
+			return err
+		}
+		if err := validateProcessNumberMetric(fmt.Sprintf("processes.apps[%d].disk_read", i), app.DiskRead, "B/s"); err != nil {
+			return err
+		}
+		if err := validateProcessNumberMetric(fmt.Sprintf("processes.apps[%d].disk_write", i), app.DiskWrite, "B/s"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateProcessNumberMetric is the per-field NumberMetric check used inside
+// validateProcessSet. Every process/app field is allowed to be unavailable
+// (per-field degradation), so unlike validateNumberMetric's strict mode it
+// accepts an unavailable value with or without an error string and only sanity
+// checks the unit + value range of available entries.
+func validateProcessNumberMetric(name string, metric NumberMetric, unit string) error {
+	if strings.TrimSpace(metric.Unit) != unit {
+		return fmt.Errorf("%s unit = %q, want %q", name, metric.Unit, unit)
+	}
+	if !metric.Available {
+		return nil
+	}
+	if math.IsNaN(metric.Value) || math.IsInf(metric.Value, 0) {
+		return fmt.Errorf("%s has invalid value %v", name, metric.Value)
+	}
+	if unit == "%" && (metric.Value < 0 || metric.Value > 100) {
+		return fmt.Errorf("%s percent out of range: %v", name, metric.Value)
+	}
+	if metric.Value < 0 {
+		return fmt.Errorf("%s negative value: %v", name, metric.Value)
 	}
 	return nil
 }
@@ -462,7 +549,7 @@ func checkClientCheck(handler http.Handler) error {
 		return fmt.Errorf("GET /api/client-checks was not empty before dashboard POST")
 	}
 
-	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v112","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
+	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v114","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
 	if post.Code != http.StatusOK {
 		return fmt.Errorf("POST /api/client-check returned %d: %s", post.Code, strings.TrimSpace(post.Body.String()))
 	}

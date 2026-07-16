@@ -257,6 +257,19 @@ function sampleMetrics() {
         temperature_celsius: { available: true, value: 49, unit: "C" },
       }],
     },
+    processes: {
+      available: true,
+      total: 87,
+      apps: [
+        { name: "chrome", count: 3, cpu_percent: { available: true, value: 24, unit: "%" }, memory_bytes: { available: true, value: 1610612736, unit: "B" }, gpu_memory: { available: true, value: 536870912, unit: "B" }, disk_read: { available: true, value: 4096, unit: "B/s" }, disk_write: { available: false, unit: "B/s", error: "no process reported this field" } },
+        { name: "blender", count: 1, cpu_percent: { available: true, value: 60, unit: "%" }, memory_bytes: { available: true, value: 2147483648, unit: "B" }, gpu_memory: { available: true, value: 2147483648, unit: "B" }, disk_read: { available: false, unit: "B/s", error: "warming up" }, disk_write: { available: false, unit: "B/s", error: "warming up" } },
+        { name: "systemd", count: 1, cpu_percent: { available: true, value: 1, unit: "%" }, memory_bytes: { available: true, value: 10485760, unit: "B" }, gpu_memory: { available: false, unit: "B", error: "not a CUDA/compute process" }, disk_read: { available: false, unit: "B/s", error: "insufficient privilege" }, disk_write: { available: false, unit: "B/s", error: "insufficient privilege" } },
+      ],
+      processes: [
+        { pid: 101, name: "chrome", cpu_percent: { available: true, value: 20, unit: "%" }, memory_bytes: { available: true, value: 805306368, unit: "B" }, gpu_memory: { available: true, value: 268435456, unit: "B" }, disk_read: { available: true, value: 2048, unit: "B/s" }, disk_write: { available: false, unit: "B/s", error: "warming up" } },
+        { pid: 202, name: "blender", cpu_percent: { available: true, value: 60, unit: "%" }, memory_bytes: { available: true, value: 2147483648, unit: "B" }, gpu_memory: { available: true, value: 2147483648, unit: "B" }, disk_read: { available: false, unit: "B/s", error: "warming up" }, disk_write: { available: false, unit: "B/s", error: "warming up" } },
+      ],
+    },
   };
 }
 
@@ -462,7 +475,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v112",
+    dashboard_build: "sysmon-static-v114",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -480,7 +493,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v112",
+    dashboard_build: "sysmon-static-v114",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -789,7 +802,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v112, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v114, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 await document.getElementById("statusStrip").click();
 await flushMicrotasks();
 assert(context.reloadCount() === 1, "stale dashboard status-strip tap did not reload the app");
@@ -824,7 +837,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v112; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v114; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -834,7 +847,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v112",
+    dashboard_build: "sysmon-static-v114",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -844,7 +857,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v112",
+    dashboard_build: "sysmon-static-v114",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -941,7 +954,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v112", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v114", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -1793,5 +1806,60 @@ runTimeouts();
 assert(await abortTimeout === "Request timed out", "fetch timeout race did not reject when abort was ignored");
 assert(abortCalls === 1, "fetch timeout did not call AbortController.abort");
 context.AbortController = originalAbortController;
+
+// App details page: the third pager page renders the per-process table,
+// supports the Apps/Processes toggle, and re-sorts on a header tap. Drive the
+// render through the sample metrics fixture, then exercise the view/sort
+// helpers directly because the layout-less DOM mock does not wire the sort
+// header buttons (document.querySelectorAll returns [] for non-fixture
+// selectors).
+context.render(sampleMetrics());
+assert(document.getElementById("processesSummary").textContent === "87 processes", "process page header did not render total process count");
+assert(document.getElementById("processesPanel").classList.contains("processes-unavailable") === false, "available process set still flagged unavailable");
+let procRows = document.getElementById("processesBody").children;
+assert(procRows.length === 3, "apps view did not render one row per app group");
+// Default sort is CPU desc: blender(60), chrome(24), systemd(1).
+assert(procRows[0].children[0].textContent === "blender", "apps view did not sort by CPU desc");
+assert(procRows[1].children[0].textContent === "chrome · 3", "apps view did not render app PID count");
+assert(procRows[2].children[0].textContent === "systemd", "apps view third row name mismatch");
+// Unavailable GPU cell renders an em dash for the non-CUDA app.
+assert(procRows[2].children[3].textContent === "—", "unavailable GPU memory cell did not render em dash");
+assert(procRows[2].children[3].classList.contains("unavailable") === true, "unavailable GPU cell missing unavailable class");
+// Toggle to the Processes view.
+context.setProcessesView("processes");
+procRows = document.getElementById("processesBody").children;
+assert(procRows.length === 2, "processes view did not render one row per PID");
+assert(procRows[0].children[0].textContent === "blender · 202", "processes view did not sort by CPU desc or render PID label");
+assert(document.getElementById("processesViewProcs").getAttribute("aria-selected") === "true", "processes toggle did not mark the Processes tab selected");
+assert(document.getElementById("processesViewApps").getAttribute("aria-selected") === "false", "processes toggle did not clear the Apps tab selection");
+// Re-sort by memory: first tap defaults to descending, so blender(2GB) comes
+// before chrome(805MB).
+context.setProcSort("memory");
+procRows = document.getElementById("processesBody").children;
+assert(procRows[0].children[0].textContent === "blender · 202", "memory sort did not default to descending");
+// Tapping the active column flips direction: memory asc -> chrome first.
+context.setProcSort("memory");
+procRows = document.getElementById("processesBody").children;
+assert(procRows[0].children[0].textContent === "chrome · 101", "memory re-sort did not flip to ascending");
+// Re-sort by name: must order lexicographically, not fall through to the PID
+// tiebreaker (regression guard for the dead name-sort path). The name column
+// defaults to ascending (alphabetical), so blender sorts before chrome; the
+// buggy PID fallthrough would have put chrome (pid 101) first.
+context.setProcSort("name");
+procRows = document.getElementById("processesBody").children;
+assert(procRows[0].children[0].textContent === "blender · 202", "name sort asc did not order lexicographically");
+// Flip to descending: chrome before blender (buggy PID fallthrough gives blender).
+context.setProcSort("name");
+procRows = document.getElementById("processesBody").children;
+assert(procRows[0].children[0].textContent === "chrome · 101", "name sort desc did not order lexicographically");
+// Back to apps view + default sort for the rest of the suite.
+context.setProcessesView("apps");
+context.setProcSort("cpu");
+// Unavailable process set degrades to a message row.
+context.render({ ...sampleMetrics(), processes: { available: false, error: "per-process metrics not supported on this platform" } });
+assert(document.getElementById("processesSummary").textContent === "unavailable", "unavailable process set did not render summary");
+assert(document.getElementById("processesBody").children.length === 1, "unavailable process set did not render a message row");
+assert(document.getElementById("processesPanel").classList.contains("processes-unavailable") === true, "unavailable process set did not flag the panel");
+context.render(sampleMetrics());
 
 console.log("ok: dashboard runtime smoke test passed");

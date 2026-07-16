@@ -7,7 +7,7 @@ const settingsRoundTrip = args.includes("--settings-roundtrip");
 const clientCheckRoundTrip = args.includes("--client-check-roundtrip");
 const baseURL = normalizeBaseURL(args.find((arg) => !arg.startsWith("--")) || defaultBaseURL);
 const timeoutMS = 5000;
-const dashboardBuild = "sysmon-static-v112";
+const dashboardBuild = "sysmon-static-v114";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,
@@ -242,6 +242,7 @@ function validateMetrics(metrics) {
   validateNetwork(metrics.network);
   validateTemperatures(metrics.temperatures);
   validateGPU(metrics.gpu);
+  validateProcesses(metrics.processes);
   validateCollectionErrors(metrics.collection_errors);
 }
 
@@ -469,6 +470,59 @@ function validateGPU(gpu) {
   });
 }
 
+// validateProcesses tolerantly shape-checks the optional per-process set,
+// mirroring the GPU set validator. It degrades as a whole on platforms that
+// cannot enumerate processes, so an unavailable set is accepted (it need not
+// carry an error -- the field is optional). When available, each row's numeric
+// fields are allowed to be unavailable (per-field degradation is the point) and
+// are range-checked; only name/pid presence is required.
+function validateProcesses(processes) {
+  if (processes === undefined) {
+    return;
+  }
+  assertObject(processes, "metrics.processes");
+  assert(typeof processes.available === "boolean", "metrics.processes.available must be boolean");
+  if (!processes.available) {
+    return;
+  }
+  assertInteger(processes.total, "metrics.processes.total", { min: 0 });
+  (processes.apps || []).forEach((app, index) => {
+    assertObject(app, `metrics.processes.apps[${index}]`);
+    assertNonEmptyString(app.name, `metrics.processes.apps[${index}].name`);
+    assertInteger(app.count, `metrics.processes.apps[${index}].count`, { min: 1 });
+    validateProcessNumberMetric(app.cpu_percent, `metrics.processes.apps[${index}].cpu_percent`, "%", 0, 100);
+    validateProcessNumberMetric(app.memory_bytes, `metrics.processes.apps[${index}].memory_bytes`, "B", 0);
+    validateProcessNumberMetric(app.gpu_memory, `metrics.processes.apps[${index}].gpu_memory`, "B", 0);
+    validateProcessNumberMetric(app.disk_read, `metrics.processes.apps[${index}].disk_read`, "B/s", 0);
+    validateProcessNumberMetric(app.disk_write, `metrics.processes.apps[${index}].disk_write`, "B/s", 0);
+  });
+  (processes.processes || []).forEach((proc, index) => {
+    assertObject(proc, `metrics.processes.processes[${index}]`);
+    assertInteger(proc.pid, `metrics.processes.processes[${index}].pid`, { min: 1 });
+    assertNonEmptyString(proc.name, `metrics.processes.processes[${index}].name`);
+    validateProcessNumberMetric(proc.cpu_percent, `metrics.processes.processes[${index}].cpu_percent`, "%", 0, 100);
+    validateProcessNumberMetric(proc.memory_bytes, `metrics.processes.processes[${index}].memory_bytes`, "B", 0);
+    validateProcessNumberMetric(proc.gpu_memory, `metrics.processes.processes[${index}].gpu_memory`, "B", 0);
+    validateProcessNumberMetric(proc.disk_read, `metrics.processes.processes[${index}].disk_read`, "B/s", 0);
+    validateProcessNumberMetric(proc.disk_write, `metrics.processes.processes[${index}].disk_write`, "B/s", 0);
+  });
+}
+
+// validateProcessNumberMetric is the per-field NumberMetric check used inside
+// validateProcesses. Every process/app field may be unavailable (per-field
+// degradation), so it accepts an unavailable value and only range-checks
+// available ones.
+function validateProcessNumberMetric(metric, name, unit, min, max = Number.POSITIVE_INFINITY) {
+  assertObject(metric, name);
+  assert(metric.unit === unit, `${name}.unit must be ${unit}`);
+  assert(typeof metric.available === "boolean", `${name}.available must be boolean`);
+  if (!metric.available) {
+    return;
+  }
+  assertFiniteNumber(metric.value, `${name}.value`);
+  assert(metric.value >= min && metric.value <= max, `${name}.value out of range: ${metric.value}`);
+}
+
 function validateCollectionErrors(errors, name = "metrics.collection_errors") {
   if (errors === undefined) {
     return;
@@ -636,6 +690,28 @@ function sampleMetrics() {
         temperature_celsius: { available: true, value: 49, unit: "C" },
       }],
       error: "nvidia-smi not found",
+    },
+    processes: {
+      available: true,
+      total: 142,
+      apps: [{
+        name: "chrome",
+        count: 12,
+        cpu_percent: { available: true, value: 23.5, unit: "%" },
+        memory_bytes: { available: true, value: 4_294_967_296, unit: "B" },
+        gpu_memory: { available: true, value: 536_870_912, unit: "B" },
+        disk_read: { available: true, value: 1024, unit: "B/s" },
+        disk_write: { available: false, unit: "B/s", error: "no process reported this field" },
+      }],
+      processes: [{
+        pid: 4321,
+        name: "chrome",
+        cpu_percent: { available: true, value: 18.2, unit: "%" },
+        memory_bytes: { available: true, value: 805_306_368, unit: "B" },
+        gpu_memory: { available: false, unit: "B", error: "not a CUDA/compute process" },
+        disk_read: { available: false, unit: "B/s", error: "insufficient privilege or warming up" },
+        disk_write: { available: false, unit: "B/s", error: "insufficient privilege or warming up" },
+      }],
     },
     collection_errors: [
       "cpu_power: no CPU package power counters found",

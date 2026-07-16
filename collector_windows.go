@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -71,6 +72,10 @@ type systemCollector struct {
 	prevCPUFast    cpuFastSample
 	prevCPUFastSet bool
 	prevCPUCores   []cpuFastSample
+	// prevProc holds the previous per-PID cumulative CPU-second counters used to
+	// derive per-process CPU% as a delta. It is replaced wholesale each slow
+	// pass, so dead PIDs are pruned automatically. Guarded by mu.
+	prevProc map[int]procSample
 	// hardwareOnce resolves the static identity strings (CPU model, RAM
 	// type/speed/channel) exactly once -- they never change at runtime and the
 	// lookups spawn CIM queries, so this keeps the cost off every slow pass.
@@ -94,6 +99,15 @@ type netCounter struct {
 	txBytes uint64
 }
 
+// procSample holds the previous cumulative TotalProcessorTime (seconds) for one
+// PID so the slow lane can derive per-process CPU% as a delta between passes.
+// Disk I/O on Windows comes straight from the Get-Counter rate counter (no
+// delta needed), so no disk counters are stored here.
+type procSample struct {
+	cpuSeconds float64
+	ts         time.Time
+}
+
 func NewSystemCollector() MetricsCollector {
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -103,6 +117,7 @@ func NewSystemCollector() MetricsCollector {
 		hostname:  hostname,
 		prevNet:   map[string]netCounter{},
 		prevNetAt: time.Now(),
+		prevProc:  map[int]procSample{},
 	}
 }
 
@@ -160,6 +175,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	var temperatures TemperatureSet
 	var gpu GPUSet
 	var tailscale TailscaleStatus
+	var processes ProcessSet
 
 	collectMetricAsync(&wg, &cpu, func() NumberMetric {
 		return windowsCPU(ctx)
@@ -225,6 +241,11 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	}, func(recovered any) TailscaleStatus {
 		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Windows Tailscale collector panicked: %v", recovered)}
 	})
+	collectMetricAsync(&wg, &processes, func() ProcessSet {
+		return c.collectProcesses(ctx)
+	}, func(recovered any) ProcessSet {
+		return unavailableProcessSet(fmt.Sprintf("Windows process collector panicked: %v", recovered))
+	})
 	wg.Wait()
 
 	metrics.CPU = cpu
@@ -242,6 +263,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.Tailscale = tailscale
 	metrics.Temperatures = temperatures
 	metrics.GPU = gpu
+	metrics.Processes = processes
 	return finishMetrics(metrics, started), nil
 }
 
@@ -524,6 +546,201 @@ func windowsNetCounters(ctx context.Context) (map[string]netCounter, error) {
 		counters[row.Name] = netCounter{rxBytes: row.ReceivedBytes, txBytes: row.SentBytes}
 	}
 	return counters, nil
+}
+
+// collectProcesses builds the per-process set from a single Get-Process call
+// (Id, ProcessName, WorkingSet64, and a computed CpuSeconds) plus a Get-Counter
+// call for per-process disk I/O rates, and joins NVIDIA per-process GPU memory
+// by PID. Per-process CPU% is derived as a delta of cumulative processor time
+// against the previous slow pass, whole-host normalized by the core count so
+// values are comparable to the aggregated CPU gauge. Each field degrades
+// independently: a row whose disk instance could not be resolved reports disk
+// unavailable rather than failing the response. Dead PIDs are pruned
+// automatically because prevProc is rebuilt each pass.
+func (c *systemCollector) collectProcesses(ctx context.Context) ProcessSet {
+	numCPU := runtime.NumCPU()
+	if numCPU < 1 {
+		numCPU = 1
+	}
+	now := time.Now()
+	gpuMem := nvidiaProcessGPUMemory(ctx)
+
+	var rows []windowsProcessRow
+	if err := runPowerShellJSONArray(ctx, `Get-Process | Select-Object Id,ProcessName,WorkingSet64,@{Name='CpuSeconds';Expression={[double]$_.TotalProcessorTime.TotalSeconds}}`, &rows); err != nil {
+		return unavailableProcessSet("Get-Process failed: " + err.Error())
+	}
+	diskReadByPID, diskWriteByPID := windowsProcessDiskRates(ctx)
+
+	current := make(map[int]procSample, len(rows))
+	raw := make([]ProcessMetric, 0, len(rows))
+	for _, row := range rows {
+		if row.ID <= 0 {
+			continue
+		}
+		pm := ProcessMetric{PID: row.ID, Name: windowsProcessName(row)}
+		pm.Memory = availableNumber(float64(row.WorkingSet64), "B")
+		cpuSeconds := windowsProcessorTimeSeconds(row.CpuSeconds)
+
+		c.mu.Lock()
+		prev, hadPrev := c.prevProc[row.ID]
+		c.mu.Unlock()
+		if hadPrev {
+			elapsed := now.Sub(prev.ts).Seconds()
+			pm.CPU = processCPUPercent(cpuSeconds, prev.cpuSeconds, elapsed, numCPU)
+		}
+		if !pm.CPU.Available {
+			pm.CPU = unavailableNumber("%", "process sampler is warming up")
+		}
+
+		pm.DiskRead = windowsProcessRate(diskReadByPID, row.ID)
+		pm.DiskWrite = windowsProcessRate(diskWriteByPID, row.ID)
+
+		if bytes, onGPU := gpuMem[row.ID]; onGPU {
+			pm.GPUMemory = availableNumber(float64(bytes), "B")
+		} else {
+			pm.GPUMemory = unavailableNumber("B", "not a CUDA/compute process")
+		}
+
+		current[row.ID] = procSample{cpuSeconds: cpuSeconds, ts: now}
+		raw = append(raw, pm)
+	}
+
+	c.mu.Lock()
+	c.prevProc = current
+	c.mu.Unlock()
+	return buildProcessSet(raw, len(raw))
+}
+
+// windowsProcessRow models one Get-Process result. CpuSeconds is computed in
+// PowerShell ([double]$_.TotalProcessorTime.TotalSeconds) so the JSON carries a
+// plain number rather than a TimeSpan object/string, which ConvertTo-Json does
+// not serialize predictably. WorkingSet64 is the resident set in bytes.
+type windowsProcessRow struct {
+	ID           int     `json:"Id"`
+	ProcessName  string  `json:"ProcessName"`
+	WorkingSet64 uint64  `json:"WorkingSet64"`
+	CpuSeconds   float64 `json:"CpuSeconds"`
+}
+
+func windowsProcessName(row windowsProcessRow) string {
+	name := strings.TrimSpace(row.ProcessName)
+	if name == "" {
+		return fmt.Sprintf("pid %d", row.ID)
+	}
+	return name
+}
+
+// windowsProcessorTimeSeconds returns the cumulative processor time for a PID
+// as seconds, guarded against non-finite/negative garbage. The value is
+// computed in PowerShell from TotalProcessorTime.TotalSeconds.
+func windowsProcessorTimeSeconds(seconds float64) float64 {
+	if !isFinite(seconds) || seconds < 0 {
+		return 0
+	}
+	return seconds
+}
+
+// windowsProcessDiskRates queries the per-process IO Read/Write Bytes/sec rate
+// counters and resolves each instance back to a PID via the ID Process counter
+// (Get-Counter names instances like "chrome#1"; the ID Process counter is the
+// authoritative PID mapping). Returns pid -> bytes/sec maps; PIDs without a
+// resolved counter are absent and degrade to unavailable per row. The counter
+// is combined disk+file+device I/O (an approximation of "disk"), since a
+// pure-disk per-process number is ETW-only.
+func windowsProcessDiskRates(ctx context.Context) (readByPID, writeByPID map[int]float64) {
+	readByPID = map[int]float64{}
+	writeByPID = map[int]float64{}
+	var rows []windowsProcessIOCounter
+	script := `Get-Counter '\Process(*)\IO Read Bytes/sec','\Process(*)\IO Write Bytes/sec','\Process(*)\ID Process' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty CounterSamples | Select-Object Path,CookedValue`
+	if err := runPowerShellJSONArray(ctx, script, &rows); err != nil {
+		return readByPID, writeByPID
+	}
+	pidsByInstance := map[string]int{}
+	readByInstance := map[string]float64{}
+	writeByInstance := map[string]float64{}
+	for _, row := range rows {
+		value, ok := windowsProcessIOValue(row.CookedValue)
+		if !ok {
+			continue
+		}
+		switch windowsProcessIOKind(row.Path) {
+		case "id":
+			pidsByInstance[windowsProcessIOInstance(row.Path)] = int(value)
+		case "read":
+			readByInstance[windowsProcessIOInstance(row.Path)] = value
+		case "write":
+			writeByInstance[windowsProcessIOInstance(row.Path)] = value
+		}
+	}
+	for instance, pid := range pidsByInstance {
+		if pid <= 0 {
+			continue
+		}
+		if v, ok := readByInstance[instance]; ok {
+			readByPID[pid] = v
+		}
+		if v, ok := writeByInstance[instance]; ok {
+			writeByPID[pid] = v
+		}
+	}
+	return readByPID, writeByPID
+}
+
+type windowsProcessIOCounter struct {
+	Path        string   `json:"Path"`
+	CookedValue *float64 `json:"CookedValue"`
+}
+
+func windowsProcessIOValue(value *float64) (float64, bool) {
+	if value == nil || math.IsNaN(*value) || math.IsInf(*value, 0) || *value < 0 {
+		return 0, false
+	}
+	return *value, true
+}
+
+// windowsProcessIOKind classifies a Get-Counter sample path as the read, write,
+// or ID Process counter, so the three queries can be resolved back to per-PID
+// rates. Counter paths look like "\\\\computer\\process(...)\\io read bytes/sec".
+func windowsProcessIOKind(path string) string {
+	p := strings.ToLower(path)
+	switch {
+	case strings.Contains(p, "id process"):
+		return "id"
+	case strings.Contains(p, "io read bytes"):
+		return "read"
+	case strings.Contains(p, "io write bytes"):
+		return "write"
+	}
+	return ""
+}
+
+// windowsProcessIOInstance extracts the bare instance name (the parenthesised
+// token) from a Get-Counter sample path, lowercased so read/write/id samples
+// for the same instance match. The instance is everything between the last
+// "process(" and the following ")".
+func windowsProcessIOInstance(path string) string {
+	p := strings.ToLower(path)
+	start := strings.LastIndex(p, "process(")
+	if start < 0 {
+		return ""
+	}
+	rest := p[start+len("process("):]
+	end := strings.IndexByte(rest, ')')
+	if end < 0 {
+		return rest
+	}
+	return rest[:end]
+}
+
+// windowsProcessRate turns a per-PID bytes/sec map entry into a NumberMetric,
+// degrading to unavailable when the PID had no resolved counter (the _Total
+// instance and idle processes have none).
+func windowsProcessRate(rates map[int]float64, pid int) NumberMetric {
+	value, ok := rates[pid]
+	if !ok || !isFinite(value) {
+		return unavailableNumber("B/s", "no disk I/O counter for this process")
+	}
+	return availableNumber(value, "B/s")
 }
 
 // windowsCPUPower reads CPU package power from the LibreHardwareMonitor WMI

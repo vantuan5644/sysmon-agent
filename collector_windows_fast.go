@@ -243,6 +243,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	var temperatures TemperatureSet
 	var gpu GPUSet
 	var tailscale TailscaleStatus
+	var processes ProcessSet
 
 	// One bridge invocation per slow pass feeds CPU power, clock, PSU and temps;
 	// LHM's kernel driver does not tolerate concurrent Computer.Open() calls.
@@ -297,6 +298,11 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	}, func(recovered any) CapacityMetric {
 		return unavailableCapacity(fmt.Sprintf("Windows swap collector panicked: %v", recovered))
 	})
+	collectMetricAsync(&wg, &processes, func() ProcessSet {
+		return c.collectProcesses(ctx)
+	}, func(recovered any) ProcessSet {
+		return unavailableProcessSet(fmt.Sprintf("Windows process collector panicked: %v", recovered))
+	})
 	wg.Wait()
 
 	cpuTemperature := pickCPUTemperature(temperatures)
@@ -316,6 +322,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		m.Tailscale = tailscale
 		m.Temperatures = temperatures
 		m.GPU = gpu
+		m.Processes = processes
 	}
 }
 
@@ -337,6 +344,7 @@ func windowsDegradedSlowPatch(message string) func(*Metrics) {
 		m.Tailscale = TailscaleStatus{Available: false, Error: message}
 		m.Temperatures = TemperatureSet{Available: false, Error: message}
 		m.GPU = GPUSet{Available: false, Error: message}
+		m.Processes = unavailableProcessSet(message)
 	}
 }
 

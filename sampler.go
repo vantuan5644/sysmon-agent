@@ -143,6 +143,7 @@ func warmingMetrics(hostname string) Metrics {
 	m.Tailscale = TailscaleStatus{Available: false, Error: warming}
 	m.Temperatures = TemperatureSet{Available: false, Error: warming}
 	m.GPU = GPUSet{Available: false, Error: warming}
+	m.Processes = unavailableProcessSet(warming)
 	return m
 }
 

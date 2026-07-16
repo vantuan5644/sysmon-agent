@@ -165,3 +165,32 @@ func TestNVIDIAPowerMetricHandlesMissingAndInvalidColumns(t *testing.T) {
 		t.Fatalf("nvidiaPowerMetric([120.25]) = %+v, want 120.25 W", got)
 	}
 }
+
+func TestParseNVIDIAProcessGPUMemory(t *testing.T) {
+	out := "1234, 512\n5678, 1024.5\n0, 256\nnotapid, 100\n9012, N/A\n"
+	got := parseNVIDIAProcessGPUMemory(out)
+	if len(got) != 2 {
+		t.Fatalf("parseNVIDIAProcessGPUMemory produced %d entries, want 2: %+v", len(got), got)
+	}
+	if got[1234] != 512*bytesPerMiB {
+		t.Errorf("pid 1234 = %d, want %d", got[1234], 512*bytesPerMiB)
+	}
+	if got[5678] != int64(1024.5*float64(bytesPerMiB)) {
+		t.Errorf("pid 5678 = %d, want %d", got[5678], int64(1024.5*float64(bytesPerMiB)))
+	}
+	if _, dup := got[0]; dup {
+		t.Errorf("pid 0 should be skipped (invalid)")
+	}
+	if _, dup := got[9012]; dup {
+		t.Errorf("pid 9012 N/A memory should be skipped")
+	}
+}
+
+func TestParseNVIDIAProcessGPUMemoryEmpty(t *testing.T) {
+	if got := parseNVIDIAProcessGPUMemory(""); len(got) != 0 {
+		t.Errorf("empty input produced %d entries, want 0", len(got))
+	}
+	if got := parseNVIDIAProcessGPUMemory("malformed"); len(got) != 0 {
+		t.Errorf("unparsable input produced %v, want empty", got)
+	}
+}

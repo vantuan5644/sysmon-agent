@@ -27,6 +27,7 @@ const state = {
   alertsExpanded: false,
   alertMessages: [],
   staleDashboardBuild: "",
+  lastProcesses: null,
   staticRefreshInFlight: false,
   lastMetricsAtMS: 0,
   lastMetricTimestampMS: 0,
@@ -56,7 +57,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v112";
+const dashboardBuild = "sysmon-static-v114";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -111,6 +112,13 @@ const wakePreferenceKey = "sysmon:wake-wanted";
 // the pager to re-measure the active page and resize to fit it.
 let pagerSyncHeight = null;
 
+// Per-process "App details" page UI state. Client-only -- not persisted
+// server-side -- so a reload returns to the Apps view sorted by CPU. appsView
+// is "apps" (grouped by executable) or "processes" (one row per PID); procSort
+// drives the client-side re-sort within the server-sent top-N rows.
+let appsView = "apps";
+let procSort = { col: "cpu", dir: "desc" };
+
 const $ = (id) => document.getElementById(id);
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -126,6 +134,11 @@ document.addEventListener("DOMContentLoaded", () => {
   $("alertsPanel").addEventListener("keydown", handleAlertsPanelKeydown);
   $("issuesPanel").addEventListener("click", toggleIssuesPanel);
   $("issuesPanel").addEventListener("keydown", handleIssuesPanelKeydown);
+  $("processesViewApps").addEventListener("click", () => setProcessesView("apps"));
+  $("processesViewProcs").addEventListener("click", () => setProcessesView("processes"));
+  for (const button of document.querySelectorAll(".processes-sort")) {
+    button.addEventListener("click", () => setProcSort(button.dataset.procSort));
+  }
   $("statusStrip").addEventListener("click", refreshNow);
   $("statusStrip").addEventListener("keydown", (event) => {
     if (event.key === "Enter" || event.key === " ") {
@@ -134,6 +147,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
   setupPager();
+  reflectProcSort();
 
   document.addEventListener("visibilitychange", handleVisibilityChange);
   window.addEventListener("online", refreshVisibleDashboard);
@@ -164,7 +178,7 @@ document.addEventListener("DOMContentLoaded", () => {
 // mock DOM has no scroll geometry) is a no-op rather than a crash.
 function setupPager() {
   const pager = $("pager");
-  const dots = [$("pageDot0"), $("pageDot1")];
+  const dots = [$("pageDot0"), $("pageDot1"), $("pageDot2")];
   if (!pager || dots.some((dot) => !dot)) {
     return;
   }
@@ -1105,6 +1119,8 @@ function render(metrics) {
   setNetGauge(net);
 
   renderPrimaryCardDetails(metrics, primaryGPU);
+  state.lastProcesses = metrics.processes || { available: false };
+  renderApps(metrics.processes);
 }
 
 // networkTotals sums RX/TX byte rates across every interface into one aggregate
@@ -1598,6 +1614,234 @@ function renderPrimaryCardDetails(metrics, primaryGPU) {
     : "no swap", null, null);
 
   renderNetDetail(metrics.tailscale);
+}
+
+// renderApps drives the App details page: the Apps view (processes grouped by
+// executable) and the Processes view (one row per PID), each with a client-side
+// re-sort. It degrades to a graceful message when the platform cannot enumerate
+// processes; unavailable per-field cells render as an em dash. No inner
+// scrollbar -- the page grows with its rows and the pager re-measures the
+// active page height afterward.
+function renderApps(processes) {
+  const body = $("processesBody");
+  const summary = $("processesSummary");
+  const panel = $("processesPanel");
+  if (!body) {
+    return;
+  }
+  body.textContent = "";
+  if (!processes || !processes.available) {
+    summary.textContent = processes?.error ? "unavailable" : "--";
+    if (panel) {
+      panel.classList.add("processes-unavailable");
+    }
+    body.append(processesMessage(processes?.error ? processes.error : "process metrics unavailable"));
+    syncPagerAfterRender();
+    return;
+  }
+  if (panel) {
+    panel.classList.remove("processes-unavailable");
+  }
+  summary.textContent = `${processes.total || 0} process${processes.total === 1 ? "" : "es"}`;
+  const rows = appsView === "processes" ? processes.processes || [] : processes.apps || [];
+  if (rows.length === 0) {
+    body.append(processesMessage("no processes reported"));
+    syncPagerAfterRender();
+    return;
+  }
+  const sorted = sortProcessRows(rows, procSort);
+  for (const row of sorted) {
+    body.append(processRow(row, appsView));
+  }
+  syncPagerAfterRender();
+}
+
+// setProcessesView toggles the Apps/Processes view and re-renders from the last
+// metrics payload. Re-rendering rather than waiting for the next poll keeps the
+// toggle snappy and lets the client-side sort apply immediately.
+function setProcessesView(view) {
+  if (view !== "apps" && view !== "processes") {
+    return;
+  }
+  if (appsView === view) {
+    return;
+  }
+  appsView = view;
+  $("processesViewApps").classList.toggle("active", view === "apps");
+  $("processesViewApps").setAttribute("aria-selected", view === "apps" ? "true" : "false");
+  $("processesViewProcs").classList.toggle("active", view === "processes");
+  $("processesViewProcs").setAttribute("aria-selected", view === "processes" ? "true" : "false");
+  renderApps(lastProcessSet());
+}
+
+// setProcSort re-sorts the process rows by a column. Tapping the active column
+// flips the direction; tapping a new column defaults to descending (ascending
+// for the name column).
+function setProcSort(col) {
+  if (!procColumnKey(col)) {
+    return;
+  }
+  if (procSort.col === col) {
+    procSort = { col, dir: procSort.dir === "asc" ? "desc" : "asc" };
+  } else {
+    procSort = { col, dir: col === "name" ? "asc" : "desc" };
+  }
+  reflectProcSort();
+  renderApps(lastProcessSet());
+}
+
+// lastProcessSet returns the processes block from the most recent metrics
+// render so view/sort changes can re-render without a fresh fetch. The render
+// path stashes it in state.lastProcesses.
+function lastProcessSet() {
+  return state.lastProcesses || { available: false };
+}
+
+// reflectProcSort marks the active sort column + direction on the header buttons
+// so the CSS can show an indicator. Tolerates a missing header (layout-less
+// verifier) by no-oping.
+function reflectProcSort() {
+  for (const button of document.querySelectorAll(".processes-sort")) {
+    const active = button.dataset.procSort === procSort.col;
+    button.classList.toggle("sorted", active);
+    button.dataset.procDir = active ? procSort.dir : "";
+  }
+}
+
+function sortProcessRows(rows, sort) {
+  const key = procColumnKey(sort.col) || "cpu";
+  const dir = sort.dir === "asc" ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    // Name sorts lexicographically, with PID as a stable tiebreaker. Handled up
+    // front because procRowValue collapses names to a constant, so routing the
+    // name column through the numeric path below would only ever hit the
+    // tiebreaker (sorting by PID, not name).
+    if (key === "name") {
+      const nameCmp = String(a.name || "").localeCompare(String(b.name || ""));
+      return (nameCmp || (a.pid || 0) - (b.pid || 0)) * dir;
+    }
+    const av = procRowValue(a, key);
+    const bv = procRowValue(b, key);
+    if (av === bv) {
+      // Stable tiebreaker: name, then PID (processes view only).
+      const nameCmp = String(a.name || "").localeCompare(String(b.name || ""));
+      if (nameCmp !== 0) {
+        return nameCmp;
+      }
+      return ((a.pid || 0) - (b.pid || 0)) * dir;
+    }
+    return (av - bv) * dir;
+  });
+}
+
+function procColumnKey(col) {
+  switch (col) {
+    case "name":
+    case "cpu":
+    case "memory":
+    case "gpu":
+    case "disk":
+      return col;
+    default:
+      return null;
+  }
+}
+
+// procRowValue extracts a comparable numeric magnitude for one row + column.
+// Unavailable fields sort as -1 so they sink below available values in desc
+// order (and rise above in asc), and the disk column sums read+write.
+function procRowValue(row, key) {
+  switch (key) {
+    case "name":
+      return 0;
+    case "cpu":
+      return procMagnitude(row.cpu_percent);
+    case "memory":
+      return procMagnitude(row.memory_bytes);
+    case "gpu":
+      return procMagnitude(row.gpu_memory);
+    case "disk":
+      return procMagnitude(row.disk_read) + procMagnitude(row.disk_write);
+    default:
+      return -1;
+  }
+}
+
+function procMagnitude(metric) {
+  const value = numberMetric(metric);
+  return value.available ? value.value : -1;
+}
+
+// processRow builds one row element for the Apps or Processes view. The leading
+// cell carries the name (plus a per-app PID count or a per-process PID), and the
+// trailing cells carry CPU/RAM/GPU/Disk with per-cell heat colour.
+function processRow(row, view) {
+  const el = document.createElement("div");
+  el.className = "processes-row";
+  el.setAttribute("role", "row");
+
+  const name = document.createElement("div");
+  name.className = "processes-cell processes-name";
+  name.textContent = view === "apps" ? procAppLabel(row) : procProcLabel(row);
+  el.append(name);
+  el.append(procCell(row.cpu_percent, formatProcPercent, thresholdValue("cpu_warn"), "cpu"));
+  el.append(procCell(row.memory_bytes, (v) => formatBytes(v), null, "memory"));
+  el.append(procCell(row.gpu_memory, (v) => formatBytes(v), null, "gpu"));
+  const diskRead = numberMetric(row.disk_read);
+  const diskWrite = numberMetric(row.disk_write);
+  const diskValue = (diskRead.available ? diskRead.value : 0) + (diskWrite.available ? diskWrite.value : 0);
+  el.append(procCell({
+    available: diskRead.available || diskWrite.available,
+    value: diskValue,
+    unit: "B/s",
+  }, formatRateCompact, null, "disk"));
+  return el;
+}
+
+function procAppLabel(row) {
+  const name = nonEmptyText(row.name) || "unknown";
+  if (row.count && row.count > 1) {
+    return `${name} · ${row.count}`;
+  }
+  return name;
+}
+
+function procProcLabel(row) {
+  const name = nonEmptyText(row.name) || `pid ${row.pid}`;
+  return `${name} · ${row.pid}`;
+}
+
+// procCell builds one numeric cell. Available values are formatted + heat-
+// coloured against an optional warn threshold (CPU only); unavailable cells
+// render an em dash with the muted colour so the row never fails on one sensor.
+function procCell(metric, format, warnThreshold, column) {
+  const cell = document.createElement("div");
+  cell.className = `processes-cell processes-value processes-${column}`;
+  const value = numberMetric(metric);
+  if (!value.available) {
+    cell.textContent = "—";
+    cell.classList.add("unavailable");
+    return cell;
+  }
+  cell.textContent = format(value.value);
+  if (warnThreshold !== null) {
+    const pct = column === "cpu" ? value.value : null;
+    if (pct !== null) {
+      cell.style.setProperty("--c", colorFor(pct, warnThreshold));
+    }
+  }
+  return cell;
+}
+
+function formatProcPercent(value) {
+  return `${Math.round(value)}%`;
+}
+
+function processesMessage(text) {
+  const el = document.createElement("div");
+  el.className = "processes-message";
+  el.textContent = text;
+  return el;
 }
 
 // renderCardIdentities fills each card's identity line: CPU model, GPU model,

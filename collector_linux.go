@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +28,11 @@ type systemCollector struct {
 	prevRAPL    map[string]raplCounter
 	prevRAPLAt  time.Time
 	prevRAPLSet bool
+	// prevProc holds the previous per-PID cumulative CPU-second and disk-byte
+	// counters used to derive per-process CPU% and disk rates as a delta. It is
+	// replaced wholesale each slow pass, so dead PIDs are pruned automatically.
+	// Guarded by mu. See collectProcesses.
+	prevProc map[int]procSample
 
 	// hardwareOnce resolves the static identity strings (CPU model, RAM
 	// type/speed) exactly once -- they never change at runtime and RAM needs a
@@ -59,6 +65,16 @@ type raplCounter struct {
 	maxUJ    uint64
 }
 
+// procSample holds the previous cumulative counters for one PID so the slow
+// lane can derive per-process CPU% and Disk I/O rates as deltas between passes.
+type procSample struct {
+	cpuSeconds float64
+	ts         time.Time
+	diskRead   uint64
+	diskWrite  uint64
+	diskAvail  bool
+}
+
 func NewSystemCollector() MetricsCollector {
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -68,6 +84,7 @@ func NewSystemCollector() MetricsCollector {
 		hostname:  hostname,
 		prevNet:   map[string]netCounter{},
 		prevNetAt: time.Now(),
+		prevProc:  map[int]procSample{},
 	}
 	if cpu, err := readCPUTimes(); err == nil {
 		c.prevCPU = cpu
@@ -105,6 +122,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	var temperatures TemperatureSet
 	var gpu GPUSet
 	var tailscale TailscaleStatus
+	var processes ProcessSet
 
 	collectMetricAsync(&wg, &cpu, func() NumberMetric {
 		return c.collectCPU(ctx)
@@ -159,6 +177,11 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	}, func(recovered any) TailscaleStatus {
 		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Linux Tailscale collector panicked: %v", recovered)}
 	})
+	collectMetricAsync(&wg, &processes, func() ProcessSet {
+		return c.collectProcesses(ctx)
+	}, func(recovered any) ProcessSet {
+		return unavailableProcessSet(fmt.Sprintf("Linux process collector panicked: %v", recovered))
+	})
 	wg.Wait()
 
 	metrics.CPU = cpu
@@ -176,6 +199,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.Tailscale = tailscale
 	metrics.Temperatures = temperatures
 	metrics.GPU = gpu
+	metrics.Processes = processes
 	return finishMetrics(metrics, started), nil
 }
 
@@ -237,6 +261,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	var temperatures TemperatureSet
 	var gpu GPUSet
 	var tailscale TailscaleStatus
+	var processes ProcessSet
 
 	collectMetricAsync(&wg, &cpuPower, func() NumberMetric {
 		return c.collectCPUPower(ctx)
@@ -278,6 +303,11 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	}, func(recovered any) TailscaleStatus {
 		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Linux Tailscale collector panicked: %v", recovered)}
 	})
+	collectMetricAsync(&wg, &processes, func() ProcessSet {
+		return c.collectProcesses(ctx)
+	}, func(recovered any) ProcessSet {
+		return unavailableProcessSet(fmt.Sprintf("Linux process collector panicked: %v", recovered))
+	})
 	wg.Wait()
 
 	cpuTemperature := pickCPUTemperature(temperatures)
@@ -296,6 +326,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		m.Tailscale = tailscale
 		m.Temperatures = temperatures
 		m.GPU = gpu
+		m.Processes = processes
 	}
 }
 
@@ -316,6 +347,7 @@ func linuxDegradedSlowPatch(message string) func(*Metrics) {
 		m.Tailscale = TailscaleStatus{Available: false, Error: message}
 		m.Temperatures = TemperatureSet{Available: false, Error: message}
 		m.GPU = GPUSet{Available: false, Error: message}
+		m.Processes = unavailableProcessSet(message)
 	}
 }
 
@@ -1341,4 +1373,241 @@ func readFirstLine(path string) string {
 	}
 	line, _, _ := strings.Cut(string(data), "\n")
 	return strings.TrimSpace(line)
+}
+
+// linuxClockTicksPerSecond is the USER_HZ clock tick rate used by the
+// /proc/[pid]/stat utime+stime fields. It has been 100 Hz on essentially every
+// Linux/x86 and Linux/arm kernel for decades; the stdlib does not expose
+// sysconf(_SC_CLK_TCK), so this constant converts jiffies to seconds. A host
+// with a non-standard rate (extremely rare, mostly embedded) would mis-scale
+// per-process CPU% by a constant factor without failing the response.
+const linuxClockTicksPerSecond = 100.0
+
+// collectProcesses enumerates /proc/[pid] once per slow pass and derives the
+// per-process CPU% (delta of utime+stime jiffies, whole-host normalized so it
+// is comparable to the aggregated CPU gauge), RSS from /proc/[pid]/status,
+// Disk I/O rates (delta of /proc/[pid]/io read_bytes/write_bytes), and joins
+// NVIDIA per-process GPU memory by PID. Each field degrades independently: a
+// PID the agent lacks privilege to read (another user's PID under a --user
+// service) degrades its disk/memory fields rather than the row. New PIDs with
+// no prior sample report CPU as unavailable for one cycle, then fill next pass.
+// Dead PIDs are pruned automatically because prevProc is rebuilt each pass.
+func (c *systemCollector) collectProcesses(ctx context.Context) ProcessSet {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return unavailableProcessSet("read /proc: " + err.Error())
+	}
+	numCPU := runtime.NumCPU()
+	if numCPU < 1 {
+		numCPU = 1
+	}
+	now := time.Now()
+	gpuMem := nvidiaProcessGPUMemory(ctx)
+
+	current := make(map[int]procSample, len(entries))
+	raw := make([]ProcessMetric, 0, 64)
+	total := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, ok := parsePID(entry.Name())
+		if !ok {
+			continue
+		}
+		total++
+		pr, readOK := readLinuxProcess(entry.Name())
+		if !readOK {
+			continue
+		}
+		pm := ProcessMetric{PID: pr.pid, Name: pr.name}
+		if pr.rssAvail {
+			pm.Memory = availableNumber(float64(pr.rssBytes), "B")
+		} else {
+			pm.Memory = unavailableNumber("B", "resident memory unavailable")
+		}
+
+		c.mu.Lock()
+		prev, hadPrev := c.prevProc[pid]
+		c.mu.Unlock()
+
+		elapsed := now.Sub(prev.ts).Seconds()
+		if hadPrev && elapsed > 0 {
+			pm.CPU = processCPUPercent(pr.cpuSeconds, prev.cpuSeconds, elapsed, numCPU)
+			pm.DiskRead = processDiskRate(pr.diskRead, prev.diskRead, pr.diskAvail, prev.diskAvail, elapsed)
+			pm.DiskWrite = processDiskRate(pr.diskWrite, prev.diskWrite, pr.diskAvail, prev.diskAvail, elapsed)
+		}
+		if !pm.CPU.Available {
+			pm.CPU = unavailableNumber("%", "process sampler is warming up")
+		}
+		if !pm.DiskRead.Available {
+			pm.DiskRead = unavailableNumber("B/s", "insufficient privilege or warming up")
+		}
+		if !pm.DiskWrite.Available {
+			pm.DiskWrite = unavailableNumber("B/s", "insufficient privilege or warming up")
+		}
+
+		if bytes, onGPU := gpuMem[pid]; onGPU {
+			pm.GPUMemory = availableNumber(float64(bytes), "B")
+		} else {
+			pm.GPUMemory = unavailableNumber("B", "not a CUDA/compute process")
+		}
+
+		current[pid] = procSample{
+			cpuSeconds: pr.cpuSeconds,
+			ts:         now,
+			diskRead:   pr.diskRead,
+			diskWrite:  pr.diskWrite,
+			diskAvail:  pr.diskAvail,
+		}
+		raw = append(raw, pm)
+	}
+
+	c.mu.Lock()
+	c.prevProc = current
+	c.mu.Unlock()
+	return buildProcessSet(raw, total)
+}
+
+// linuxProcessRaw is the cumulative-counter snapshot read from /proc/[pid] for
+// one PID, before delta math turns it into rates.
+type linuxProcessRaw struct {
+	pid        int
+	name       string
+	cpuSeconds float64
+	rssBytes   uint64
+	rssAvail   bool
+	diskRead   uint64
+	diskWrite  uint64
+	diskAvail  bool
+}
+
+func parsePID(name string) (int, bool) {
+	pid, err := strconv.Atoi(name)
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
+}
+
+func readLinuxProcess(pidStr string) (linuxProcessRaw, bool) {
+	pid, ok := parsePID(pidStr)
+	if !ok {
+		return linuxProcessRaw{}, false
+	}
+	stat, err := os.ReadFile("/proc/" + pidStr + "/stat")
+	if err != nil {
+		return linuxProcessRaw{}, false
+	}
+	utime, stime, name, ok := parseLinuxProcStat(string(stat))
+	if !ok {
+		return linuxProcessRaw{}, false
+	}
+	pr := linuxProcessRaw{
+		pid:        pid,
+		name:       name,
+		cpuSeconds: float64(utime+stime) / linuxClockTicksPerSecond,
+	}
+	pr.rssBytes, pr.rssAvail = readLinuxProcRSS(pidStr)
+	pr.diskRead, pr.diskWrite, pr.diskAvail = readLinuxProcIO(pidStr)
+	return pr, true
+}
+
+// parseLinuxProcStat extracts the process name (between the first '(' and the
+// last ')', which may itself contain spaces/parens) plus the utime (field 14)
+// and stime (field 15) jiffy counters from a /proc/[pid]/stat line. The fields
+// after the comm are indexed relative to the slice following the last ')'.
+func parseLinuxProcStat(stat string) (utime, stime uint64, name string, ok bool) {
+	rp := strings.LastIndexByte(stat, ')')
+	if rp < 0 {
+		return 0, 0, "", false
+	}
+	lp := strings.IndexByte(stat, '(')
+	if lp >= 0 && lp < rp {
+		name = stat[lp+1 : rp]
+	}
+	rest := strings.Fields(stat[rp+1:])
+	// state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5) flags(6)
+	// minflt(7) cminflt(8) majflt(9) cmajflt(10) utime(11) stime(12)
+	if len(rest) < 13 {
+		return 0, 0, name, false
+	}
+	var err error
+	utime, err = strconv.ParseUint(rest[11], 10, 64)
+	if err != nil {
+		return 0, 0, name, false
+	}
+	stime, err = strconv.ParseUint(rest[12], 10, 64)
+	if err != nil {
+		return 0, 0, name, false
+	}
+	return utime, stime, name, true
+}
+
+// readLinuxProcRSS returns the resident set size in bytes from the VmRSS line
+// of /proc/[pid]/status. It degrades to unavailable when the file is absent or
+// unreadable (e.g. another user's PID under a --user service).
+func readLinuxProcRSS(pidStr string) (uint64, bool) {
+	data, err := os.ReadFile("/proc/" + pidStr + "/status")
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "VmRSS:" {
+			continue
+		}
+		kib, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		bytes, ok := kibToBytes(kib)
+		return bytes, ok
+	}
+	return 0, false
+}
+
+// readLinuxProcIO returns the cumulative read_bytes/write_bytes counters from
+// /proc/[pid]/io. The file is root-only (0400), so an unprivileged reader gets
+// EACCES for other users' PIDs; callers report disk I/O as unavailable for
+// those rows instead of failing the whole set.
+func readLinuxProcIO(pidStr string) (read, write uint64, ok bool) {
+	data, err := os.ReadFile("/proc/" + pidStr + "/io")
+	if err != nil {
+		return 0, 0, false
+	}
+	gotR, gotW := false, false
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		val, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch fields[0] {
+		case "read_bytes:":
+			read = val
+			gotR = true
+		case "write_bytes:":
+			write = val
+			gotW = true
+		}
+	}
+	return read, write, gotR && gotW
+}
+
+// processDiskRate turns two cumulative byte counters into a bytes/sec rate for
+// one process. A counter reset (process restart) or missing privilege degrades
+// to unavailable; warming up (no prior sample) degrades the same way for one
+// cycle.
+func processDiskRate(current, previous uint64, currentOK, previousOK bool, elapsedSeconds float64) NumberMetric {
+	if elapsedSeconds <= 0 || !currentOK || !previousOK {
+		return unavailableNumber("B/s", "process disk sampler is warming up")
+	}
+	if current < previous {
+		return unavailableNumber("B/s", "process disk counter reset")
+	}
+	return availableNumber(float64(current-previous)/elapsedSeconds, "B/s")
 }

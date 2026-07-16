@@ -97,6 +97,54 @@ type GPUSet struct {
 	Error     string      `json:"error,omitempty"`
 }
 
+// ProcessMetric is one row of the per-process "mini Task Manager + nvitop"
+// page: a single PID with its CPU% (whole-host normalized 0..100), RAM
+// (RSS/WorkingSet), GPU memory (CUDA/compute processes only), and Disk I/O
+// rates. Each numeric field degrades independently per the core invariant, so
+// a process the agent lacks privilege to read (e.g. another user's PID under a
+// --user service) degrades just the unread fields rather than the row.
+type ProcessMetric struct {
+	PID       int          `json:"pid"`
+	Name      string       `json:"name"`
+	CPU       NumberMetric `json:"cpu_percent"`  // whole-host %, 0..100
+	Memory    NumberMetric `json:"memory_bytes"` // RSS/WorkingSet, unit "B"
+	GPUMemory NumberMetric `json:"gpu_memory"`   // bytes; unavailable for non-CUDA processes
+	DiskRead  NumberMetric `json:"disk_read"`    // bytes/sec
+	DiskWrite NumberMetric `json:"disk_write"`   // bytes/sec
+}
+
+// AppMetric is the Task-Manager-style aggregate of every ProcessMetric that
+// shares an executable (grouped by the lowercased base name, with a .exe suffix
+// stripped). Count is the number of PIDs merged. Each summed field is available
+// if at least one contributing PID reported it.
+type AppMetric struct {
+	Name      string       `json:"name"`
+	Count     int          `json:"count"`
+	CPU       NumberMetric `json:"cpu_percent"`
+	Memory    NumberMetric `json:"memory_bytes"`
+	GPUMemory NumberMetric `json:"gpu_memory"`
+	DiskRead  NumberMetric `json:"disk_read"`
+	DiskWrite NumberMetric `json:"disk_write"`
+}
+
+// ProcessSet is the per-process view served to the new dashboard page. It
+// carries both an Apps breakdown (processes grouped by executable) and a
+// Processes view (one row per PID), each already trimmed to the top resource
+// consumers by a union of per-column leaders (see processes.go). Total is the
+// full host process count for the page header. It degrades as a whole
+// (Available:false + Error) on platforms that cannot enumerate processes, and
+// per-field within each row. Intentionally NOT rolled into collection_errors,
+// like Tailscale: it is an optional subsystem whose absence on some platforms
+// would be permanent noise; the Error string still ships in the JSON for the
+// process page to render.
+type ProcessSet struct {
+	Available bool            `json:"available"`
+	Total     int             `json:"total"`
+	Apps      []AppMetric     `json:"apps,omitempty"`
+	Processes []ProcessMetric `json:"processes,omitempty"`
+	Error     string          `json:"error,omitempty"`
+}
+
 // TailscaleStatus reports the host's Tailscale daemon state: whether the node
 // is online to the coordination server and whether it is routing through an
 // exit node. It degrades independently (a missing/offline daemon reports
@@ -131,6 +179,7 @@ type Metrics struct {
 	Tailscale            TailscaleStatus `json:"tailscale"`
 	Temperatures         TemperatureSet  `json:"temperatures"`
 	GPU                  GPUSet          `json:"gpu"`
+	Processes            ProcessSet      `json:"processes"`
 	CollectionDurationMS int64           `json:"collection_duration_ms"`
 	CollectionErrors     []string        `json:"collection_errors,omitempty"`
 }
