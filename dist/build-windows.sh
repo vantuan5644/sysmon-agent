@@ -70,9 +70,19 @@ if [[ -z "$GVI" ]]; then
     fi
 fi
 if [[ -n "$GVI" ]] && [[ -f "$PKG_DIR/version.json" ]]; then
-    ( cd "$PKG_DIR" && "$GVI" -major "$MAJOR" -minor "$MINOR" -patch "$PATCH" \
-        -product-version "$VERSION.0" -ver "$VERSION.0" \
-        -icon "$PKG_DIR/sysmon.ico" -o "$PKG_DIR/resource.syso" 2>/dev/null ) || true
+    # goversioninfo reads StringFileInfo (CompanyName/FileDescription/...) from
+    # version.json (passed positionally), while the -*-ver-* flags override the
+    # numeric FixedFileInfo so the resource matches this build's version instead
+    # of the placeholder baked into the JSON. Flag names track goversioninfo's
+    # current CLI: -ver-major/-ver-minor/-ver-patch (not the long-gone
+    # -major/-minor/-patch) and -file-version (not -ver), or the syso is never
+    # generated and the exe ships with no version resource.
+    ( cd "$PKG_DIR" && "$GVI" \
+        -ver-major "$MAJOR" -ver-minor "$MINOR" -ver-patch "$PATCH" -ver-build 0 \
+        -product-ver-major "$MAJOR" -product-ver-minor "$MINOR" -product-ver-patch "$PATCH" -product-ver-build 0 \
+        -file-version "$VERSION.0" -product-version "$VERSION.0" \
+        -icon "$PKG_DIR/sysmon.ico" -o "$PKG_DIR/resource.syso" \
+        "$PKG_DIR/version.json" ) || true
     [[ -f "$PKG_DIR/resource.syso" ]] && cp "$PKG_DIR/resource.syso" "$ROOT/resource.syso" && SYSO_FLAG=1
 fi
 
