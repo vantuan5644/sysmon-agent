@@ -187,6 +187,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.CPU = cpu
 	metrics.CPUCores = c.collectCPUCores(ctx)
 	metrics.CPUPower = cpuPower
+	unavailableCPUPowerRails(&metrics, linuxNoPowerRailsMessage)
 	metrics.CPUClock = cpuClock
 	metrics.CPUClockMax = cpuClockMax
 	metrics.CPUClockBase = cpuClockBase
@@ -316,6 +317,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		m.CPUName = cpuName
 		m.MemoryName = memoryName
 		m.CPUPower = cpuPower
+		unavailableCPUPowerRails(m, linuxNoPowerRailsMessage)
 		m.CPUClock = cpuClock
 		m.CPUClockMax = cpuClockMax
 		m.CPUClockBase = cpuClockBase
@@ -330,6 +332,12 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	}
 }
 
+// linuxNoPowerRailsMessage explains the permanently-absent per-rail CPU power
+// breakdown on Linux. RAPL (/sys/class/powercap) exposes package and, on some
+// parts, a core subdomain, but not the AMD SMU core/SoC/misc split the Windows
+// LibreHardwareMonitor bridge reads out of the SMU power table.
+const linuxNoPowerRailsMessage = "no per-rail CPU power breakdown on Linux (RAPL exposes package energy only, not the AMD SMU core/SoC/misc rails)"
+
 // linuxDegradedSlowPatch marks every slow-lane field unavailable with the same
 // message. It is the panic safety net for CollectSlow (per-metric panics are
 // already recovered by collectMetricAsync; this covers a panic before the
@@ -337,6 +345,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 func linuxDegradedSlowPatch(message string) func(*Metrics) {
 	return func(m *Metrics) {
 		m.CPUPower = unavailableNumber("W", message)
+		unavailableCPUPowerRails(m, message)
 		m.CPUClock = unavailableNumber("MHz", message)
 		m.CPUClockMax = unavailableNumber("MHz", message)
 		m.CPUClockBase = unavailableNumber("MHz", message)

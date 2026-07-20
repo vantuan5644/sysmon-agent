@@ -132,6 +132,7 @@ func warmingMetrics(hostname string) Metrics {
 	m.CPU = unavailableNumber("%", warming)
 	m.CPUCores = unavailableCPUCores(warming)
 	m.CPUPower = unavailableNumber("W", warming)
+	unavailableCPUPowerRails(&m, warming)
 	m.CPUClock = unavailableNumber("MHz", warming)
 	m.CPUClockMax = unavailableNumber("MHz", warming)
 	m.CPUClockBase = unavailableNumber("MHz", warming)

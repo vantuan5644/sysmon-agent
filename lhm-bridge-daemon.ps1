@@ -131,6 +131,52 @@ function Select-PsuOutputPower($sensors) {
     return $null
 }
 
+# True for the CPU hardware node. HardwareType is authoritative and is checked
+# first because the name regex on its own also matches an AMD Radeon GPU node,
+# which exposes its own Power and 'Core' Clock sensors and would otherwise be
+# mistaken for the CPU when it enumerates first. The regex stays as the fallback
+# for any build that does not surface HardwareType.
+function Test-CpuNode($hw) {
+    if ($hw.HardwareType) { return ($hw.HardwareType.ToString() -eq 'Cpu') }
+    return ($hw.Name -match 'Ryzen|Intel|AMD|EPYC|Xeon|Core')
+}
+
+# Exact-name Power sensor lookup, or $null. Filtering on SensorType is not
+# optional: the Zen 4 SMU table also defines a *Temperature* sensor named
+# 'Package', so a name-only match can silently return degrees as watts.
+function Select-PowerSensor($sensors, [string]$name) {
+    $sensor = $sensors | Where-Object {
+        $_.SensorType -eq 'Power' -and $_.Name -eq $name -and $_.Value -ne $null
+    } | Select-Object -First 1
+    if ($sensor) { return [double]$sensor.Value }
+    return $null
+}
+
+# CPU package power, in preference order. The order is what makes our figure
+# agree with AMD's own tools:
+#   1. 'CPU PPT'     - AMD SMU telemetry (Package Power Tracking), read straight
+#                      out of the SMU PM table. Instantaneous, and the same
+#                      source and definition Ryzen Master and AMD Adrenalin
+#                      report.
+#   2. 'Total Power' - the other SMU socket-total slot; tracks PPT within ~1 W
+#                      and covers parts where the PPT slot reads zero.
+#   3. 'Package'     - RAPL (MSR_PKG_ENERGY_STAT). Always present on Zen and
+#                      Intel, so it stays the fallback, but it is an energy
+#                      accumulator delta divided by the wall time since the
+#                      caller's previous Update(). That makes it an interval
+#                      average rather than a reading, it overshoots on the first
+#                      poll after Computer.Open(), and its 32-bit accumulator
+#                      silently undercounts once a poll gap exceeds one wrap
+#                      (~11 min at 100 W - LHM corrects only a single wrap).
+#                      Measured ~10% above PPT on a 7950X.
+function Select-CpuPackagePower($sensors) {
+    foreach ($name in @('CPU PPT', 'Total Power', 'Package')) {
+        $value = Select-PowerSensor $sensors $name
+        if ($null -ne $value -and $value -gt 0) { return $value }
+    }
+    return $null
+}
+
 # One Update + read pass against an already-open Computer. Returns the compact
 # JSON string the Go agent parses. Mirrors the sensor-selection logic of the
 # one-shot script exactly (same field names, same selection rules) so the JSON
@@ -140,6 +186,9 @@ function Select-PsuOutputPower($sensors) {
 # what makes each read sub-second.
 function Read-LhmSnapshot($computer) {
     $cpuPackagePower = $null
+    $cpuCorePower = $null
+    $cpuSocPower = $null
+    $cpuMiscPower = $null
     $cpuClock = $null
     $psuOutputPower = $null
     $temperatures = New-Object System.Collections.Generic.List[object]
@@ -147,12 +196,24 @@ function Read-LhmSnapshot($computer) {
     foreach ($hw in $computer.Hardware) {
         try { $hw.Update() } catch {}
         $sensors = @($hw.Sensors)
-        # First CPU package power sensor wins (matches the agent selection rule).
-        if (-not $cpuPackagePower -and ($hw.Name -match 'Ryzen|Intel|AMD|EPYC|Xeon|Core')) {
-            $pkg = $sensors | Where-Object {
-                $_.SensorType -eq 'Power' -and $_.Name -eq 'Package' -and $_.Value -ne $null
-            } | Select-Object -First 1
-            if ($pkg) { $cpuPackagePower = [double]$pkg.Value }
+        # First CPU node that reports package power wins. The per-rail breakdown
+        # is read from that same node so the parts always sum against the total
+        # they were measured with.
+        if (-not $cpuPackagePower -and (Test-CpuNode $hw)) {
+            $pkg = Select-CpuPackagePower $sensors
+            if ($null -ne $pkg) {
+                $cpuPackagePower = $pkg
+                # AMD SMU per-rail breakdown. 'Core Power' is the cores-only rail
+                # and is the figure AMD Adrenalin displays as CPU power; package
+                # power additionally includes SOC (IO die, memory controller,
+                # Infinity Fabric) and Misc, which on a chiplet part add ~30 W
+                # that Adrenalin never shows. Absent on Intel and on Zen parts
+                # whose SMU PM-table version LHM has no sensor map for, so each
+                # rail degrades independently to null.
+                $cpuCorePower = Select-PowerSensor $sensors 'Core Power'
+                $cpuSocPower = Select-PowerSensor $sensors 'SOC Power'
+                $cpuMiscPower = Select-PowerSensor $sensors 'Misc Power'
+            }
         }
         # Live CPU clock: the average per-core clock in MHz. LHM reads the
         # per-core MSRs on each Update(), so unlike Win32_Processor's static
@@ -161,7 +222,7 @@ function Read-LhmSnapshot($computer) {
         # clocks. Per-domain ('Bus Speed', 'Fabric', 'Memory', 'Uncore') and
         # '(Effective)' sensors are excluded - effective clocks collapse toward
         # 0 in idle C-states and would read as a misleading sub-GHz value.
-        if ($null -eq $cpuClock -and ($hw.Name -match 'Ryzen|Intel|AMD|EPYC|Xeon|Core')) {
+        if ($null -eq $cpuClock -and (Test-CpuNode $hw)) {
             $clockSensors = @($sensors | Where-Object { $_.SensorType -eq 'Clock' -and $_.Value -ne $null })
             $avg = $clockSensors | Where-Object {
                 $_.Name -match 'Average' -and $_.Name -notmatch 'Effective' -and $_.Name -match 'Core'
@@ -211,6 +272,9 @@ function Read-LhmSnapshot($computer) {
     $result = @{
         available        = $true
         power            = if ($null -ne $cpuPackagePower) { @{ available = $true; value = [math]::Round($cpuPackagePower, 2) } } else { $null }
+        cpu_core_power   = if ($null -ne $cpuCorePower) { @{ available = $true; value = [math]::Round($cpuCorePower, 2) } } else { $null }
+        cpu_soc_power    = if ($null -ne $cpuSocPower) { @{ available = $true; value = [math]::Round($cpuSocPower, 2) } } else { $null }
+        cpu_misc_power   = if ($null -ne $cpuMiscPower) { @{ available = $true; value = [math]::Round($cpuMiscPower, 2) } } else { $null }
         cpu_clock        = if ($null -ne $cpuClock -and $cpuClock -gt 0) { @{ available = $true; value = [math]::Round($cpuClock, 0) } } else { $null }
         psu_output_power = if ($null -ne $psuOutputPower) { @{ available = $true; value = [math]::Round($psuOutputPower, 2) } } else { $null }
         temperatures     = $temperatures

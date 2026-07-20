@@ -57,7 +57,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v114";
+const dashboardBuild = "sysmon-static-v117";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -1091,12 +1091,16 @@ function render(metrics) {
   });
 
   // CPU: outer ring = utilization, inner ring = core clock (filled against the
-  // max/boost clock), center = util %, sub = live GHz. Temperature + package
-  // power show on the detail line below.
+  // max/boost clock), center = util %, sub = live/boost GHz -- the pair gives the
+  // inner ring's fill a readable scale. Temperature + core/package power show on
+  // the detail line below.
   setGauge("cpuGauge", "cpuValue", cpuMetric, "%", thresholdValue("cpu_warn"));
   setInnerRing("cpuGauge", clockRingMetric(metrics.cpu_clock, metrics.cpu_clock_max, metrics.cpu_clock_base));
   const cpuClock = numberMetric(metrics.cpu_clock);
-  setGaugeSub("cpuSub", cpuClock.available ? (formatClock(cpuClock.value) || "--") : "--");
+  const cpuClockMax = numberMetric(metrics.cpu_clock_max);
+  setGaugeSub("cpuSub", cpuClock.available
+    ? (formatClockPair(cpuClock.value, cpuClockMax.available ? cpuClockMax.value : null) || "--")
+    : "--");
 
   // GPU: outer ring = utilization, inner ring = VRAM %, center = util %,
   // sub = used/total VRAM. Temperature + board power show on the detail line.
@@ -1105,7 +1109,7 @@ function render(metrics) {
   const gpuVram = primaryGPU ? capacityPercent(primaryGPU.memory) : unavailable();
   setInnerRing("gpuGauge", vramRingMetric(gpuVram, gpuWarn));
   setGaugeSub("gpuSub", gpuVram.available
-    ? `${formatGib(gpuVram.usedBytes)} / ${formatGib(gpuVram.totalBytes)}`
+    ? (formatGibPair(gpuVram.usedBytes, gpuVram.totalBytes) || "--")
     : "--");
 
   // RAM: single ring (utilization), center = util %, sub = used/total bytes.
@@ -1594,9 +1598,16 @@ function renderPrimaryCardDetails(metrics, primaryGPU) {
 
   const cpuTemp = numberMetric(metrics.cpu_temperature);
   const cpuPower = numberMetric(metrics.cpu_power);
+  // Both power figures matter -- the cores-only rail is what AMD Adrenalin and
+  // Ryzen Master call "CPU power", while the package figure is what the socket
+  // actually draws (~30 W more on a chiplet part, which includes the IO die and
+  // misc rails). They render as a "core / package" pair rather than two labelled
+  // segments so the whole detail line stays on one row of the CPU card. The pair
+  // is AMD-only and collapses to the package figure alone elsewhere.
+  const cpuCorePower = numberMetric(metrics.cpu_core_power);
   setCardDetail("cpuDetail", joinDetail([
     cpuTemp.available ? formatTemp(cpuTemp.value) : "",
-    cpuPower.available ? formatPower(cpuPower.value) : "",
+    formatPowerPair(cpuPower, cpuCorePower),
   ]), cpuTemp, tempWarn);
   renderCoreGrid(metrics.cpu_cores);
 
@@ -2328,6 +2339,50 @@ function formatTemp(celsius) {
   return `${Math.round(value)}°C`;
 }
 
+// formatPowerPair renders the CPU detail line's power segment. With both rails
+// it is a compact "48 / 84 W" -- cores-only against whole-socket package power,
+// the same part/whole idiom the GPU and RAM gauge subs use for used/total. Both
+// sides are rounded to whole watts: formatPower's sub-100 W decimal buys no real
+// precision on a rail that moves several watts between samples, and this segment
+// shares one line with the temperature. Falls back to the single package figure
+// (with its usual formatting) when the cores-only rail is unavailable, which is
+// the permanent state on Intel and Linux.
+function formatPowerPair(packageMetric, coreMetric) {
+  if (!packageMetric || !packageMetric.available) {
+    return "";
+  }
+  if (!coreMetric || !coreMetric.available) {
+    return formatPower(packageMetric.value);
+  }
+  const core = finiteNumber(coreMetric.value);
+  const total = finiteNumber(packageMetric.value);
+  if (core === null || total === null || core < 0 || total < 0) {
+    return formatPower(packageMetric.value);
+  }
+  // Unit is appended directly rather than via formatPower, which would re-apply
+  // its sub-100 W decimal and undo the rounding ("48 / 84.0 W").
+  return `${Math.round(core)} / ${Math.round(total)} W`;
+}
+
+// formatClockPair renders the CPU gauge sub as "4.4 / 5.4 GHz" -- the live clock
+// against the boost ceiling, which is what the gauge's inner ring is filled
+// against, so the sub now explains the ring instead of just repeating one end of
+// it. One decimal per side (formatClock uses two) keeps the pair inside the gauge
+// circle. Falls back to the single live value when the boost ceiling is missing
+// or reads below the live clock -- a max under the current clock is a bad
+// reading, and rendering "5.5 / 5.4" would look broken.
+function formatClockPair(currentMhz, maxMhz) {
+  const current = finiteNumber(currentMhz);
+  const max = finiteNumber(maxMhz);
+  if (current === null || current <= 0) {
+    return null;
+  }
+  if (max === null || max <= 0 || max < current || current < 1000) {
+    return formatClock(current);
+  }
+  return `${(current / 1000).toFixed(1)} / ${(max / 1000).toFixed(1)} GHz`;
+}
+
 // formatClock renders a CPU clock reading (MHz from the API) as a compact GHz
 // value, falling back to MHz for sub-GHz readings (rare on modern CPUs).
 function formatClock(mhz) {
@@ -2343,17 +2398,32 @@ function formatClock(mhz) {
 
 // formatGib renders a byte count as whole gibibytes with one decimal for the
 // fractional part. Used for GPU VRAM where percentage is less meaningful than
-// the absolute used/total budget.
-function formatGib(bytes) {
+// the absolute used/total budget. Pass omitUnit for the left side of a pair
+// (see formatGibPair), which shares the trailing unit.
+function formatGib(bytes, omitUnit) {
   const value = finiteNumber(bytes);
   if (value === null || value < 0) {
     return null;
   }
   const gib = value / (1024 ** 3);
-  if (gib >= 100) {
-    return `${gib.toFixed(0)} GB`;
+  const text = gib >= 100 ? gib.toFixed(0) : gib.toFixed(1);
+  return omitUnit ? text : `${text} GB`;
+}
+
+// formatGibPair renders a VRAM used/total pair as "2.0 / 8.0 GB". formatGib never
+// switches unit, so the used side can drop its own "GB" and let the trailing one
+// cover both -- matching the CPU gauge's "4.6 / 5.4 GHz" and keeping the sub
+// inside the gauge circle. Deliberately not reused for the RAM gauge: that one
+// formats through formatBytes, which picks a unit per value and so can
+// legitimately pair a MB used with a GB total, where a single trailing unit would
+// be wrong.
+function formatGibPair(usedBytes, totalBytes) {
+  const used = formatGib(usedBytes, true);
+  const total = formatGib(totalBytes);
+  if (used === null || total === null) {
+    return null;
   }
-  return `${gib.toFixed(1)} GB`;
+  return `${used} / ${total}`;
 }
 
 function formatTime(timestamp) {

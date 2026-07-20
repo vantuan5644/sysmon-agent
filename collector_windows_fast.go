@@ -233,6 +233,9 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 
 	var wg sync.WaitGroup
 	var cpuPower NumberMetric
+	var cpuCorePower NumberMetric
+	var cpuSocPower NumberMetric
+	var cpuMiscPower NumberMetric
 	var cpuClock NumberMetric
 	var cpuClockMax NumberMetric
 	var cpuClockBase NumberMetric
@@ -252,6 +255,19 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		return windowsCPUPowerFromBridge(bridgeResult, bridgeErr)
 	}, func(recovered any) NumberMetric {
 		return unavailableNumber("W", fmt.Sprintf("Windows CPU power collector panicked: %v", recovered))
+	})
+	// The three AMD SMU rails come from one bridge result and are assigned
+	// together, mirroring how the clock trio below shares a single collection.
+	collectMetricAsync(&wg, &cpuCorePower, func() NumberMetric {
+		core, soc, misc := windowsCPURailPowerFromBridge(bridgeResult, bridgeErr)
+		cpuSocPower = soc
+		cpuMiscPower = misc
+		return core
+	}, func(recovered any) NumberMetric {
+		message := fmt.Sprintf("Windows CPU rail power collector panicked: %v", recovered)
+		cpuSocPower = unavailableNumber("W", message)
+		cpuMiscPower = unavailableNumber("W", message)
+		return unavailableNumber("W", message)
 	})
 	collectMetricAsync(&wg, &psuOutputPower, func() NumberMetric {
 		return windowsPSUOutputPowerFromBridge(bridgeResult, bridgeErr)
@@ -311,6 +327,9 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		m.CPUName = cpuName
 		m.MemoryName = memoryName
 		m.CPUPower = cpuPower
+		m.CPUCorePower = cpuCorePower
+		m.CPUSocPower = cpuSocPower
+		m.CPUMiscPower = cpuMiscPower
 		m.CPUClock = cpuClock
 		m.CPUClockMax = cpuClockMax
 		m.CPUClockBase = cpuClockBase
@@ -333,6 +352,9 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 func windowsDegradedSlowPatch(message string) func(*Metrics) {
 	return func(m *Metrics) {
 		m.CPUPower = unavailableNumber("W", message)
+		m.CPUCorePower = unavailableNumber("W", message)
+		m.CPUSocPower = unavailableNumber("W", message)
+		m.CPUMiscPower = unavailableNumber("W", message)
 		m.CPUClock = unavailableNumber("MHz", message)
 		m.CPUClockMax = unavailableNumber("MHz", message)
 		m.CPUClockBase = unavailableNumber("MHz", message)

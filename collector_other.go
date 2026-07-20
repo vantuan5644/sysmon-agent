@@ -26,6 +26,7 @@ func (c unsupportedCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.CPU = unavailableNumber("%", "unsupported operating system")
 	metrics.CPUCores = unavailableCPUCores("unsupported operating system")
 	metrics.CPUPower = unavailableNumber("W", "unsupported operating system")
+	unavailableCPUPowerRails(&metrics, "unsupported operating system")
 	metrics.CPUClock = unavailableNumber("MHz", "unsupported operating system")
 	metrics.CPUClockMax = unavailableNumber("MHz", "unsupported operating system")
 	metrics.CPUClockBase = unavailableNumber("MHz", "unsupported operating system")

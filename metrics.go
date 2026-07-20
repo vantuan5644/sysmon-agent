@@ -157,15 +157,24 @@ type TailscaleStatus struct {
 }
 
 type Metrics struct {
-	Hostname             string          `json:"hostname"`
-	OS                   string          `json:"os"`
-	Arch                 string          `json:"arch"`
-	Platform             string          `json:"platform,omitempty"`
-	Timestamp            time.Time       `json:"timestamp"`
-	CPUName              string          `json:"cpu_name,omitempty"`
-	MemoryName           string          `json:"memory_name,omitempty"`
-	CPU                  NumberMetric    `json:"cpu_percent"`
+	Hostname   string       `json:"hostname"`
+	OS         string       `json:"os"`
+	Arch       string       `json:"arch"`
+	Platform   string       `json:"platform,omitempty"`
+	Timestamp  time.Time    `json:"timestamp"`
+	CPUName    string       `json:"cpu_name,omitempty"`
+	MemoryName string       `json:"memory_name,omitempty"`
+	CPU        NumberMetric `json:"cpu_percent"`
+	// CPUPower is whole-socket power. CPUCorePower/CPUSocPower/CPUMiscPower are
+	// its per-rail breakdown, currently AMD-only (read from the SMU power table
+	// via the LibreHardwareMonitor bridge) and unavailable elsewhere. The
+	// distinction is worth keeping visible: AMD Adrenalin and Ryzen Master label
+	// the cores-only rail "CPU power", which on a chiplet part runs ~30 W below
+	// the socket total because it excludes the IO die (SoC) and misc rails.
 	CPUPower             NumberMetric    `json:"cpu_power"`
+	CPUCorePower         NumberMetric    `json:"cpu_core_power"`
+	CPUSocPower          NumberMetric    `json:"cpu_soc_power"`
+	CPUMiscPower         NumberMetric    `json:"cpu_misc_power"`
 	CPUClock             NumberMetric    `json:"cpu_clock"`
 	CPUClockMax          NumberMetric    `json:"cpu_clock_max"`
 	CPUClockBase         NumberMetric    `json:"cpu_clock_base"`
@@ -262,6 +271,17 @@ func availableNumber(value float64, unit string) NumberMetric {
 
 func unavailableNumber(unit, message string) NumberMetric {
 	return NumberMetric{Available: false, Unit: unit, Error: message}
+}
+
+// unavailableCPUPowerRails marks the per-rail CPU power breakdown
+// (core/SoC/misc) unavailable with a single message. Those rails are AMD SMU
+// telemetry read through the Windows LibreHardwareMonitor bridge, so every other
+// platform reports them explicitly absent rather than leaving the fields at
+// their zero value with no Error to explain why.
+func unavailableCPUPowerRails(m *Metrics, message string) {
+	m.CPUCorePower = unavailableNumber("W", message)
+	m.CPUSocPower = unavailableNumber("W", message)
+	m.CPUMiscPower = unavailableNumber("W", message)
 }
 
 // cpuCoreBusyPercent is the per-core utilization at or above which a logical

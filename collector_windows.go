@@ -164,6 +164,9 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	var wg sync.WaitGroup
 	var cpu NumberMetric
 	var cpuPower NumberMetric
+	var cpuCorePower NumberMetric
+	var cpuSocPower NumberMetric
+	var cpuMiscPower NumberMetric
 	var cpuClock NumberMetric
 	var cpuClockMax NumberMetric
 	var cpuClockBase NumberMetric
@@ -190,6 +193,17 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return windowsCPUPowerFromBridge(bridgeResult, bridgeErr)
 	}, func(recovered any) NumberMetric {
 		return unavailableNumber("W", fmt.Sprintf("Windows CPU power collector panicked: %v", recovered))
+	})
+	collectMetricAsync(&wg, &cpuCorePower, func() NumberMetric {
+		core, soc, misc := windowsCPURailPowerFromBridge(bridgeResult, bridgeErr)
+		cpuSocPower = soc
+		cpuMiscPower = misc
+		return core
+	}, func(recovered any) NumberMetric {
+		message := fmt.Sprintf("Windows CPU rail power collector panicked: %v", recovered)
+		cpuSocPower = unavailableNumber("W", message)
+		cpuMiscPower = unavailableNumber("W", message)
+		return unavailableNumber("W", message)
 	})
 	collectMetricAsync(&wg, &psuOutputPower, func() NumberMetric {
 		return windowsPSUOutputPowerFromBridge(bridgeResult, bridgeErr)
@@ -251,6 +265,9 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.CPU = cpu
 	metrics.CPUCores = c.windowsCPUCores(ctx)
 	metrics.CPUPower = cpuPower
+	metrics.CPUCorePower = cpuCorePower
+	metrics.CPUSocPower = cpuSocPower
+	metrics.CPUMiscPower = cpuMiscPower
 	metrics.CPUClock = cpuClock
 	metrics.CPUClockMax = cpuClockMax
 	metrics.CPUClockBase = cpuClockBase
@@ -754,9 +771,15 @@ func windowsProcessRate(rates map[int]float64, pid int) NumberMetric {
 // hosts with LibreHardwareMonitor installed, because modern LHM builds no longer
 // publish a root/LibreHardwareMonitor WMI namespace.
 type lhmBridgeResult struct {
-	Available      bool            `json:"available"`
-	Error          string          `json:"error,omitempty"`
-	Power          *lhmBridgeValue `json:"power,omitempty"`
+	Available bool            `json:"available"`
+	Error     string          `json:"error,omitempty"`
+	Power     *lhmBridgeValue `json:"power,omitempty"`
+	// AMD SMU per-rail breakdown of Power. Only Zen parts whose SMU PM-table
+	// version LibreHardwareMonitor has a sensor map for report these, so each is
+	// absent (nil) on Intel and on unmapped AMD parts.
+	CPUCorePower   *lhmBridgeValue `json:"cpu_core_power,omitempty"`
+	CPUSocPower    *lhmBridgeValue `json:"cpu_soc_power,omitempty"`
+	CPUMiscPower   *lhmBridgeValue `json:"cpu_misc_power,omitempty"`
 	CPUClock       *lhmBridgeValue `json:"cpu_clock,omitempty"`
 	PSUOutputPower *lhmBridgeValue `json:"psu_output_power,omitempty"`
 	Temperatures   []lhmBridgeTemp `json:"temperatures,omitempty"`
@@ -874,6 +897,45 @@ func lhmPSUOutputPowerMetric(power *lhmBridgeValue) NumberMetric {
 		return unavailableNumber("W", "LibreHardwareMonitor reported 0 W PSU output power (sensor warming up or driver contention)")
 	}
 	return availableNumber(power.Value, "W")
+}
+
+// lhmRailPowerMetric converts one AMD SMU power rail into a metric. Unlike
+// package power these rails are genuinely absent on Intel and on AMD parts whose
+// SMU PM-table version LibreHardwareMonitor has no sensor map for, so a missing
+// rail is a normal state and carries an explanatory message rather than an error
+// implying a fault. A rail may also legitimately read 0 W (LibreHardwareMonitor
+// only activates a rail sensor once it reports non-zero, so a zero here means a
+// stale sample), which is reported unavailable for the same reason package power
+// is.
+func lhmRailPowerMetric(power *lhmBridgeValue, rail string) NumberMetric {
+	if power == nil || !power.Available {
+		return unavailableNumber("W", "LibreHardwareMonitor did not report "+rail+" (AMD SMU telemetry only; unavailable on Intel and on AMD parts with an unmapped SMU table)")
+	}
+	if !isFinite(power.Value) || power.Value < 0 {
+		return unavailableNumber("W", "invalid LibreHardwareMonitor "+rail+" reading")
+	}
+	if power.Value == 0 {
+		return unavailableNumber("W", "LibreHardwareMonitor reported 0 W "+rail+" (sensor warming up or driver contention)")
+	}
+	return availableNumber(power.Value, "W")
+}
+
+// windowsCPURailPowerFromBridge extracts the three SMU rails from one bridge
+// result. They are returned together because they are only meaningful as a set:
+// core + SoC + misc is the breakdown of the package figure.
+func windowsCPURailPowerFromBridge(result lhmBridgeResult, err error) (core, soc, misc NumberMetric) {
+	if err != nil || !result.Available {
+		message := "LibreHardwareMonitor unavailable"
+		if err != nil {
+			message = "LibreHardwareMonitor bridge failed: " + err.Error()
+		} else if strings.TrimSpace(result.Error) != "" {
+			message = strings.TrimSpace(result.Error)
+		}
+		return unavailableNumber("W", message), unavailableNumber("W", message), unavailableNumber("W", message)
+	}
+	return lhmRailPowerMetric(result.CPUCorePower, "CPU core power"),
+		lhmRailPowerMetric(result.CPUSocPower, "CPU SoC power"),
+		lhmRailPowerMetric(result.CPUMiscPower, "CPU misc power")
 }
 
 // lhmTemperatureMetrics converts the bridge's temperature entries to sensor
