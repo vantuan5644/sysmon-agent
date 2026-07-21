@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"image/png"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -129,7 +130,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v117"`,
+		`const STATIC_CACHE = "sysmon-static-v120"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -235,6 +236,101 @@ func TestDashboardCanRecoverStaleStaticAssetsFromStatusStrip(t *testing.T) {
 	}
 }
 
+func TestDashboardUpdateBannerMatchesServerContract(t *testing.T) {
+	// The update banner is rendered from /api/status -> {update, update_check_supported}.
+	// Pin the JS / markup / CSS contract so the dashboard and the agent update.go
+	// surface stay in lockstep: the panel ID, the apply + dismiss buttons, the
+	// applying/error class names, the per-version localStorage dismissal key, and
+	// the POST /api/update call shape.
+	app, err := staticFS.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appJS := string(app)
+	for _, needle := range []string{
+		`updatePanel`,
+		`updateApplyBtn`,
+		`updateDismissBtn`,
+		`updateText`,
+		`state.updateApplying`,
+		`state.updateAvailable`,
+		`state.updateLatestVersion`,
+		`updateDismissedKeyPrefix = "sysmon:update-dismissed-"`,
+		`renderUpdatePanel(status);`,
+		`async function sendUpdate()`,
+		`"/api/update"`,
+		`response.status === 202`,
+		`update-applying`,
+		`update-error`,
+		`will reload automatically`,
+		`function dismissUpdate()`,
+		`$("updateApplyBtn").addEventListener("click", sendUpdate)`,
+		`$("updateDismissBtn").addEventListener("click", dismissUpdate)`,
+		// Build-channel badge, and the rule that a dev build gets no update UI
+		// at all: it can never self-update (isVersionNewer returns false for an
+		// unknown current version), so a banner or an update-failed warning
+		// would be noise the user cannot act on.
+		`renderAgentVersion(status);`,
+		`function renderAgentVersion(status)`,
+		`function isDevBuild()`,
+		`state.agentChannel`,
+		`releaseVersionPattern`,
+		`is-release`,
+		`is-dev`,
+	} {
+		if !strings.Contains(appJS, needle) {
+			t.Fatalf("app.js missing update banner behavior %q", needle)
+		}
+	}
+
+	// Both the panel render and the error render must bail out on a dev build.
+	if strings.Count(appJS, "if (isDevBuild()) {") < 2 {
+		t.Fatalf("app.js must suppress BOTH the update banner and the update-failed warning on a dev build; found %d isDevBuild() guards", strings.Count(appJS, "if (isDevBuild()) {"))
+	}
+
+	index, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexHTML := string(index)
+	for _, needle := range []string{
+		`id="updatePanel"`,
+		`id="updateText"`,
+		`id="updateApplyBtn"`,
+		`id="updateDismissBtn"`,
+		`class="panel update-panel"`,
+		`class="update-btn"`,
+		`class="update-dismiss"`,
+		`id="agentVersion"`,
+		`class="agent-version"`,
+	} {
+		if !strings.Contains(indexHTML, needle) {
+			t.Fatalf("index.html missing update banner markup %q", needle)
+		}
+	}
+
+	css, err := staticFS.ReadFile("static/styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cssText := string(css)
+	for _, needle := range []string{
+		`.agent-version`,
+		`.agent-version.is-release`,
+		`.agent-version.is-dev`,
+		`.update-panel`,
+		`.update-panel.update-applying`,
+		`.update-panel.update-error`,
+		`.update-btn`,
+		`.update-dismiss`,
+		`.update-actions`,
+	} {
+		if !strings.Contains(cssText, needle) {
+			t.Fatalf("styles.css missing update banner style %q", needle)
+		}
+	}
+}
+
 func TestDashboardResumeShowsUpdatingUntilRefreshCompletes(t *testing.T) {
 	app, err := staticFS.ReadFile("static/app.js")
 	if err != nil {
@@ -299,7 +395,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 3000;`,
-		`const dashboardBuild = "sysmon-static-v117";`,
+		`const dashboardBuild = "sysmon-static-v120";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -1166,9 +1262,16 @@ func TestMobileStatusMetadataRemainsVisible(t *testing.T) {
 	if strings.Contains(css, "#agentMeta {\n    display: none;") {
 		t.Fatal("mobile CSS hides agent status metadata")
 	}
+	// The point of the mobile layout is that the metadata gets its own full-width
+	// row rather than being squeezed (or hidden) next to the state and timestamp.
+	// Match the meta row generically so adding a status-strip column (the build
+	// badge added one) doesn't break the test while the intent still holds.
+	metaRow := regexp.MustCompile(`"meta( meta)+"`)
+	if !metaRow.MatchString(css) {
+		t.Fatal("styles.css has no full-width \"meta ...\" grid row for the mobile status metadata")
+	}
 	for _, needle := range []string{
 		`grid-template-areas:`,
-		`"meta meta"`,
 		`#agentMeta {`,
 		`grid-area: meta;`,
 		`.status-dot.warn {`,

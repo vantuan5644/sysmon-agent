@@ -137,6 +137,45 @@ func TestWindowsInstallerDefaults(t *testing.T) {
 	}
 }
 
+func TestWindowsInstallerUpdateAction(t *testing.T) {
+	// install-windows.ps1 is release-owned; the monorepo copy is a parity
+	// mirror (see sync-to-release.sh). Phase 2 of the auto-update plan adds an
+	// -Action Update engine: validate the parity copy carries it so the two
+	// repos don't drift.
+	data, err := os.ReadFile("install-windows.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+	for _, needle := range []string{
+		`[ValidateSet('Install', 'Uninstall', 'Status', 'Update')]`,
+		`[string]$UpdateVersion`,
+		`[switch]$Force`,
+		`[switch]$DryRun`,
+		`'Update' { Update-Agent }`,
+		`function Update-Agent`,
+		`function Get-InstalledExePath`,
+		`function Get-InstalledVersion`,
+		`function Get-LatestRelease`,
+		`function Find-ReleaseAsset`,
+		`function Read-PublishedChecksum`,
+		`function Invoke-VerifiedSwap`,
+		`function Compare-VersionTag`,
+		`Get-FileHash -LiteralPath $downloadExe -Algorithm SHA256`,
+		`SHA256SUMS.txt has no entry for sysmon-agent.exe`,
+		`Checksum mismatch`,
+		`rolled back`,
+		`releases/latest`,
+	} {
+		if !strings.Contains(script, needle) {
+			t.Errorf("install-windows.ps1 missing %q", needle)
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+}
+
 func TestWindowsVerifierDefaults(t *testing.T) {
 	data, err := os.ReadFile("verify-windows.ps1")
 	if err != nil {

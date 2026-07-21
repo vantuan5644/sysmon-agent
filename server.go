@@ -225,6 +225,60 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 		defer cancel()
 		writeJSON(w, http.StatusOK, controller.Apply(ctx, request.Action))
 	})
+	// POST /api/update triggers an in-dashboard self-update. Same-origin gated
+	// and body-capped like the other POST routes. The synchronous half runs in
+	// the request: re-check the channel, download the binary + checksum,
+	// SHA-256 verify against the release-published sum, then spawn the detached
+	// apply-update helper (see update.go). The helper swaps the binary and
+	// restarts the service; the dashboard reloads via the existing
+	// dashboard-build staleness path once the new binary is up. Returns 202 on
+	// success; 501 if the host is not the Windows service (console / Linux);
+	// 409 if the check is disabled or the channel is offline; 502 on network /
+	// checksum failure.
+	mux.HandleFunc("POST /api/update", func(w http.ResponseWriter, r *http.Request) {
+		if !sameOriginBrowserRequest(r) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "self-update requires same-origin browser requests"})
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+		defer r.Body.Close()
+		// Empty body is the only accepted request; reject any JSON to keep the
+		// trust surface minimal (no caller-supplied data drives the swap).
+		buffer := make([]byte, 1)
+		if n, _ := r.Body.Read(buffer); n > 0 {
+			writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "request body must be empty"})
+			return
+		}
+
+		checker := state.UpdateChecker()
+		if checker == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "update checker is not available"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), updateDownloadTimeout+updateApplySpawnTimeout+5*time.Second)
+		defer cancel()
+		decision, err := checker.ApplyNow(ctx)
+		switch {
+		case err == nil:
+			writeJSON(w, http.StatusAccepted, decision)
+		case errors.Is(err, errUpdateUnsupported):
+			writeJSON(w, http.StatusNotImplemented, decision)
+		case errors.Is(err, errUpdateDisabled):
+			writeJSON(w, http.StatusConflict, decision)
+		case errors.Is(err, errUpdateNotNewer):
+			writeJSON(w, http.StatusConflict, decision)
+		case errors.Is(err, errUpdateInProgress):
+			writeJSON(w, http.StatusConflict, decision)
+		case errors.Is(err, errUpdateNetwork):
+			writeJSON(w, http.StatusBadGateway, decision)
+		case errors.Is(err, errUpdateChecksum):
+			writeJSON(w, http.StatusBadGateway, decision)
+		case errors.Is(err, errUpdateMissingAsset):
+			writeJSON(w, http.StatusBadGateway, decision)
+		default:
+			writeJSON(w, http.StatusInternalServerError, decision)
+		}
+	})
 	mux.Handle("GET /", staticAssetHandler(staticSub))
 	return securityHeaders(mux), nil
 }

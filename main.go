@@ -42,6 +42,8 @@ func main() {
 	waitReady := flag.Bool("wait-ready", envBool("SYSMON_WAIT_READY", false), "wait until the configured /readyz endpoint responds and exit")
 	waitReadyTimeout := flag.Duration("wait-ready-timeout", envDuration("SYSMON_WAIT_READY_TIMEOUT", 15*time.Second), "maximum time to wait with -wait-ready")
 	controlEmit := flag.String("control-emit", "", "internal: emit one host input (media_play_pause|lock_screen) in the current session, then exit")
+	applyUpdate := flag.String("apply-update", "", "internal: detached helper that swaps in a verified update binary, then restarts the service (Windows-only)")
+	noUpdateCheck := flag.Bool("no-update-check", false, "disable the periodic update check and the in-dashboard self-update")
 	showVersion := flag.Bool("version", false, "print the build version and exit")
 	flag.Parse()
 
@@ -60,6 +62,33 @@ func main() {
 		if err := emitControlInput(*controlEmit); err != nil {
 			log.Fatalf("control-emit %q: %v", *controlEmit, err)
 		}
+		return
+	}
+
+	// -apply-update is the detached helper the in-dashboard self-update spawns
+	// (see update.go ApplyNow + update_apply_windows.go). It runs *after* the
+	// agent process has verified the download and is itself about to be killed
+	// when the helper stops the service. It does no network and no verification;
+	// the positional args are <verified-exe> <ready-url> [service-name]. The
+	// service name is resolved by the agent from the SCM (the release installer
+	// and the monorepo script register different names) and passed through here.
+	// It exits before any server/service setup so a stuck helper never serves
+	// traffic.
+	if *applyUpdate != "" {
+		args := flag.Args()
+		if len(args) < 2 {
+			log.Fatalf("apply-update: expected <verified-exe> <ready-url> [service-name] after -apply-update <tag>")
+		}
+		verifiedExe := args[0]
+		readyURL := args[1]
+		svcName := ""
+		if len(args) > 2 {
+			svcName = args[2]
+		}
+		if err := runApplyUpdate(*applyUpdate, verifiedExe, readyURL, svcName); err != nil {
+			log.Fatalf("apply-update %q: %v", *applyUpdate, err)
+		}
+		log.Printf("apply-update %q ok", *applyUpdate)
 		return
 	}
 
@@ -106,11 +135,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("static assets: %v", err)
 	}
+	// The update checker is on by default and gated by both a persisted setting
+	// (UpdateCheckEnabled, default true, surfaced in /api/settings) and a
+	// hard-off flag/env here. Flag/env off wins: the checker's Enabled() returns
+	// false regardless of the setting, and /api/status surfaces the effective
+	// state so the dashboard can explain why no checks are happening.
+	updateCheckEnabled := envBool("SYSMON_UPDATE_CHECK", true) && !*noUpdateCheck
+	updateChecker := newUpdateChecker(UpdateCheckerOptions{
+		CurrentVersion: version,
+		Enabled:        updateCheckEnabled,
+		Logf:           log.Printf,
+	})
+	state.SetUpdateChecker(updateChecker)
 	if *selfCheck {
 		// The sampler is intentionally left unstarted here: its Collect() falls
 		// back to a direct platform collection when there is no warm snapshot yet,
 		// so the in-process checks exercise the real collector without background
-		// goroutines.
+		// goroutines. The update checker is likewise left unstarted so -self-check
+		// makes no outbound network calls and spawns no goroutines.
 		if err := runSelfCheck(handler); err != nil {
 			log.Fatalf("self-check failed: %v", err)
 		}
@@ -124,6 +166,12 @@ func main() {
 
 	metricsSampler.Start()
 	defer metricsSampler.Stop()
+
+	// Start the update checker only on the serve path. It performs one outbound
+	// call at startup (after a short delay) and then once per
+	// updateCheckInterval; -self-check above returns before reaching here.
+	updateChecker.Start()
+	defer updateChecker.Stop()
 
 	serve := func(stop <-chan struct{}, ready func()) error {
 		return serveAgent(listen, handler, stop, ready)

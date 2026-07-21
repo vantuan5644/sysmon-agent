@@ -174,12 +174,43 @@ integration — the same binary is both console app and service). From an elevat
 ```powershell
 .\install-windows.ps1 -Action Install
 .\install-windows.ps1 -Action Status      # probes /readyz, reports settings
+.\install-windows.ps1 -Action Update      # download + verify + swap + rollback
 .\install-windows.ps1 -Action Uninstall
 ```
 
 The service runs as **LocalSystem**, which is why it can load the LibreHardwareMonitor
 kernel driver every boot. Don't run it interactively under an unprivileged account for
 production, or CPU power and board temps degrade.
+
+**Updating.** Three paths, in order of convenience:
+
+1. **In-dashboard.** The agent checks for a newer release once at startup and every 24 h,
+   and the dashboard shows a `vX.Y.Z available - Update` banner. One tap downloads the new
+   binary, **SHA-256 verifies it against the release's `SHA256SUMS.txt`**, then hands it to
+   a detached helper that stops the service, swaps the binary, restarts, polls `/readyz`,
+   and **rolls back to the previous binary if the new one fails readiness**. The dashboard
+   reloads itself once the new build is up. No SmartScreen prompt — that only fires on an
+   interactive double-click, not when the service replaces its own binary.
+2. **`-Action Update`** — the same download/verify/swap/rollback driven entirely from the
+   script, with no in-app network calls. Good for a weekly elevated Scheduled Task:
+   ```powershell
+   .\install-windows.ps1 -Action Update -DryRun                 # report only
+   .\install-windows.ps1 -Action Update -Force                  # reapply same version
+   .\install-windows.ps1 -Action Update -UpdateVersion v1.2.3   # pin or downgrade
+   ```
+3. **Re-run the installer.** `SysmonAgent-Setup-<ver>.exe` stops the running service and
+   waits for it to release the binary before overwriting, so upgrading in place works
+   without uninstalling first.
+
+Self-update is confined to the **LocalSystem Windows service** — console runs and Linux
+hosts refuse it (HTTP 501) and should use the installer or the systemd/package path. Every
+release **must** publish `SHA256SUMS.txt`: it is what authenticates the download before a
+SYSTEM-privileged process executes it, and both engines refuse to update without it.
+
+**Turning the check off.** It is on by default. Toggle `update_check_enabled` via
+`POST /api/settings`, or hard-disable it host-side with `-no-update-check` /
+`SYSMON_UPDATE_CHECK=0` (flag/env wins over the setting). Disabled means no outbound calls
+at all; the only endpoint ever contacted is `api.github.com`.
 </details>
 
 <details>

@@ -581,7 +581,7 @@ func TestClientCheckHandlerRecordsDashboardVisit(t *testing.T) {
 	}
 
 	post := httptest.NewRecorder()
-	postReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v117","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
+	postReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v120","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
 	postReq.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
 	postReq.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile Safari")
 	handler.ServeHTTP(post, postReq)
@@ -686,7 +686,7 @@ func TestStatusKeepsDeviceClientCheckAfterHistoryRotates(t *testing.T) {
 	}
 
 	device := httptest.NewRecorder()
-	deviceReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v117","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
+	deviceReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v120","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
 	deviceReq.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
 	deviceReq.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile Safari")
 	handler.ServeHTTP(device, deviceReq)
@@ -1495,5 +1495,176 @@ func TestControlHandlerRejectsTrailingJSON(t *testing.T) {
 	}
 	if controller.calls != 0 {
 		t.Fatalf("controller called %d times for trailing JSON, want 0", controller.calls)
+	}
+}
+
+func TestStatusReportsVersionAndUpdateBlock(t *testing.T) {
+	handler := newControlTestHandler(t, &fakeController{})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var body struct {
+		Version              string       `json:"version"`
+		Update               UpdateStatus `json:"update"`
+		UpdateCheckSupported bool         `json:"update_check_supported"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	// version is "dev" in `go test` (no -ldflags -X main.version), and the
+	// status strip surfaces it. We only assert it is present, not its value.
+	if body.Version == "" {
+		t.Errorf("status.version is empty")
+	}
+	// No checker is wired in newControlTestHandler (bare state), so Update is
+	// the zero value with Available=false and no network calls made. The
+	// supported flag reflects the platform under test.
+	if body.Update.Available {
+		t.Errorf("status.update.available = true, want false (no checker wired)")
+	}
+	if body.Update.LatestVersion != "" {
+		t.Errorf("status.update.latest_version = %q, want empty", body.Update.LatestVersion)
+	}
+	if body.UpdateCheckSupported != selfUpdateSupported() {
+		t.Errorf("status.update_check_supported = %v, want %v", body.UpdateCheckSupported, selfUpdateSupported())
+	}
+}
+
+func TestStatusSurfacesCachedUpdateWhenCheckerWired(t *testing.T) {
+	state := NewMemoryRuntimeState()
+	checker := newUpdateChecker(UpdateCheckerOptions{CurrentVersion: "v1.0.0", Enabled: true})
+	checker.fetchRelease = func(ctx context.Context, repo string) (ReleaseInfo, error) {
+		return ReleaseInfo{Tag: "v1.2.0", URL: "https://example.com/v1.2.0"}, nil
+	}
+	if _, err := checker.CheckNow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state.SetUpdateChecker(checker)
+	handler, err := newHTTPHandlerWithController(fakeCollector{}, testStaticFS(), state, NewSystemController())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var status AgentStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.Update.Available || status.Update.LatestVersion != "v1.2.0" || status.Update.URL != "https://example.com/v1.2.0" {
+		t.Fatalf("status.update = %+v, want available v1.2.0", status.Update)
+	}
+}
+
+func TestUpdateHandlerRejectsCrossOriginPost(t *testing.T) {
+	state := NewMemoryRuntimeState()
+	state.SetUpdateChecker(newUpdateChecker(UpdateCheckerOptions{CurrentVersion: "v1.0.0", Enabled: true}))
+	handler, err := newHTTPHandlerWithController(fakeCollector{}, testStaticFS(), state, &fakeController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/update", strings.NewReader(""))
+	req.Header.Set("Origin", "https://example.invalid")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (cross-origin)", rec.Code, http.StatusForbidden)
+	}
+}
+
+func TestUpdateHandlerRejectsRequestBody(t *testing.T) {
+	state := NewMemoryRuntimeState()
+	state.SetUpdateChecker(newUpdateChecker(UpdateCheckerOptions{CurrentVersion: "v1.0.0", Enabled: true}))
+	handler, err := newHTTPHandlerWithController(fakeCollector{}, testStaticFS(), state, &fakeController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/update", strings.NewReader(`{"huh":true}`))
+	req.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want %d (body must be empty)", rec.Code, http.StatusUnsupportedMediaType)
+	}
+}
+
+func TestUpdateHandlerGatesOnSelfUpdateSupported(t *testing.T) {
+	// On non-Windows / console (the test host), self-update is not supported,
+	// so the handler returns 501 with a clear message rather than touching the
+	// network. On the Windows service CI host this same test would need a
+	// different assertion; for now we just document the gate behavior.
+	state := NewMemoryRuntimeState()
+	state.SetUpdateChecker(newUpdateChecker(UpdateCheckerOptions{CurrentVersion: "v1.0.0", Enabled: true}))
+	handler, err := newHTTPHandlerWithController(fakeCollector{}, testStaticFS(), state, &fakeController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/update", strings.NewReader(""))
+	req.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if selfUpdateSupported() {
+		t.Skip("self-update is supported on this host; the 501 assertion only holds for console / non-Windows")
+	}
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want %d (self-update unsupported on this host)", rec.Code, http.StatusNotImplemented)
+	}
+	if !strings.Contains(rec.Body.String(), "install-windows.ps1") {
+		t.Fatalf("body = %q, want install-windows.ps1 hint", rec.Body.String())
+	}
+}
+
+func TestSettingsUpdateToggleAffectsChecker(t *testing.T) {
+	state := NewMemoryRuntimeState()
+	checker := newUpdateChecker(UpdateCheckerOptions{CurrentVersion: "v1.0.0", Enabled: true})
+	state.SetUpdateChecker(checker)
+	handler, err := newHTTPHandlerWithController(fakeCollector{}, testStaticFS(), state, &fakeController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !checker.Enabled() {
+		t.Fatalf("checker should start enabled")
+	}
+
+	// Disable via the persisted settings toggle. Same-origin POST mirrors the
+	// dashboard's flow.
+	req := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/settings", strings.NewReader(`{"update_check_enabled":false}`))
+	req.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("settings POST status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if checker.Enabled() {
+		t.Errorf("checker still enabled after dashboard toggle off")
+	}
+
+	// Re-enable.
+	req2 := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/settings", strings.NewReader(`{"update_check_enabled":true}`))
+	req2.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("settings POST status = %d", rec2.Code)
+	}
+	if !checker.Enabled() {
+		t.Errorf("checker not re-enabled after dashboard toggle on")
+	}
+}
+
+func TestDefaultSettingsHaveUpdateCheckEnabled(t *testing.T) {
+	settings := defaultDashboardSettings()
+	if !settings.UpdateCheckEnabled {
+		t.Fatalf("default UpdateCheckEnabled = false, want true")
 	}
 }

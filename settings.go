@@ -50,7 +50,11 @@ type DashboardSettings struct {
 	RefreshMS  int                 `json:"refresh_ms"`
 	Panel      string              `json:"panel"`
 	Thresholds DashboardThresholds `json:"thresholds"`
-	UpdatedAt  time.Time           `json:"updated_at"`
+	// UpdateCheckEnabled gates the periodic outbound update check. Defaults to
+	// true; toggleable via the dashboard. A host-side flag/env (-no-update-check /
+	// SYSMON_UPDATE_CHECK=0) hard-disables the check and wins over this setting.
+	UpdateCheckEnabled bool      `json:"update_check_enabled"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type DashboardSettingsUpdate struct {
@@ -59,6 +63,8 @@ type DashboardSettingsUpdate struct {
 	RefreshMS  *int                       `json:"refresh_ms,omitempty"`
 	Panel      *string                    `json:"panel,omitempty"`
 	Thresholds *DashboardThresholdsUpdate `json:"thresholds,omitempty"`
+	// UpdateCheckEnabled is optional in updates; nil means "leave unchanged".
+	UpdateCheckEnabled *bool `json:"update_check_enabled,omitempty"`
 }
 
 type DashboardThresholds struct {
@@ -115,12 +121,13 @@ type ClientCheckHistory struct {
 }
 
 type RuntimeState struct {
-	mu           sync.RWMutex
-	settings     DashboardSettings
-	clientCheck  ClientCheck
-	deviceCheck  ClientCheck
-	clientChecks []ClientCheck
-	settingsPath string
+	mu            sync.RWMutex
+	settings      DashboardSettings
+	clientCheck   ClientCheck
+	deviceCheck   ClientCheck
+	clientChecks  []ClientCheck
+	settingsPath  string
+	updateChecker *UpdateChecker
 }
 
 func NewRuntimeState(settingsPath string) (*RuntimeState, error) {
@@ -141,11 +148,12 @@ func NewMemoryRuntimeState() *RuntimeState {
 
 func defaultDashboardSettings() DashboardSettings {
 	return DashboardSettings{
-		Shift:      true,
-		RefreshMS:  defaultRefreshMS,
-		Panel:      defaultPanelMode,
-		Thresholds: defaultDashboardThresholds(),
-		UpdatedAt:  time.Now().UTC(),
+		Shift:              true,
+		RefreshMS:          defaultRefreshMS,
+		Panel:              defaultPanelMode,
+		Thresholds:         defaultDashboardThresholds(),
+		UpdateCheckEnabled: true,
+		UpdatedAt:          time.Now().UTC(),
 	}
 }
 
@@ -169,6 +177,24 @@ func (s *RuntimeState) HasPersistentSettings() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.settingsPath != ""
+}
+
+// SetUpdateChecker wires the background update checker into the state so the
+// HTTP layer can surface its cached status in /api/status, route POST
+// /api/update, and toggle the runtime-enabled flag when the persisted
+// UpdateCheckEnabled setting changes. It is set once at startup in main.go.
+func (s *RuntimeState) SetUpdateChecker(checker *UpdateChecker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateChecker = checker
+}
+
+// UpdateChecker returns the wired update checker, or nil if none (e.g. -self-check
+// or unit tests that construct a bare state).
+func (s *RuntimeState) UpdateChecker() *UpdateChecker {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.updateChecker
 }
 
 func (s *RuntimeState) GetClientCheck() ClientCheck {
@@ -230,7 +256,6 @@ func (s *RuntimeState) RecordClientCheck(update ClientCheckUpdate, userAgent str
 
 func (s *RuntimeState) UpdateSettings(update DashboardSettingsUpdate) (DashboardSettings, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	next := s.settings
 	if update.Dim != nil {
@@ -248,17 +273,31 @@ func (s *RuntimeState) UpdateSettings(update DashboardSettingsUpdate) (Dashboard
 	if update.Thresholds != nil {
 		next.Thresholds = applyDashboardThresholdsUpdate(next.Thresholds, *update.Thresholds)
 	}
+	if update.UpdateCheckEnabled != nil {
+		next.UpdateCheckEnabled = *update.UpdateCheckEnabled
+	}
 	next.UpdatedAt = time.Now().UTC()
 	if err := validateDashboardSettings(next); err != nil {
+		s.mu.Unlock()
 		return s.settings, err
 	}
 	if s.settingsPath != "" {
 		if err := saveDashboardSettings(s.settingsPath, next); err != nil {
+			s.mu.Unlock()
 			return s.settings, err
 		}
 	}
+	checker := s.updateChecker
 	s.settings = next
-	return s.settings, nil
+	s.mu.Unlock()
+	// Apply the runtime-enabled toggle to the live checker outside the state
+	// lock. A flag/env hard-off is enforced at construction time (Enabled()
+	// stays false regardless); this only updates the setting-driven half so the
+	// dashboard toggle takes effect immediately.
+	if checker != nil {
+		checker.SetEnabled(next.UpdateCheckEnabled)
+	}
+	return next, nil
 }
 
 func loadDashboardSettings(path string) (DashboardSettings, error) {

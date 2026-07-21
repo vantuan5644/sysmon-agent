@@ -3,6 +3,7 @@
 package main
 
 import (
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -73,6 +74,15 @@ var (
 	svcHandle     uintptr
 	svcCheckPoint uint32
 
+	// svcActualName is the service name the SCM actually launched this process
+	// under, captured from serviceMain's argv[0]. It is NOT necessarily the
+	// compile-time serviceName const: the same binary is installed under
+	// "HomelabSysmonAgent" by the monorepo script and "SysmonAgent" by the
+	// public release installer. Anything that drives the SCM by name (notably
+	// the self-update helper's sc.exe stop/start) must use this, not the const,
+	// or it operates on a service that does not exist.
+	svcActualName string
+
 	svcRun       serviceRunFunc
 	svcStop      chan struct{}
 	svcStopOnce  sync.Once
@@ -133,7 +143,13 @@ func startedByServiceControlManager() bool {
 // thread. It registers the control handler, runs the agent (reporting RUNNING
 // once the listener is up), and reports STOPPED when the agent exits.
 func serviceMain(argc uint32, argv **uint16) uintptr {
-	namePtr, _ := syscall.UTF16PtrFromString(serviceName)
+	// argv[0] is, per the Win32 SERVICE_MAIN_FUNCTION contract, the name the
+	// service was registered under. Capture it before anything else so
+	// resolvedServiceName() reports the real name for the rest of the process
+	// lifetime (see svcActualName).
+	captureServiceName(argc, argv)
+
+	namePtr, _ := syscall.UTF16PtrFromString(resolvedServiceName())
 	handle, _, _ := procRegisterServiceCtrlHandlerExW.Call(
 		uintptr(unsafe.Pointer(namePtr)),
 		syscall.NewCallback(serviceHandler),
@@ -163,6 +179,60 @@ func serviceMain(argc uint32, argv **uint16) uintptr {
 		reportStatus(serviceStopped, 0, 0)
 	}
 	return 0
+}
+
+// captureServiceName records serviceMain's argv[0] — the name the SCM launched
+// this process under — into svcActualName. A missing/empty argv leaves the
+// compile-time default in place.
+func captureServiceName(argc uint32, argv **uint16) {
+	if argc == 0 || argv == nil {
+		return
+	}
+	args := unsafe.Slice(argv, argc)
+	if args[0] == nil {
+		return
+	}
+	name := strings.TrimSpace(utf16PtrToString(args[0]))
+	if name == "" {
+		return
+	}
+	svcMu.Lock()
+	svcActualName = name
+	svcMu.Unlock()
+}
+
+// utf16PtrToString decodes a NUL-terminated UTF-16 string. The stdlib syscall
+// package only exposes UTF16ToString([]uint16) — the pointer variant lives in
+// golang.org/x/sys/windows, which this module deliberately does not depend on
+// (go.mod is stdlib-only). The scan is bounded so a non-terminated buffer from
+// a misbehaving caller cannot walk memory indefinitely.
+func utf16PtrToString(p *uint16) string {
+	if p == nil {
+		return ""
+	}
+	const maxServiceNameLen = 4096
+	buf := unsafe.Slice(p, maxServiceNameLen)
+	for i := 0; i < maxServiceNameLen; i++ {
+		if buf[i] == 0 {
+			return syscall.UTF16ToString(buf[:i])
+		}
+	}
+	return syscall.UTF16ToString(buf)
+}
+
+// resolvedServiceName returns the Windows service name to drive the SCM with:
+// the name the SCM actually launched us under when known, otherwise the
+// compile-time default. The self-update helper depends on this being the real
+// installed name — the public release registers "SysmonAgent" while the
+// monorepo script registers "HomelabSysmonAgent", and sc.exe against the wrong
+// one fails with error 1060.
+func resolvedServiceName() string {
+	svcMu.Lock()
+	defer svcMu.Unlock()
+	if svcActualName != "" {
+		return svcActualName
+	}
+	return serviceName
 }
 
 // serviceHandler is the HANDLER_FUNCTION_EX the SCM calls (on a separate thread)

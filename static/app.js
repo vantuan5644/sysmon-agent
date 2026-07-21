@@ -10,6 +10,7 @@ const state = {
   pendingClientCheckPromise: null,
   pendingClientCheckResolve: null,
   transientStatusTimer: null,
+  updatePollTimer: null,
   paused: false,
   stream: null,
   streamFallback: false,
@@ -35,6 +36,26 @@ const state = {
   connectionKind: "loading",
   wakeLock: null,
   wakeWanted: false,
+  // updateAvailable is the latest "update available" status from /api/status.
+  // updateApplying flips true after a successful POST /api/update (the agent
+  // returns 202 and the dashboard waits for the staleness reload).
+  updateAvailable: false,
+  updateLatestVersion: "",
+  updateURL: "",
+  updateApplying: false,
+  updateMessage: "",
+  // updateApplyingFromVersion is the agent version we were running when the
+  // apply started. The agent reporting anything else means the swap landed, so
+  // the "Updating..." state can be left even if the service-worker reload has
+  // not fired yet. updateWatchdogTimer is the always-armed escape hatch.
+  updateApplyingFromVersion: "",
+  updateWatchdogTimer: null,
+  // agentVersion is the running binary's version tag from /api/status, and
+  // agentChannel is "release" for a real vX.Y.Z tag or "dev" for an untagged
+  // `go build`. A dev build never self-updates, so the channel also decides
+  // whether any update UI is shown at all.
+  agentVersion: "",
+  agentChannel: "",
   history: {
     cpu: [],
     mem: [],
@@ -57,7 +78,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v117";
+const dashboardBuild = "sysmon-static-v120";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -94,6 +115,11 @@ const controlActionLabels = {
   volume_mute: "Speaker",
   lock_screen: "Screen",
 };
+// updateDismissedKey returns the localStorage key for a per-version update
+// dismissal. Dismissing vX.Y.Z once keeps the banner quiet across reloads until
+// a newer version ships (then the new tag changes the key and the banner
+// re-appears, by design, so the user hears about each new release once).
+const updateDismissedKeyPrefix = "sysmon:update-dismissed-";
 const metricsTimeoutMS = 4500;
 const auxiliaryTimeoutMS = 3000;
 // Number of consecutive EventSource failures (with no recovery in between)
@@ -132,6 +158,8 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   $("alertsPanel").addEventListener("click", toggleAlertsPanel);
   $("alertsPanel").addEventListener("keydown", handleAlertsPanelKeydown);
+  $("updateApplyBtn").addEventListener("click", sendUpdate);
+  $("updateDismissBtn").addEventListener("click", dismissUpdate);
   $("issuesPanel").addEventListener("click", toggleIssuesPanel);
   $("issuesPanel").addEventListener("keydown", handleIssuesPanelKeydown);
   $("processesViewApps").addEventListener("click", () => setProcessesView("apps"));
@@ -810,6 +838,8 @@ function renderStatus(status) {
     applySettings(status.settings);
   }
   applyControlCapabilities(status?.controls);
+  renderAgentVersion(status);
+  renderUpdatePanel(status);
   renderStatusIssues(status);
   renderDisplayModeIssues();
   const uptime = formatDuration(status?.uptime_seconds);
@@ -840,6 +870,268 @@ function renderStatusIssues(status) {
   }
   state.statusIssueMessages = messages;
   renderIssuesPanel();
+}
+
+// releaseVersionPattern matches a real release tag ("v1.2.3" / "1.2.3", with an
+// optional pre-release suffix). Anything else — notably the "dev" placeholder a
+// plain `go build` leaves in main.version — is a dev build. This mirrors the
+// agent's own parseSemver check so the badge agrees with what the server will
+// actually do about updates.
+const releaseVersionPattern = /^v?\d+\.\d+\.\d+([-+].*)?$/;
+
+// renderAgentVersion fills the status-strip build badge: "v0.1.4" for a shipped
+// release, "dev" for a hand-built binary. Knowing which one a host is running
+// is the difference between "why is there no update banner" and a real problem.
+function renderAgentVersion(status) {
+  const badge = $("agentVersion");
+  if (!badge) {
+    return;
+  }
+  const version = String(status?.version || "").trim();
+  state.agentVersion = version;
+  if (!version) {
+    // Older agents (and the pre-update-subsystem builds) do not report a
+    // version at all; show nothing rather than guessing.
+    state.agentChannel = "";
+    badge.hidden = true;
+    badge.classList.remove("is-release", "is-dev");
+    return;
+  }
+  const isRelease = releaseVersionPattern.test(version);
+  state.agentChannel = isRelease ? "release" : "dev";
+  badge.hidden = false;
+  badge.classList.toggle("is-release", isRelease);
+  badge.classList.toggle("is-dev", !isRelease);
+  badge.textContent = isRelease ? `release ${version}` : version;
+  badge.title = isRelease
+    ? `Running release ${version}`
+    : `Running a development build (${version}) - self-update is disabled`;
+}
+
+// isDevBuild reports whether the agent is an untagged build. Dev builds cannot
+// self-update (the agent refuses, since there is no version to compare), so the
+// entire update panel — banner *and* error states — is suppressed for them: the
+// "dev" badge in the status strip already says why, and an update notice that
+// can never be acted on is just noise.
+function isDevBuild() {
+  return state.agentChannel === "dev";
+}
+
+// renderUpdatePanel surfaces a non-intrusive banner when /api/status reports an
+// update available. The banner says "vX.Y.Z available - Update" and is dismissed
+// per-version (remembered in localStorage so it does not nag every load). When
+// self-update is unsupported on the host (Linux / console run) the banner stays
+// hidden even if an update is available; a one-line status-strip note could be
+// added later if we want to direct users to the installer path.
+function renderUpdatePanel(status) {
+  const panel = $("updatePanel");
+  if (!panel) {
+    return;
+  }
+  // A dev build never self-updates, so it gets no update UI at all — not a
+  // banner, not an error. The "dev" build badge is the explanation.
+  if (isDevBuild()) {
+    panel.hidden = true;
+    panel.classList.remove("update-applying", "update-error");
+    state.updateAvailable = false;
+    return;
+  }
+  const update = status?.update || {};
+  const latest = String(update.latest_version || "").trim();
+  const available = update.available === true && latest !== "";
+  state.updateAvailable = available;
+  state.updateLatestVersion = latest;
+  state.updateURL = String(update.url || "");
+
+  panel.classList.remove("update-applying", "update-error");
+  const text = $("updateText");
+  const applyBtn = $("updateApplyBtn");
+
+  // The agent reporting a version other than the one we started from means the
+  // swap landed. Leave the applying state on that signal rather than waiting
+  // for the service-worker staleness reload, which may not fire (and never
+  // fires at all if the update rolled back to the same version).
+  if (
+    state.updateApplying &&
+    state.agentVersion &&
+    state.updateApplyingFromVersion &&
+    state.agentVersion !== state.updateApplyingFromVersion
+  ) {
+    endUpdateApplying();
+  }
+
+  if (state.updateApplying) {
+    panel.hidden = false;
+    text.textContent = `Updating to ${latest} - the dashboard will reload automatically.`;
+    panel.classList.add("update-applying");
+    // Only the apply button is disabled. The dismiss × stays live: if the agent
+    // never comes back, this box is the user's only way out of it.
+    if (applyBtn) applyBtn.disabled = true;
+    return;
+  }
+
+  const supported = status?.update_check_supported === true;
+  const dismissed = latest !== "" && readStoredBoolean(updateDismissedKeyPrefix + latest);
+  if (!available || !supported || dismissed) {
+    panel.hidden = true;
+    if (applyBtn) applyBtn.disabled = false;
+    return;
+  }
+
+  panel.hidden = false;
+  text.textContent = `${latest} available - Update`;
+  if (applyBtn) applyBtn.disabled = false;
+}
+
+// sendUpdate triggers the in-dashboard self-update: POST /api/update with an
+// empty body, then on 202 flip into the "Updating..." state and wait for the
+// existing dashboard-build staleness reload (the new binary's /api/status
+// reports a new dashboard_build, the service worker evicts the cached shell,
+// and the dashboard reloads). Non-202 outcomes are surfaced in the banner so
+// the user can see why it refused (501 unsupported, 409 disabled, 502 network).
+async function sendUpdate() {
+  if (state.updateApplying) {
+    return;
+  }
+  const applyBtn = $("updateApplyBtn");
+  if (applyBtn) applyBtn.disabled = true;
+  beginUpdateApplying();
+  renderUpdatePanel({ update: { available: true, latest_version: state.updateLatestVersion, url: state.updateURL } });
+  try {
+    const response = await fetchWithTimeout(
+      "/api/update",
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "" },
+      auxiliaryTimeoutMS,
+    );
+    const decision = await response.json().catch(() => ({}));
+    if (response.status === 202) {
+      renderUpdatePanel({ update: { available: true, latest_version: decision?.latest_version || state.updateLatestVersion } });
+      scheduleUpdatePoll();
+      return;
+    }
+    endUpdateApplying();
+    showUpdateError(decision, response.status);
+  } catch (error) {
+    endUpdateApplying();
+    showUpdateError({ error: error?.message || "request failed" }, 0);
+  }
+}
+
+// updateApplyWatchdogMS bounds how long the "Updating..." box may persist. The
+// agent stops itself mid-swap, so a failed or rolled-back update can leave the
+// dashboard waiting for a reload that never comes.
+const updateApplyWatchdogMS = 5 * 60 * 1000;
+
+// beginUpdateApplying enters the applying state and arms the escape hatch. The
+// watchdog is armed here rather than in scheduleUpdatePoll so it covers every
+// path into this state — including one where the POST succeeds but the poll is
+// never scheduled.
+function beginUpdateApplying() {
+  state.updateApplying = true;
+  state.updateApplyingFromVersion = state.agentVersion || "";
+  clearUpdateWatchdog();
+  state.updateWatchdogTimer = setTimeout(() => {
+    if (!state.updateApplying) {
+      return;
+    }
+    endUpdateApplying();
+    showUpdateError(
+      { error: "the agent did not come back in time; it may have rolled back to the previous version" },
+      0,
+    );
+  }, updateApplyWatchdogMS);
+}
+
+// endUpdateApplying leaves the applying state and tears down both timers. Every
+// exit from "Updating..." goes through here so the flag can never be left set
+// with no timer still running to clear it.
+function endUpdateApplying() {
+  state.updateApplying = false;
+  state.updateApplyingFromVersion = "";
+  clearUpdatePoll();
+  clearUpdateWatchdog();
+}
+
+function clearUpdateWatchdog() {
+  if (state.updateWatchdogTimer) {
+    clearTimeout(state.updateWatchdogTimer);
+    state.updateWatchdogTimer = null;
+  }
+}
+
+// scheduleUpdatePoll keeps the /api/status poll warm while the agent swaps +
+// restarts so the dashboard notices the new build as soon as it is up. Without
+// this the existing poll cadence would still catch it, but we poll more eagerly
+// for a short window to surface the reload quickly.
+function scheduleUpdatePoll() {
+  if (state.updatePollTimer) {
+    return;
+  }
+  state.updatePollTimer = setInterval(() => {
+    if (!state.updateApplying) {
+      clearUpdatePoll();
+      return;
+    }
+    fetchStatus();
+  }, 2000);
+  // The timeout that bounds this state lives in beginUpdateApplying so it is
+  // armed on every path, not only when the poll happens to be scheduled.
+}
+
+function clearUpdatePoll() {
+  if (state.updatePollTimer) {
+    clearInterval(state.updatePollTimer);
+    state.updatePollTimer = null;
+  }
+}
+
+// showUpdateError renders a refused update as a banner with the agent's reason
+// (errUpdateUnsupported -> 501, errUpdateDisabled -> 409, errUpdateNetwork /
+// errUpdateChecksum -> 502). The user can dismiss it; a retry re-checks the
+// channel via the existing /api/status poll.
+function showUpdateError(decision, status) {
+  const panel = $("updatePanel");
+  if (!panel) {
+    return;
+  }
+  // Unreachable in normal use (a dev build never renders the Update button),
+  // but keep the suppression here too so no code path can surface an update
+  // failure on a build that was never going to update.
+  if (isDevBuild()) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  panel.classList.add("update-error");
+  const reason = String(decision?.error || `HTTP ${status || "?"}`).trim();
+  const latest = state.updateLatestVersion || decision?.latest_version || "";
+  const prefix = latest ? `${latest} update failed: ` : "Update failed: ";
+  $("updateText").textContent = prefix + reason;
+  const applyBtn = $("updateApplyBtn");
+  if (applyBtn) applyBtn.disabled = false;
+}
+
+// dismissUpdate records a per-version dismissal in localStorage so the banner
+// does not nag every load. A newer release ships under a new tag, which changes
+// the dismissal key, so the banner re-appears for that release once.
+function dismissUpdate() {
+  // An explicit dismissal always wins, including out of the "Updating..."
+  // state. Without this, renderUpdatePanel's applying branch re-shows the box
+  // on every call and the × does nothing — leaving an unclosable panel if the
+  // agent never comes back from a swap.
+  endUpdateApplying();
+  const panel = $("updatePanel");
+  if (panel) {
+    panel.hidden = true;
+    panel.classList.remove("update-applying", "update-error");
+  }
+  const applyBtn = $("updateApplyBtn");
+  if (applyBtn) applyBtn.disabled = false;
+  state.updateAvailable = false;
+  const latest = state.updateLatestVersion;
+  if (latest) {
+    writeStoredBoolean(updateDismissedKeyPrefix + latest, true);
+  }
 }
 
 async function refreshStaticAssets() {

@@ -481,7 +481,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v117",
+    dashboard_build: "sysmon-static-v120",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -499,7 +499,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v117",
+    dashboard_build: "sysmon-static-v120",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -800,6 +800,77 @@ assert(document.getElementById("updatedAt").textContent.endsWith("/ 0s / 142ms")
 assert(document.getElementById("alertsPanel").hidden === true, "healthy metrics showed threshold alerts panel");
 assert(document.getElementById("issuesPanel").hidden === true, "healthy metrics showed collector issues panel");
 assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / app", "agent status metadata did not render");
+
+// --- build-channel badge + dev-build update suppression ---------------------
+// A status with no version at all (older agents) must not guess a channel.
+assert(document.getElementById("agentVersion").hidden === true, "missing version rendered a build badge");
+
+context.renderStatus({ ...sampleStatus(), version: "v0.1.4", update_check_supported: true });
+assert(document.getElementById("agentVersion").hidden === false, "release version did not show the build badge");
+assert(document.getElementById("agentVersion").textContent === "release v0.1.4", "release build badge text did not render");
+assert(document.getElementById("agentVersion").classList.contains("is-release"), "release build badge missing is-release class");
+assert(!document.getElementById("agentVersion").classList.contains("is-dev"), "release build badge kept the is-dev class");
+
+// A release build with an update available shows the banner as usual.
+context.renderStatus({
+  ...sampleStatus(),
+  version: "v0.1.4",
+  update_check_supported: true,
+  update: { available: true, latest_version: "v0.2.0" },
+});
+assert(document.getElementById("updatePanel").hidden === false, "release build did not show the update banner");
+assert(document.getElementById("updateText").textContent === "v0.2.0 available - Update", "update banner text did not render");
+
+// A dev build shows the "dev" badge and NO update UI, even when the server
+// reports an update available — it can never self-update, so a banner (or an
+// update-failed warning) would be noise the user cannot act on.
+context.renderStatus({
+  ...sampleStatus(),
+  version: "dev",
+  update_check_supported: true,
+  update: { available: true, latest_version: "v0.2.0" },
+});
+assert(document.getElementById("agentVersion").textContent === "dev", "dev build badge text did not render");
+assert(document.getElementById("agentVersion").classList.contains("is-dev"), "dev build badge missing is-dev class");
+assert(!document.getElementById("agentVersion").classList.contains("is-release"), "dev build badge kept the is-release class");
+assert(document.getElementById("updatePanel").hidden === true, "dev build showed an update banner it can never act on");
+
+// The error path is suppressed on dev builds too.
+context.showUpdateError({ error: "boom" }, 502);
+assert(document.getElementById("updatePanel").hidden === true, "dev build surfaced an update-failed warning");
+
+// --- the "Updating..." box must never become a trap -------------------------
+// It disables the apply button, so if state.updateApplying is ever left set the
+// panel is permanently stuck and unclickable.
+// A version tag no other test uses: dismissUpdate persists a per-version key
+// into the shared localStorage stub, and reusing v0.2.0 here would silently
+// suppress the banner in the dedicated update-banner test further down.
+const releaseApplying = { ...sampleStatus(), version: "v0.1.4", update_check_supported: true, update: { available: true, latest_version: "v0.9.9" } };
+context.renderStatus(releaseApplying);
+context.beginUpdateApplying();
+context.renderUpdatePanel(releaseApplying);
+assert(document.getElementById("updatePanel").hidden === false, "applying state did not show the panel");
+assert(document.getElementById("updateApplyBtn").disabled === true, "applying state left the apply button enabled");
+assert(document.getElementById("updateDismissBtn").disabled !== true, "applying state disabled the dismiss button, leaving no way out");
+
+// Dismiss must escape the applying state, not be swallowed by its early return.
+context.dismissUpdate();
+assert(document.getElementById("updatePanel").hidden === true, "dismiss did not close the panel while applying");
+context.renderUpdatePanel(releaseApplying);
+assert(document.getElementById("updatePanel").hidden === true, "panel reappeared after dismiss - applying state was not cleared");
+
+// The agent coming back on a different version must also clear the state, so a
+// completed update does not depend on the service-worker reload firing.
+context.beginUpdateApplying();
+context.renderUpdatePanel(releaseApplying);
+assert(document.getElementById("updatePanel").hidden === false, "applying state did not re-enter");
+context.renderStatus({ ...releaseApplying, version: "v0.9.9", update: { available: false } });
+assert(document.getElementById("updatePanel").hidden === true, "a landed update (new version) did not leave the applying state");
+assert(document.getElementById("updateApplyBtn").disabled === false, "apply button stayed disabled after the update landed");
+
+context.renderStatus(sampleStatus());
+assert(document.getElementById("agentVersion").hidden === true, "returning to a versionless status left the build badge visible");
+
 context.renderStatus(sampleObservedStatus());
 assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / app / seen 12s", "agent status metadata did not render client-check age");
 context.renderStatus(sampleStatus());
@@ -808,7 +879,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v117, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v120, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 await document.getElementById("statusStrip").click();
 await flushMicrotasks();
 assert(context.reloadCount() === 1, "stale dashboard status-strip tap did not reload the app");
@@ -843,7 +914,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v117; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v120; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -853,7 +924,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v117",
+    dashboard_build: "sysmon-static-v120",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -863,7 +934,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v117",
+    dashboard_build: "sysmon-static-v120",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -960,7 +1031,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v117", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v120", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -1867,5 +1938,62 @@ assert(document.getElementById("processesSummary").textContent === "unavailable"
 assert(document.getElementById("processesBody").children.length === 1, "unavailable process set did not render a message row");
 assert(document.getElementById("processesPanel").classList.contains("processes-unavailable") === true, "unavailable process set did not flag the panel");
 context.render(sampleMetrics());
+
+// Update banner: /api/status surfaces update.available; the dashboard renders
+// a non-intrusive banner with an Update button. Dismiss remembers it per-version
+// so it does not re-appear on the next status poll for the same release.
+assert(document.getElementById("updatePanel").hidden === true, "update panel visible without an available update");
+context.renderStatus({ ...sampleStatus(), update: { available: true, latest_version: "v0.2.0", url: "https://example.com/v0.2.0" }, update_check_supported: true });
+assert(document.getElementById("updatePanel").hidden === false, "update panel hidden despite available update");
+assert(/v0\.2\.0 available - Update/.test(document.getElementById("updateText").textContent), "update banner text did not render the latest version");
+// Same status again does not flip the banner off (dismissal is the off-switch).
+context.renderStatus({ ...sampleStatus(), update: { available: true, latest_version: "v0.2.0", url: "https://example.com/v0.2.0" }, update_check_supported: true });
+assert(document.getElementById("updatePanel").hidden === false, "repeated update status hid the banner without a dismiss");
+// Dismiss removes the banner for this version.
+await document.getElementById("updateDismissBtn").click();
+await flushMicrotasks();
+assert(document.getElementById("updatePanel").hidden === true, "dismiss did not hide the update panel");
+assert(context.localStorage.getItem("sysmon:update-dismissed-v0.2.0") === "1", "dismiss did not persist per-version");
+// A new version re-announces itself.
+context.renderStatus({ ...sampleStatus(), update: { available: true, latest_version: "v0.3.0", url: "https://example.com/v0.3.0" }, update_check_supported: true });
+assert(document.getElementById("updatePanel").hidden === false, "newer release did not re-show the update panel");
+assert(/v0\.3\.0 available - Update/.test(document.getElementById("updateText").textContent), "update banner text did not refresh to the new version");
+// Unsupported host (Linux/console): banner stays hidden even if available.
+context.renderStatus({ ...sampleStatus(), update: { available: true, latest_version: "v0.3.0", url: "https://example.com/v0.3.0" }, update_check_supported: false });
+assert(document.getElementById("updatePanel").hidden === true, "update panel visible on an unsupported host");
+// Click Update: dashboard POSTs /api/update, flips into the applying state on
+// 202, and shows the "will reload automatically" message. Test the non-202 path
+// first because the applying state is sticky after a 202 (the banner waits for
+// the staleness reload).
+const updateFetch = context.fetch;
+let updatePosted = null;
+// Non-202 outcome surfaces the agent's reason in an error banner.
+context.fetch = async (path, options = {}) => {
+  if (path === "/api/update") {
+    updatePosted = options;
+    return { ok: false, status: 501, json: async () => ({ error: "self-update is supported only for the Windows service" }) };
+  }
+  return updateFetch(path, options);
+};
+context.renderStatus({ ...sampleStatus(), update: { available: true, latest_version: "v0.3.0", url: "https://example.com/v0.3.0" }, update_check_supported: true });
+await document.getElementById("updateApplyBtn").click();
+await flushMicrotasks();
+assert(updatePosted && updatePosted.method === "POST", "Update click did not POST /api/update");
+assert(document.getElementById("updatePanel").classList.contains("update-error") === true, "non-202 outcome did not flag the banner as update-error");
+assert(/Windows service/.test(document.getElementById("updateText").textContent), "error banner text missing the agent reason");
+// Now swap to the 202 response and retry: the applying banner flips on with the
+// "will reload automatically" message.
+context.fetch = async (path, options = {}) => {
+  if (path === "/api/update") {
+    updatePosted = options;
+    return { ok: true, status: 202, json: async () => ({ accepted: true, latest_version: "v0.3.0", current_version: "v0.2.0", stage: "applied" }) };
+  }
+  return updateFetch(path, options);
+};
+await document.getElementById("updateApplyBtn").click();
+await flushMicrotasks();
+assert(document.getElementById("updatePanel").classList.contains("update-applying") === true, "applying banner did not flip to update-applying");
+assert(/will reload automatically/.test(document.getElementById("updateText").textContent), "applying banner text missing reload hint");
+context.fetch = updateFetch;
 
 console.log("ok: dashboard runtime smoke test passed");

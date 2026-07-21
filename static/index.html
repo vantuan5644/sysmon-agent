@@ -31,8 +31,17 @@
 
     <section id="statusStrip" class="status-strip" role="button" tabindex="0" aria-label="Refresh metrics now" aria-live="polite">
       <span id="statusText">Connecting</span>
+      <span id="agentVersion" class="agent-version" hidden>--</span>
       <span id="agentMeta" class="muted">--</span>
       <span id="updatedAt" class="muted">--</span>
+    </section>
+
+    <section id="updatePanel" class="panel update-panel" role="status" aria-live="polite" hidden>
+      <span id="updateText" class="update-text">--</span>
+      <span class="update-actions">
+        <button id="updateApplyBtn" class="update-btn" type="button">Update</button>
+        <button id="updateDismissBtn" class="update-dismiss" type="button" aria-label="Dismiss update notice">×</button>
+      </span>
     </section>
 
     <section id="alertsPanel" class="panel alerts-panel" role="button" tabindex="0" aria-label="Alert details" aria-expanded="false" aria-live="polite" hidden>

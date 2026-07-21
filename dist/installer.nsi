@@ -72,9 +72,51 @@ InstallDirRegKey HKLM "${REGKEY}" "InstallDir"
 ; ============================================================
 Section "!${APPNAME} (required)" SecCore
   SectionIn RO
+
+  ; --- in-place upgrade: release the exe lock BEFORE overwriting it ---------
+  ; On an upgrade the old service is still running and holds a lock on
+  ; sysmon-agent.exe, so the File directive below would fail with a sharing
+  ; violation and the installer would silently ship the old binary. `sc stop`
+  ; is asynchronous, so issuing it is not enough: we must wait for the service
+  ; to actually reach STOPPED, which is what releases the lock.
+  ; install-windows.ps1 -Action Install stops/reconfigures/starts the service
+  ; anyway, but that runs *after* the copy — too late to help here.
+  nsExec::Exec 'cmd /c sc query "${SERVICE_NAME}" >nul 2>&1'
+  Pop $2 ; 0 when the service already exists (i.e. this is an upgrade)
+  ${If} $2 == 0
+    DetailPrint "Existing install detected - stopping the ${SERVICE_NAME} service before upgrading..."
+    nsExec::ExecToLog 'cmd /c sc stop "${SERVICE_NAME}"'
+    Pop $3
+    ; Poll for STOPPED, up to ~15 s (30 x 500 ms).
+    StrCpy $4 0
+    upgrade_wait_loop:
+      nsExec::Exec 'cmd /c sc query "${SERVICE_NAME}" | find "STOPPED" >nul'
+      Pop $5
+      ${If} $5 == 0
+        DetailPrint "Service stopped; upgrading files."
+        Goto upgrade_wait_done
+      ${EndIf}
+      IntOp $4 $4 + 1
+      ${If} $4 >= 30
+        DetailPrint "WARNING: the service did not stop within 15 seconds; the file copy may fail."
+        Goto upgrade_wait_done
+      ${EndIf}
+      Sleep 500
+      Goto upgrade_wait_loop
+    upgrade_wait_done:
+  ${EndIf}
+
   SetOutPath "$INSTDIR"
+  ; ClearErrors/IfErrors around the copy so a still-locked exe surfaces as a
+  ; clear message instead of NSIS's generic abort dialog.
+  ClearErrors
   File "out\sysmon-agent.exe"
   File "..\install-windows.ps1"
+  ${If} ${Errors}
+    DetailPrint "ERROR: could not write $INSTDIR\sysmon-agent.exe (the file may still be locked)."
+    MessageBox MB_ICONSTOP|MB_OK "Setup could not replace sysmon-agent.exe - it is still in use.$\r$\n$\r$\nStop the ${SERVICE_NAME} service (or reboot) and run Setup again."
+    Abort
+  ${EndIf}
 
   ; Remember install dir for upgrades / uninstall.
   WriteRegStr HKLM "${REGKEY}" "InstallDir" "$INSTDIR"

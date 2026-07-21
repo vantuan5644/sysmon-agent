@@ -7,13 +7,14 @@ const settingsRoundTrip = args.includes("--settings-roundtrip");
 const clientCheckRoundTrip = args.includes("--client-check-roundtrip");
 const baseURL = normalizeBaseURL(args.find((arg) => !arg.startsWith("--")) || defaultBaseURL);
 const timeoutMS = 5000;
-const dashboardBuild = "sysmon-static-v117";
+const dashboardBuild = "sysmon-static-v120";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,
   shift: true,
   refresh_ms: 2000,
   panel: "gpu",
+  update_check_enabled: false,
   thresholds: {
     cpu_warn: 80,
     memory_warn: 75,
@@ -214,8 +215,22 @@ function validateStatus(status, expectedSettings = {}) {
   assertArrayIncludes(status.refresh_options_ms, [250, 500, 1000, 2000], "status.refresh_options_ms");
   assertArrayIncludes(status.panel_options, ["all", "performance", "storage", "network", "sensors", "gpu"], "status.panel_options");
   validateSettings(status.settings, expectedSettings);
+  assertNonEmptyString(status.version, "status.version");
+  validateUpdateBlock(status.update);
+  assert(typeof status.update_check_supported === "boolean", "status.update_check_supported must be boolean");
   validateClientCheck(status.client_check);
   validateClientCheck(status.device_client_check);
+}
+
+function validateUpdateBlock(update) {
+  assertObject(update, "status.update");
+  assert(typeof update.available === "boolean", "status.update.available must be boolean");
+  if (update.available) {
+    assertNonEmptyString(update.latest_version, "status.update.latest_version");
+  }
+  if (update.checked_at !== undefined && update.checked_at !== null) {
+    assertTimestamp(update.checked_at, "status.update.checked_at", { allowStale: true });
+  }
 }
 
 function validateMetrics(metrics) {
@@ -278,10 +293,19 @@ function validateSettings(settings, expected = {}) {
   assert(typeof settings.shift === "boolean", "settings.shift must be boolean");
   assert([250, 500, 1000, 2000].includes(settings.refresh_ms), "settings.refresh_ms must be one of 250, 500, 1000, 2000");
   assert(["all", "performance", "storage", "network", "sensors", "gpu"].includes(settings.panel), "settings.panel is invalid");
+  assert(typeof settings.update_check_enabled === "boolean", "settings.update_check_enabled must be boolean");
   validateThresholds(settings.thresholds, expected.thresholds || {});
   assertTimestamp(settings.updated_at, "settings.updated_at", { allowStale: true });
   for (const [key, value] of Object.entries(expected)) {
     if (key === "thresholds") {
+      continue;
+    }
+    // The settings update endpoint accepts partial updates; round-trip
+    // expectations are written into the persisted settings only when the key
+    // was actually included in the update payload. update_check_enabled here
+    // is asserted only for the round-trip path.
+    if (key === "update_check_enabled") {
+      assert(settings.update_check_enabled === value, `settings.update_check_enabled = ${settings.update_check_enabled}, want ${value}`);
       continue;
     }
     assert(settings[key] === value, `settings.${key} = ${settings[key]}, want ${value}`);
@@ -621,6 +645,15 @@ function sampleStatus(settings = sampleSettings()) {
     refresh_options_ms: [250, 500, 1000, 2000],
     panel_options: ["all", "gpu", "network", "performance", "sensors", "storage"],
     settings,
+    version: "v0.1.4",
+    update: {
+      available: true,
+      latest_version: "v0.2.0",
+      url: "https://github.com/vantuan5644/sysmon-agent/releases/tag/v0.2.0",
+      published_at: new Date(Date.now() - 86400_000).toISOString(),
+      checked_at: new Date().toISOString(),
+    },
+    update_check_supported: true,
     client_check: sampleClientCheck(false),
     device_client_check: sampleClientCheck(false),
   };
@@ -733,6 +766,7 @@ function sampleSettings() {
     shift: true,
     refresh_ms: 1000,
     panel: "gpu",
+    update_check_enabled: true,
     thresholds: {
       cpu_warn: 70,
       memory_warn: 70,

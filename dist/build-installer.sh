@@ -41,7 +41,56 @@ echo "==> Building NSIS installer (version $VERSION)"
 ( cd "$SCRIPT_DIR" && makensis -DVERSION="$VERSION" -NOCD installer.nsi )
 
 OUT="$ROOT/dist/out/SysmonAgent-Setup-$VERSION.exe"
+
+# --- checksum manifest -------------------------------------------------------
+# SHA256SUMS.txt is a REQUIRED release asset, not a nicety. Both update engines
+# (the agent's in-dashboard self-update in update.go, and
+# install-windows.ps1 -Action Update) download it and verify the binary against
+# it before executing or swapping it in. The agent service runs as LocalSystem,
+# so an unverified swap would be a SYSTEM-level RCE vector — both engines refuse
+# to proceed when this asset is missing from the release.
+echo "==> Writing SHA256SUMS.txt"
+SUMS="$ROOT/dist/out/SHA256SUMS.txt"
+(
+    # Run from the output dir so the manifest carries bare file names: both
+    # engines match the release asset name exactly, with no directory part.
+    cd "$ROOT/dist/out"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "sysmon-agent.exe" "SysmonAgent-Setup-$VERSION.exe"
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "sysmon-agent.exe" "SysmonAgent-Setup-$VERSION.exe"
+    elif command -v certutil >/dev/null 2>&1; then
+        # Windows fallback: reshape certutil's multi-line output into the
+        # coreutils "<hex>  <name>" form the engines parse.
+        for f in "sysmon-agent.exe" "SysmonAgent-Setup-$VERSION.exe"; do
+            hash="$(certutil -hashfile "$f" SHA256 | sed -n '2p' | tr -d ' \r')"
+            printf '%s  %s\n' "$hash" "$f"
+        done
+    else
+        echo "ERROR: no sha256 tool found (need sha256sum, shasum, or certutil)." >&2
+        echo "       Refusing to build a release without a checksum manifest." >&2
+        exit 1
+    fi
+) > "$SUMS"
+
+# Fail loudly rather than shipping an empty or short manifest.
+if [[ "$(grep -c . "$SUMS")" -ne 2 ]]; then
+    echo "ERROR: $SUMS does not contain exactly 2 entries:" >&2
+    cat "$SUMS" >&2
+    exit 1
+fi
+
 echo "==> Built: $OUT"
 echo "    size:  $(du -h "$OUT" | awk '{print $1}')"
+echo "    sums:  $SUMS"
+sed 's/^/           /' "$SUMS"
+echo
 echo "    Test on a Windows host: double-click to install, then open"
 echo "    http://localhost:9099/  (or your PC's LAN IP from a phone)."
+echo
+echo "    Publish ALL THREE assets - the update engines refuse a release"
+echo "    without SHA256SUMS.txt:"
+echo "      gh release create v$VERSION \\"
+echo "        \"$ROOT/dist/out/sysmon-agent.exe\" \\"
+echo "        \"$OUT\" \\"
+echo "        \"$SUMS\""

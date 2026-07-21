@@ -255,7 +255,6 @@ function verifyStaticLayout(fixturePath) {
     `.sparkline-bar.unavailable`,
     `@media (max-width: 480px)`,
     `grid-template-areas:`,
-    `"state updated"`,
     `@media (max-width: 360px)`,
     `min-width: 54px;`,
     `@media (pointer: coarse)`,
@@ -282,6 +281,13 @@ function verifyStaticLayout(fixturePath) {
     `color: var(--warn);`,
   ]) {
     assertIncludes(css, needle, "dashboard CSS");
+  }
+  // The narrow-screen status strip must keep the state and the timestamp on the
+  // first row, with the metadata dropping to its own full-width row below.
+  // Matched loosely so adding a strip column (the build badge added one) does
+  // not fail a layout that still satisfies the requirement.
+  if (!/"state( \w+)* updated"/.test(css)) {
+    throw new Error(`dashboard CSS missing a "state ... updated" status-strip grid row`);
   }
   assertCount(html, `class="metric-card"`, 4, "primary metric cards");
   assertMinimumCount(html, `class="panel`, 6, "dashboard panels");
