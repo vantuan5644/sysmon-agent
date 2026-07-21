@@ -773,6 +773,15 @@ h2 {
   background: #0f1620;
 }
 
+/* An explicit `display` beats the `hidden` attribute's UA `display: none`, so
+   without this the panel is permanently visible no matter what the JS sets --
+   it sat on screen showing its "--" placeholder as an undismissable empty
+   banner. Any element toggled via `hidden` that also sets `display` needs a
+   rule like this (TestHiddenElementsAreActuallyHidden enforces it). */
+.update-panel[hidden] {
+  display: none;
+}
+
 .update-panel.update-applying {
   border-color: #4a6a2f;
   background: #131a10;

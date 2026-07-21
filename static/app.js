@@ -50,6 +50,7 @@ const state = {
   // not fired yet. updateWatchdogTimer is the always-armed escape hatch.
   updateApplyingFromVersion: "",
   updateWatchdogTimer: null,
+  autoShellRefreshAttempted: false,
   // agentVersion is the running binary's version tag from /api/status, and
   // agentChannel is "release" for a real vX.Y.Z tag or "dev" for an untagged
   // `go build`. A dev build never self-updates, so the channel also decides
@@ -78,7 +79,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v120";
+const dashboardBuild = "sysmon-static-v121";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -853,6 +854,7 @@ function renderStatusIssues(status) {
   state.staleDashboardBuild = serverBuild && serverBuild !== dashboardBuild ? serverBuild : "";
   if (serverBuild && serverBuild !== dashboardBuild) {
     messages.push(`dashboard build stale: app ${dashboardBuild}, server ${serverBuild}; tap status strip to refresh app or re-add Home Screen app`);
+    maybeAutoRefreshStaleShell(serverBuild);
   }
   const clientBuild = String(status?.client_check?.dashboard_build || "").trim();
   if (status?.client_check?.seen && clientBuild && clientBuild !== dashboardBuild) {
@@ -883,22 +885,28 @@ const releaseVersionPattern = /^v?\d+\.\d+\.\d+([-+].*)?$/;
 // release, "dev" for a hand-built binary. Knowing which one a host is running
 // is the difference between "why is there no update banner" and a real problem.
 function renderAgentVersion(status) {
+  // Resolve the channel BEFORE touching the DOM. A service worker can serve a
+  // cached index.html without #agentVersion alongside a newer app.js, and if
+  // this bailed out on the missing element it would leave state.agentChannel
+  // empty — which makes isDevBuild() false and un-suppresses the update panel
+  // on a dev build. The channel must not depend on the badge existing.
+  const version = String(status?.version || "").trim();
+  state.agentVersion = version;
+  // Older agents (and pre-update-subsystem builds) report no version at all;
+  // treat that as "unknown", not as a release.
+  state.agentChannel = version ? (releaseVersionPattern.test(version) ? "release" : "dev") : "";
+
   const badge = $("agentVersion");
   if (!badge) {
     return;
   }
-  const version = String(status?.version || "").trim();
-  state.agentVersion = version;
-  if (!version) {
-    // Older agents (and the pre-update-subsystem builds) do not report a
-    // version at all; show nothing rather than guessing.
-    state.agentChannel = "";
+  if (!state.agentChannel) {
     badge.hidden = true;
     badge.classList.remove("is-release", "is-dev");
+    badge.textContent = "";
     return;
   }
-  const isRelease = releaseVersionPattern.test(version);
-  state.agentChannel = isRelease ? "release" : "dev";
+  const isRelease = state.agentChannel === "release";
   badge.hidden = false;
   badge.classList.toggle("is-release", isRelease);
   badge.classList.toggle("is-dev", !isRelease);
@@ -1132,6 +1140,46 @@ function dismissUpdate() {
   if (latest) {
     writeStoredBoolean(updateDismissedKeyPrefix + latest, true);
   }
+}
+
+// autoShellRefreshKeyPrefix namespaces the once-per-server-build guard below.
+const autoShellRefreshKeyPrefix = "sysmon:auto-shell-refresh-";
+
+// maybeAutoRefreshStaleShell reloads the cached PWA shell when the agent is
+// serving a newer build than the one running.
+//
+// Recovering by tapping the status strip has always been possible, but it
+// requires knowing to do it — and a stale shell can be actively stuck (an older
+// build could get wedged showing an update banner with no working dismiss),
+// which is exactly when a user is least able to discover the gesture. So do it
+// for them.
+//
+// Strictly once per server build, because refreshStaticAssets() reloads the
+// page: if the reload does not resolve the mismatch, a second attempt would
+// loop forever. The guard lives in localStorage (which survives the reload and
+// the cache purge); if it cannot be persisted we skip the auto-refresh entirely
+// and leave the user with the tap-to-refresh issue message, because an
+// unguarded reload loop is far worse than a stale shell.
+function maybeAutoRefreshStaleShell(serverBuild) {
+  if (!serverBuild || serverBuild === dashboardBuild) {
+    return;
+  }
+  if (state.autoShellRefreshAttempted || state.staticRefreshInFlight) {
+    return;
+  }
+  const key = autoShellRefreshKeyPrefix + serverBuild;
+  if (readStoredBoolean(key)) {
+    return;
+  }
+  writeStoredBoolean(key, true);
+  if (!readStoredBoolean(key)) {
+    // Storage is unavailable or rejected the write; without a durable guard the
+    // reloaded page would land right back here.
+    return;
+  }
+  state.autoShellRefreshAttempted = true;
+  showTransientStatus(`Updating app to ${serverBuild}`);
+  refreshStaticAssets();
 }
 
 async function refreshStaticAssets() {

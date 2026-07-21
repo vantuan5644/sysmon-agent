@@ -130,7 +130,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v120"`,
+		`const STATIC_CACHE = "sysmon-static-v121"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -219,6 +219,17 @@ func TestDashboardCanRecoverStaleStaticAssetsFromStatusStrip(t *testing.T) {
 		`state.staleDashboardBuild = serverBuild && serverBuild !== dashboardBuild ? serverBuild : "";`,
 		`tap status strip to refresh app or re-add Home Screen app`,
 		`async function refreshStaticAssets() {`,
+		// A stale shell self-heals instead of waiting for the user to discover
+		// the status-strip tap — bounded to one attempt per server build, and
+		// skipped entirely when the guard cannot be persisted, so it can never
+		// become a reload loop.
+		`maybeAutoRefreshStaleShell(serverBuild);`,
+		`function maybeAutoRefreshStaleShell(serverBuild) {`,
+		`autoShellRefreshKeyPrefix = "sysmon:auto-shell-refresh-"`,
+		`if (readStoredBoolean(key)) {`,
+		`writeStoredBoolean(key, true);`,
+		`if (!readStoredBoolean(key)) {`,
+		`state.autoShellRefreshAttempted = true;`,
 		`stopVisibleTimers();`,
 		`await unregisterSysmonServiceWorkers();`,
 		`await deleteSysmonStaticCaches();`,
@@ -395,7 +406,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 3000;`,
-		`const dashboardBuild = "sysmon-static-v120";`,
+		`const dashboardBuild = "sysmon-static-v121";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -1249,6 +1260,56 @@ func TestDashboardPreventsDeviceTextInflation(t *testing.T) {
 	} {
 		if !strings.Contains(css, needle) {
 			t.Fatalf("styles.css missing device text sizing guard %q", needle)
+		}
+	}
+}
+
+// TestHiddenElementsAreActuallyHidden catches a whole class of bug that the JS
+// verifiers structurally cannot: they assert on the `hidden` *property* against
+// a stub DOM with no CSS, so an element can report hidden===true while being
+// fully visible in a real browser.
+//
+// The cause is CSS precedence. `hidden` works by way of a UA rule
+// (`[hidden] { display: none }`) that any author `display` declaration
+// outranks. `.update-panel { display: flex }` shipped exactly this way: the
+// update banner was permanently on screen showing its "--" placeholder, with no
+// way to dismiss it, and every test still passed.
+//
+// So: for every element in index.html carrying a `hidden` attribute, if its
+// class sets `display`, that class must also carry a `[hidden]` override.
+func TestHiddenElementsAreActuallyHidden(t *testing.T) {
+	index, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css, err := staticFS.ReadFile("static/styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cssText := string(css)
+
+	// Elements written as `<tag ... class="a b" ... hidden>`. Match the bare
+	// boolean attribute only: `\bhidden\b` also matches inside `aria-hidden`
+	// (the hyphen is a word boundary), which is a different thing entirely --
+	// it affects the accessibility tree, not `display`.
+	tagRe := regexp.MustCompile(`(?s)<[a-zA-Z]+[^>]*\shidden[\s>/=][^>]*>`)
+	classRe := regexp.MustCompile(`class="([^"]*)"`)
+	for _, tag := range tagRe.FindAllString(string(index), -1) {
+		classMatch := classRe.FindStringSubmatch(tag)
+		if classMatch == nil {
+			continue
+		}
+		for _, class := range strings.Fields(classMatch[1]) {
+			// Does any rule for this class set `display`?
+			declRe := regexp.MustCompile(`(?s)\.` + regexp.QuoteMeta(class) + `\s*\{[^}]*\bdisplay\s*:`)
+			if !declRe.MatchString(cssText) {
+				continue
+			}
+			// Then it must also neutralise itself when hidden.
+			overrideRe := regexp.MustCompile(`(?s)\.` + regexp.QuoteMeta(class) + `\[hidden\]\s*\{[^}]*\bdisplay\s*:\s*none`)
+			if !overrideRe.MatchString(cssText) {
+				t.Errorf("element with the hidden attribute uses .%s, which sets `display` but has no `.%s[hidden] { display: none }` override; `hidden` will not hide it in a real browser", class, class)
+			}
 		}
 	}
 }
