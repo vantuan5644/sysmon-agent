@@ -27,18 +27,37 @@ fi
 echo "==> Building release exe"
 "$SCRIPT_DIR/build-windows.sh" "$VERSION"
 
-if ! command -v makensis >/dev/null 2>&1; then
+MAKENSIS="$(command -v makensis 2>/dev/null || true)"
+if [[ -z "$MAKENSIS" ]]; then
+    # The Windows NSIS installer does not put makensis on PATH, so a Git Bash
+    # release build fails here even though NSIS is installed. Look in the
+    # standard install locations before giving up.
+    # Note: no ${PROGRAMFILES(X86)} here — parentheses are not legal in a bash
+    # variable name, so referencing that environment variable is a parse error.
+    for candidate in \
+        "/c/Program Files (x86)/NSIS/makensis.exe" \
+        "/c/Program Files/NSIS/makensis.exe" \
+        "${PROGRAMFILES:-/c/Program Files}/NSIS/makensis.exe"; do
+        if [[ -x "$candidate" ]]; then
+            MAKENSIS="$candidate"
+            echo "==> Using NSIS at: $MAKENSIS"
+            break
+        fi
+    done
+fi
+if [[ -z "$MAKENSIS" ]]; then
     echo "==> makensis not found; cannot build the installer." >&2
     echo "    Install NSIS:" >&2
     echo "      Debian/Ubuntu: sudo apt install nsis" >&2
     echo "      macOS:         brew install nsis" >&2
     echo "      Arch:          paru -S nsis   (AUR)" >&2
     echo "      Windows:       https://nsis.sourceforge.io/Download" >&2
+    echo "                     (installs to Program Files without touching PATH)" >&2
     exit 1
 fi
 
 echo "==> Building NSIS installer (version $VERSION)"
-( cd "$SCRIPT_DIR" && makensis -DVERSION="$VERSION" -NOCD installer.nsi )
+( cd "$SCRIPT_DIR" && "$MAKENSIS" -DVERSION="$VERSION" -NOCD installer.nsi )
 
 OUT="$ROOT/dist/out/SysmonAgent-Setup-$VERSION.exe"
 
