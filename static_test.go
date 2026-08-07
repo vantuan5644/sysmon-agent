@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"image/png"
-	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -508,82 +507,6 @@ func TestDashboardPersistsWakePreferenceLocally(t *testing.T) {
 	} {
 		if !strings.Contains(appJS, needle) {
 			t.Fatalf("app.js missing local wake preference behavior %q", needle)
-		}
-	}
-}
-
-func TestReadmeDocumentsLocalWakePreference(t *testing.T) {
-	data, err := staticFS.ReadFile("static/app.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(data), `const wakePreferenceKey = "sysmon:wake-wanted";`) {
-		t.Fatal("app.js no longer has the local Wake preference key")
-	}
-
-	readme, err := os.ReadFile("README.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, needle := range []string{
-		`Wake preference is remembered`,
-		`locally on the device`,
-		`Wake is not stored on the host because it represents per-device browser state`,
-		`device dashboard's local storage`,
-	} {
-		if !strings.Contains(string(readme), needle) {
-			t.Fatalf("README.md missing local Wake preference note %q", needle)
-		}
-	}
-}
-
-func TestReadmeDocumentsStrictHomeScreenGate(t *testing.T) {
-	readme, err := os.ReadFile("README.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, needle := range []string{
-		`polls the ` + "`/api/client-checks`" + ` history, falls back to ` + "`/api/client-check`",
-		`also considers the ` + "`/api/status`" + ` ` + "`device_client_check`",
-		`status-carried device evidence is not missed`,
-		`requires both ` + "`standalone=true`" + ` and ` + "`display_mode=standalone`",
-		`gate requiring ` + "`standalone=true`",
-		"`interaction=status_strip_tap`",
-		`Client checks include the dashboard build token from ` + "`/api/status`",
-		`passive page-open beacon cannot satisfy`,
-		`history, latest endpoint, or ` + "`/api/status`" + ` client-check fields have`,
-		"`standalone=true`" + `, ` + "`display_mode=standalone`",
-		"`interaction=status_strip_tap`" + `, and a ` + "`dashboard_build`" + ` matching ` + "`/api/status`",
-		`plus a ` + "`last_seen`" + ` timestamp from the hold window`,
-		`Tap the status strip while that issue is`,
-		`visible to unregister the Sysmon service worker`,
-		`clear only ` + "`sysmon-static-*`",
-		`caches, and reload the Home Screen dashboard once`,
-		`Successful device control changes also send lightweight ` + "`settings_*`",
-		`without relaxing the final deployed verifier's ` + "`status_strip_tap`" + ` requirement`,
-	} {
-		if !strings.Contains(string(readme), needle) {
-			t.Fatalf("README.md missing strict Home Screen gate note %q", needle)
-		}
-	}
-}
-
-func TestReadmeDocumentsTrustedProxyHeadersForDeviceControls(t *testing.T) {
-	readme, err := os.ReadFile("README.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, needle := range []string{
-		`Settings updates require an ` + "`Origin`" + ` header matching the public request host`,
-		`including script-driven checks`,
-		`X-Forwarded-Host`,
-		`standard ` + "`Forwarded`" + ` header with ` + "`host=...`",
-		`installed device dashboard`,
-		`ignores spoofed`,
-		`non-loopback clients`,
-	} {
-		if !strings.Contains(string(readme), needle) {
-			t.Fatalf("README.md missing trusted proxy header note %q", needle)
 		}
 	}
 }

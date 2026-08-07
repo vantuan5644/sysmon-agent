@@ -21,7 +21,11 @@ func TestWindowsInstallerDefaults(t *testing.T) {
 		// sysmon-agent/CLAUDE.md lists $ReadinessTimeoutSeconds as a cosmetic value the
 		// release and monorepo copies are allowed to diverge on (it is 45 here, was 20).
 		`[int]$ReadinessTimeoutSeconds =`,
-		`$ServiceName = 'HomelabSysmonAgent'`,
+		// The public installer registers `SysmonAgent`; the monorepo copy uses
+		// `HomelabSysmonAgent`. This divergence is intentional and documented --
+		// see apps/sysmon-agent/CLAUDE.md. This file is release-owned so the
+		// upstream expectation is never synced over it.
+		`$ServiceName = 'SysmonAgent'`,
 		`$SettingsPath = "$env:ProgramData\SysmonAgent\settings.json"`,
 		`-Profile Domain,Private`,
 		`Command-line values cannot contain double quotes`,
