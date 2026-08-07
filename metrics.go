@@ -97,6 +97,32 @@ type GPUSet struct {
 	Error     string      `json:"error,omitempty"`
 }
 
+// StorageDevice is one physical block device (NVMe/SATA SSD, HDD) carrying its
+// own capacity and temperature, mirroring the GPUSet/GPUMetric precedent of
+// "one device with its own metrics". Capacity aggregates only the MOUNTED
+// filesystems backed by that device (a drive with nothing mounted degrades to
+// unavailable rather than reporting a bogus 0%-of-physical-size); SizeBytes is
+// the physical drive size, reported separately. Temperature degrades
+// independently (a device with no hwmon still renders its model + capacity).
+type StorageDevice struct {
+	Name        string         `json:"name"`                  // "nvme0n1"
+	Model       string         `json:"model"`                 // "CT4000T705SSD3"
+	SizeBytes   uint64         `json:"size_bytes"`            // physical drive capacity
+	Mountpoints []string       `json:"mountpoints,omitempty"` // mounted filesystems backing this device
+	Capacity    CapacityMetric `json:"capacity"`              // aggregated over MOUNTED filesystems
+	Temperature NumberMetric   `json:"temperature_celsius"`
+}
+
+// StorageSet is the per-drive storage view served to the dashboard's storage
+// panel. It degrades as a whole (Available:false + Error) on platforms that
+// cannot enumerate block devices, and per-field within each device. Mirrors the
+// GPUSet shape so the same tolerant validator pattern applies.
+type StorageSet struct {
+	Available bool            `json:"available"`
+	Devices   []StorageDevice `json:"devices"`
+	Error     string          `json:"error,omitempty"`
+}
+
 // ProcessMetric is one row of the per-process "mini Task Manager + nvitop"
 // page: a single PID with its CPU% (whole-host normalized 0..100), RAM
 // (RSS/WorkingSet), GPU memory (CUDA/compute processes only), and Disk I/O
@@ -184,6 +210,7 @@ type Metrics struct {
 	Memory               CapacityMetric  `json:"memory"`
 	MemorySwap           CapacityMetric  `json:"memory_swap"`
 	Disks                []DiskMetric    `json:"disks"`
+	Storage              StorageSet      `json:"storage"`
 	Network              NetworkSet      `json:"network"`
 	Tailscale            TailscaleStatus `json:"tailscale"`
 	Temperatures         TemperatureSet  `json:"temperatures"`
@@ -368,6 +395,12 @@ func unavailableDisk(message string) []DiskMetric {
 	}}
 }
 
+// unavailableStorage marks the whole StorageSet unavailable with an error. It
+// is the platform-absent / read-failure fallback, mirroring unavailableDisk.
+func unavailableStorage(message string) StorageSet {
+	return StorageSet{Available: false, Error: message}
+}
+
 func ensureDiskMetrics(disks []DiskMetric, unavailableMessage string) []DiskMetric {
 	if len(disks) > 0 {
 		return disks
@@ -419,6 +452,23 @@ func summarizeCollectionErrors(metrics Metrics) []string {
 		}
 		label := firstNonEmpty(disk.Mountpoint, disk.Name, "unknown")
 		add("disk "+label, disk.Capacity.Error)
+	}
+	// Storage degrades as a whole (unavailable set) or per-field within each
+	// device (a drive with no mounted filesystem degrades only its capacity, not
+	// its temperature). Roll every degraded field up so a missing storage sensor
+	// is visible in collection_errors -- otherwise the panel silently shows gaps.
+	if !metrics.Storage.Available {
+		add("storage", metrics.Storage.Error)
+	} else {
+		for _, device := range metrics.Storage.Devices {
+			label := firstNonEmpty(device.Model, device.Name, "unknown")
+			if !device.Capacity.Available {
+				add("storage "+label+" capacity", device.Capacity.Error)
+			}
+			if !device.Temperature.Available {
+				add("storage "+label+" temperature", device.Temperature.Error)
+			}
+		}
 	}
 	if !metrics.Network.Available {
 		add("network", metrics.Network.Error)

@@ -10,6 +10,8 @@ const state = {
   pendingClientCheckPromise: null,
   pendingClientCheckResolve: null,
   transientStatusTimer: null,
+  controlArmedAction: null,
+  controlArmTimer: null,
   updatePollTimer: null,
   paused: false,
   stream: null,
@@ -79,7 +81,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v121";
+const dashboardBuild = "sysmon-static-v124";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -131,6 +133,11 @@ const streamFailureLimit = 3;
 const clientCheckIntervalMS = 30000;
 const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;
 const clientCheckDebounceMS = 500;
+// controlArmWindowMS is how long the Lock Screen button stays armed after the
+// first tap before it auto-disarms. The armed label ("Confirm?") is the
+// authoritative affordance; this is short enough that an accidental arm does
+// not linger but long enough to land the confirming second tap.
+const controlArmWindowMS = 3000;
 const collapsedIssueLimit = 5;
 const sparklineSampleLimit = 24;
 const wakePreferenceKey = "sysmon:wake-wanted";
@@ -229,23 +236,14 @@ function setupPager() {
       ? window.matchMedia("(orientation: landscape) and (max-height: 500px)")
       : null;
 
-  // syncHeight pins the pager to the ACTIVE page's natural height. Because the
-  // CSS uses `align-items: flex-start`, each page keeps its own content height
-  // (it is never stretched to the taller sibling), so offsetHeight here is the
-  // real height of the page we are showing. Setting it on the flex container
-  // collapses the dead space the taller page would otherwise leave below the
-  // shorter one. Guarded so the headless verifier's layout-less DOM is a no-op.
+  // Per-page scrolling: each .page now owns its own vertical scroller (CSS
+  // height: 100% + overflow-y: auto on a bounded pager), so the pager no longer
+  // needs its height pinned to the active page. Kept as a no-op stub because
+  // the render paths still call syncPagerAfterRender() and the layout-less
+  // verifier DOM must not touch geometry APIs. Guarded for that mock regardless.
   const syncHeight = () => {
     if (!pages.length || typeof pager.getBoundingClientRect !== "function") {
       return;
-    }
-    if (landscapeQuery && landscapeQuery.matches) {
-      pager.style.height = "";
-      return;
-    }
-    const active = pages[activePage];
-    if (active && active.offsetHeight > 0) {
-      pager.style.height = `${active.offsetHeight}px`;
     }
   };
   pagerSyncHeight = syncHeight;
@@ -261,6 +259,13 @@ function setupPager() {
       dot.classList.toggle("active", on);
       dot.setAttribute("aria-current", on ? "true" : "false");
     });
+    // Reset the incoming page's vertical scroll to the top so swiping back from
+    // a scrolled-down page lands at the top instead of inheriting a stale
+    // scrollTop. Feature-guarded for the layout-less verifier DOM.
+    const incoming = pages[clamped];
+    if (incoming && typeof incoming.scrollTop === "number") {
+      incoming.scrollTop = 0;
+    }
   };
 
   // Re-measure once the horizontal swipe settles rather than mid-scroll, so a
@@ -1465,6 +1470,7 @@ function render(metrics) {
   renderPrimaryCardDetails(metrics, primaryGPU);
   state.lastProcesses = metrics.processes || { available: false };
   renderApps(metrics.processes);
+  renderStorage(metrics.storage);
 }
 
 // networkTotals sums RX/TX byte rates across every interface into one aggregate
@@ -1709,6 +1715,17 @@ function metricAlertMessages(metrics) {
     const label = disk.mountpoint || disk.name || "disk";
     addPercentAlert(messages, `Disk ${label}`, capacityPercent(disk.capacity), thresholdValue("disk_warn"));
   }
+  // Drive temperatures are alerted from storage.devices[] rather than from the
+  // raw sensor list: the per-device reading is already matched to a drive, so it
+  // alerts as "Samsung SSD 990 PRO" instead of an anonymous "nvme Composite"
+  // repeated once per drive. isPrimaryCardTemperatureSensor suppresses the raw
+  // storage sensors below so the two paths never double-report. The storage
+  // panel only COLOURS its temperature, so without this a hot drive would raise
+  // no alert at all.
+  for (const device of metrics?.storage?.devices || []) {
+    const label = String(device?.model || "").trim() || String(device?.name || "").trim() || "drive";
+    addTemperatureAlert(messages, label, numberMetric(device.temperature_celsius), thresholdValue("temp_warn_c"));
+  }
   for (const sensor of metrics?.temperatures?.sensors || []) {
     if (isPrimaryCardTemperatureSensor(sensor.name)) {
       continue;
@@ -1737,12 +1754,20 @@ function isPrimaryCardTemperatureSensor(name) {
       return true;
     }
   }
-  // Reject non-CPU-die sensors (board, water, disks, PSU, RAM) before the CPU
+  // Storage die sensors (NVMe/SATA SSD, HDD) are alerted from storage.devices[]
+  // in metricAlertMessages, where each reading is already matched to a named
+  // drive. Suppressing them here keeps the two paths from double-reporting --
+  // the raw list would otherwise emit an anonymous "nvme Composite" per drive.
+  for (const fragment of ["hdd", "ssd", "nvme", "disk"]) {
+    if (n.includes(fragment)) {
+      return true;
+    }
+  }
+  // Reject non-CPU-die sensors (board, water, PSU, RAM) before the CPU
   // name check so e.g. a "CPU VRM"/"board" reading is not mistaken for the die.
   for (const fragment of [
     "dimm", "ram", "memory",
     "water", "ambient", "board", "chipset", "motherboard",
-    "hdd", "ssd", "nvme", "disk",
     "psu", "battery",
   ]) {
     if (n.includes(fragment)) {
@@ -2023,6 +2048,120 @@ function setProcessesView(view) {
   $("processesViewProcs").classList.toggle("active", view === "processes");
   $("processesViewProcs").setAttribute("aria-selected", view === "processes" ? "true" : "false");
   renderApps(lastProcessSet());
+}
+
+// renderStorage drives the per-drive storage panel on page 2: one row per
+// physical device with model/name/size + temperature up top, a horizontal fill
+// bar (coloured by the disk_warn threshold), and used/total + mountpoints below.
+// A drive with no mounted filesystem (e.g. an unmounted NTFS drive) renders its
+// temperature and a "\u2014" capacity rather than a bogus 0%. Hidden when the
+// whole set is unavailable, mirroring the GPU/process panels.
+function renderStorage(storage) {
+  const panel = $("storagePanel");
+  const list = $("storageList");
+  const summary = $("storageSummary");
+  if (!panel || !list || !summary) {
+    return;
+  }
+  list.textContent = "";
+  if (!storage || !storage.available || !Array.isArray(storage.devices) || storage.devices.length === 0) {
+    panel.hidden = true;
+    summary.textContent = "--";
+    syncPagerAfterRender();
+    return;
+  }
+  panel.hidden = false;
+  summary.textContent = `${storage.devices.length} drive${storage.devices.length === 1 ? "" : "s"}`;
+  const diskWarn = thresholdValue("disk_warn");
+  const tempWarn = thresholdValue("temp_warn_c");
+  for (const device of storage.devices) {
+    list.append(storageRow(device, diskWarn, tempWarn));
+  }
+  syncPagerAfterRender();
+}
+
+function storageRow(device, diskWarn, tempWarn) {
+  const row = document.createElement("div");
+  row.className = "storage-row";
+
+  const head = document.createElement("div");
+  head.className = "storage-row-head";
+  const model = document.createElement("span");
+  model.className = "storage-model";
+  model.textContent = storageDeviceLabel(device);
+  const temp = numberMetric(device.temperature_celsius);
+  const tempEl = document.createElement("span");
+  tempEl.className = "storage-temp";
+  tempEl.textContent = temp.available ? formatTemp(temp.value) : "--";
+  if (temp.available) {
+    tempEl.style.color = colorFor(temp.value, tempWarn);
+  }
+  head.append(model, tempEl);
+  row.append(head);
+
+  const cap = capacityPercent(device.capacity);
+  const bar = document.createElement("div");
+  bar.className = "storage-bar";
+  const fill = document.createElement("span");
+  fill.className = "storage-bar-fill";
+  if (cap.available) {
+    fill.style.setProperty("--w", `${clamp(cap.value, 0, 100)}%`);
+    fill.style.setProperty("--c", colorFor(cap.value, diskWarn));
+  } else {
+    fill.classList.add("unavailable");
+  }
+  bar.append(fill);
+  row.append(bar);
+
+  const foot = document.createElement("div");
+  foot.className = "storage-row-foot";
+  const left = document.createElement("span");
+  left.className = "storage-mounts";
+  left.textContent = storageFootLeft(device, cap);
+  const capText = document.createElement("span");
+  capText.className = "storage-cap";
+  capText.textContent = cap.available
+    ? `${formatBytes(cap.usedBytes)} / ${formatBytes(cap.totalBytes)}`
+    : "\u2014";
+  foot.append(left, capText);
+  row.append(foot);
+
+  return row;
+}
+
+// storageDeviceLabel renders the row's identity line: model + short name +
+// physical size (e.g. "Samsung 990 PRO 2TB \u00b7 nvme1n1 \u00b7 2.0 TB"),
+// falling back to "drive" when nothing is reported.
+function storageDeviceLabel(device) {
+  const parts = [];
+  const model = String(device?.model || "").trim();
+  const name = String(device?.name || "").trim();
+  if (model) {
+    parts.push(model);
+  }
+  if (name) {
+    parts.push(name);
+  }
+  const sizeBytes = safeIntegerNumber(device?.size_bytes);
+  if (sizeBytes !== null && sizeBytes > 0) {
+    parts.push(formatBytes(sizeBytes));
+  }
+  return parts.length > 0 ? parts.join(" \u00b7 ") : "drive";
+}
+
+// storageFootLeft renders the bar's caption: the device's mountpoints when it
+// has mounted filesystems, otherwise the capacity error ("no mounted
+// filesystems") so an unmounted drive explains itself rather than looking
+// broken.
+function storageFootLeft(device, cap) {
+  const mounts = Array.isArray(device?.mountpoints) ? device.mountpoints.filter((m) => m) : [];
+  if (mounts.length > 0) {
+    return mounts.join(" \u00b7 ");
+  }
+  if (!cap.available) {
+    return cap.error || "not mounted";
+  }
+  return "";
 }
 
 // setProcSort re-sorts the process rows by a column. Tapping the active column
@@ -2464,6 +2603,17 @@ async function sendControl(action, button) {
   if (!button || button.disabled) {
     return;
   }
+  // Lock Screen is destructive enough to require an arm-then-confirm: the first
+  // tap arms the button (label flips to "Confirm?"), and only a second tap
+  // within controlArmWindowMS POSTs. Any other control button disarms it so a
+  // stray arm never lingers. applyControlCapabilities rewrites .disabled on
+  // every status poll, so the armed state lives in a CSS class, not disabled.
+  if (action === "lock_screen" && state.controlArmedAction !== "lock_screen") {
+    disarmControl();
+    armLockControl(button);
+    return;
+  }
+  disarmControl();
   const label = controlActionLabels[action] || "Control";
   try {
     const response = await fetchWithTimeout(
@@ -2487,6 +2637,41 @@ async function sendControl(action, button) {
     showTransientStatus(`${label}: ${reason || "unavailable"}`);
   } catch (error) {
     showTransientStatus(`${label}: ${controlErrorText(error)}`);
+  }
+}
+
+// armLockControl arms the Lock Screen button for the confirm window: it flips
+// the label to "Confirm?", adds the armed CSS class, hints via the status strip,
+// and starts the auto-disarm timer. The second tap (within the window) is what
+// actually POSTs /api/control; the first tap only arms.
+function armLockControl(button) {
+  state.controlArmedAction = "lock_screen";
+  button.classList.add("armed");
+  const labelEl = $("lockCtlLabel");
+  if (labelEl) {
+    labelEl.textContent = "Confirm?";
+  }
+  showTransientStatus("Tap again to lock");
+  clearDashboardTimeout("controlArmTimer");
+  state.controlArmTimer = setTimeout(disarmControl, controlArmWindowMS);
+}
+
+// disarmControl clears any armed Lock Screen state: removes the armed class,
+// restores the label, and cancels the timer. Safe to call when not armed.
+function disarmControl() {
+  const wasArmed = state.controlArmedAction;
+  state.controlArmedAction = null;
+  clearDashboardTimeout("controlArmTimer");
+  if (wasArmed !== "lock_screen") {
+    return;
+  }
+  const button = controlButtonIDs.lock_screen ? $(controlButtonIDs.lock_screen) : null;
+  if (button) {
+    button.classList.remove("armed");
+  }
+  const labelEl = $("lockCtlLabel");
+  if (labelEl) {
+    labelEl.textContent = "Lock";
   }
 }
 

@@ -174,6 +174,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	var memory CapacityMetric
 	var swap CapacityMetric
 	var disks []DiskMetric
+	var storage StorageSet
 	var network NetworkSet
 	var temperatures TemperatureSet
 	var gpu GPUSet
@@ -235,6 +236,11 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	}, func(recovered any) []DiskMetric {
 		return unavailableDisk(fmt.Sprintf("Windows disk collector panicked: %v", recovered))
 	})
+	collectMetricAsync(&wg, &storage, func() StorageSet {
+		return windowsStorage(ctx, bridgeResult, bridgeErr)
+	}, func(recovered any) StorageSet {
+		return unavailableStorage(fmt.Sprintf("Windows storage collector panicked: %v", recovered))
+	})
 	collectMetricAsync(&wg, &network, func() NetworkSet {
 		return c.windowsNetwork(ctx)
 	}, func(recovered any) NetworkSet {
@@ -276,6 +282,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.Memory = memory
 	metrics.MemorySwap = swap
 	metrics.Disks = disks
+	metrics.Storage = storage
 	metrics.Network = network
 	metrics.Tailscale = tailscale
 	metrics.Temperatures = temperatures
@@ -457,6 +464,98 @@ func windowsDisks(ctx context.Context) []DiskMetric {
 	}
 	sort.Slice(disks, func(i, j int) bool { return disks[i].Mountpoint < disks[j].Mountpoint })
 	return ensureDiskMetrics(disks, "no fixed disks found")
+}
+
+// windowsPhysicalDisk is the JSON shape emitted by the MSFT_PhysicalDisk +
+// MSFT_Partition/MSFT_Volume join below: one entry per physical drive with its
+// model, physical size, and aggregated used/total over the drive-lettered
+// volumes that live on it.
+type windowsPhysicalDisk struct {
+	Name        string   `json:"name"`
+	Model       string   `json:"model"`
+	SizeBytes   uint64   `json:"size_bytes"`
+	UsedBytes   uint64   `json:"used_bytes"`
+	TotalBytes  uint64   `json:"total_bytes"`
+	Mountpoints []string `json:"mountpoints"`
+}
+
+// windowsStorage builds the per-physical-drive storage set on Windows. Capacity
+// comes from a Get-CimInstance MSFT_PhysicalDisk query joined to volumes via
+// MSFT_Partition (root/Microsoft/Windows/Storage); temperature is matched from
+// the LibreHardwareMonitor bridge by FriendlyName (the bridge harvest loop is
+// generic over whatever IsStorageEnabled emits). Any failure degrades the whole
+// set to unavailable rather than failing the response. Mirrors the Linux
+// collectStorage shape so the dashboard panel is identical.
+func windowsStorage(ctx context.Context, bridge lhmBridgeResult, bridgeErr error) StorageSet {
+	// Join physical disks to their drive-lettered volumes and aggregate capacity.
+	// -ErrorAction Stop on the CIM queries makes a missing namespace / cmdlet
+	// surface as a non-zero exit, which runPowerShellJSONArray turns into a Go
+	// error so the whole set degrades cleanly.
+	const script = `$ns='root/Microsoft/Windows/Storage'; ` +
+		`$disks=@(Get-CimInstance -Namespace $ns -ClassName MSFT_PhysicalDisk -ErrorAction Stop); ` +
+		`$parts=@(Get-CimInstance -Namespace $ns -ClassName MSFT_Partition -ErrorAction Stop); ` +
+		`foreach ($d in $disks) { ` +
+		`$dp=@($parts | Where-Object { [uint32]$_.DiskNumber -eq [uint32]$d.DeviceId }); ` +
+		`$u=[uint64]0; $t=[uint64]0; $m=@(); ` +
+		`foreach ($p in $dp) { ` +
+		`$l=$p.DriveLetter; ` +
+		`if($l){ $v=Get-Volume -DriveLetter $l -ErrorAction SilentlyContinue; ` +
+		`if($v -and $v.Size -gt 0){ $u+=[uint64]$v.Size-[uint64]$v.SizeRemaining; $t+=[uint64]$v.Size; $m+=($l.ToString()+':') } } ` +
+		`} ` +
+		`[ordered]@{name=('PhysicalDrive'+$d.DeviceId);model=($d.FriendlyName);size_bytes=([uint64]$d.Size);used_bytes=$u;total_bytes=$t;mountpoints=$m} ` +
+		`}`
+	var rows []windowsPhysicalDisk
+	if err := runPowerShellJSONArray(ctx, script, &rows); err != nil {
+		return unavailableStorage(err.Error())
+	}
+	if len(rows) == 0 {
+		return unavailableStorage("no physical disks found")
+	}
+	devices := make([]StorageDevice, 0, len(rows))
+	for _, row := range rows {
+		var capacity CapacityMetric
+		if row.TotalBytes > 0 {
+			capacity = availableCapacity(row.UsedBytes, row.TotalBytes)
+		} else {
+			capacity = unavailableCapacity("no mounted filesystems")
+		}
+		devices = append(devices, StorageDevice{
+			Name:        row.Name,
+			Model:       strings.TrimSpace(row.Model),
+			SizeBytes:   row.SizeBytes,
+			Mountpoints: row.Mountpoints,
+			Capacity:    capacity,
+			Temperature: windowsStorageTemperatureForModel(row.Model, bridge, bridgeErr),
+		})
+	}
+	sort.Slice(devices, func(i, j int) bool { return devices[i].Name < devices[j].Name })
+	return StorageSet{Available: true, Devices: devices}
+}
+
+// windowsStorageTemperatureForModel matches one physical disk's temperature
+// from the LibreHardwareMonitor bridge by FriendlyName. LHM names storage
+// sensors "<FriendlyName> Temperature", so a case-insensitive substring match
+// on the model is specific enough (no CPU/GPU/board temp carries a drive model).
+// Returns unavailable (never an error) when the bridge is down or no match.
+func windowsStorageTemperatureForModel(model string, bridge lhmBridgeResult, bridgeErr error) NumberMetric {
+	if bridgeErr != nil || !bridge.Available {
+		return unavailableNumber("C", "storage temperature unavailable")
+	}
+	needle := strings.ToLower(strings.TrimSpace(model))
+	if needle == "" {
+		return unavailableNumber("C", "no storage temperature sensor reported")
+	}
+	for _, temp := range bridge.Temperatures {
+		name := strings.ToLower(temp.Name)
+		if !strings.Contains(name, needle) {
+			continue
+		}
+		if !isFinite(temp.Value) || temp.Value < -50 || temp.Value > 150 {
+			continue
+		}
+		return availableNumber(temp.Value, "C")
+	}
+	return unavailableNumber("C", "no storage temperature sensor reported")
 }
 
 // windowsNetwork builds the per-interface throughput set and attaches the

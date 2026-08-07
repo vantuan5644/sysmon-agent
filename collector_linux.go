@@ -118,6 +118,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	var memory CapacityMetric
 	var swap CapacityMetric
 	var disks []DiskMetric
+	var storage StorageSet
 	var network NetworkSet
 	var temperatures TemperatureSet
 	var gpu GPUSet
@@ -156,6 +157,11 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return collectDisks()
 	}, func(recovered any) []DiskMetric {
 		return unavailableDisk(fmt.Sprintf("Linux disk collector panicked: %v", recovered))
+	})
+	collectMetricAsync(&wg, &storage, func() StorageSet {
+		return collectStorage()
+	}, func(recovered any) StorageSet {
+		return unavailableStorage(fmt.Sprintf("Linux storage collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &network, func() NetworkSet {
 		return c.collectNetwork(ctx)
@@ -196,6 +202,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.Memory = memory
 	metrics.MemorySwap = swap
 	metrics.Disks = disks
+	metrics.Storage = storage
 	metrics.Network = network
 	metrics.Tailscale = tailscale
 	metrics.Temperatures = temperatures
@@ -258,6 +265,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	var cpuClockMax NumberMetric
 	var cpuClockBase NumberMetric
 	var disks []DiskMetric
+	var storage StorageSet
 	var network NetworkSet
 	var temperatures TemperatureSet
 	var gpu GPUSet
@@ -283,6 +291,11 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		return collectDisks()
 	}, func(recovered any) []DiskMetric {
 		return unavailableDisk(fmt.Sprintf("Linux disk collector panicked: %v", recovered))
+	})
+	collectMetricAsync(&wg, &storage, func() StorageSet {
+		return collectStorage()
+	}, func(recovered any) StorageSet {
+		return unavailableStorage(fmt.Sprintf("Linux storage collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &network, func() NetworkSet {
 		return c.collectNetwork(ctx)
@@ -324,6 +337,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		m.CPUTemperature = cpuTemperature
 		m.PSUOutputPower = unavailableNumber("W", "no PSU output power sensor exposed on Linux")
 		m.Disks = disks
+		m.Storage = storage
 		m.Network = network
 		m.Tailscale = tailscale
 		m.Temperatures = temperatures
@@ -352,6 +366,7 @@ func linuxDegradedSlowPatch(message string) func(*Metrics) {
 		m.CPUTemperature = unavailableNumber("C", message)
 		m.PSUOutputPower = unavailableNumber("W", message)
 		m.Disks = unavailableDisk(message)
+		m.Storage = unavailableStorage(message)
 		m.Network = NetworkSet{Available: false, Error: message}
 		m.Tailscale = TailscaleStatus{Available: false, Error: message}
 		m.Temperatures = TemperatureSet{Available: false, Error: message}
@@ -963,41 +978,23 @@ type mountInfo struct {
 }
 
 func collectDisks() []DiskMetric {
-	data, err := os.ReadFile("/proc/mounts")
+	mounts, err := readIncludedMounts()
 	if err != nil {
 		return unavailableDisk(err.Error())
 	}
 
-	mounts := parseMounts(string(data))
-	disks := make([]DiskMetric, 0, len(mounts))
-	seen := map[string]bool{}
-	for _, mount := range mounts {
-		if !shouldIncludeMount(mount) || seen[mount.mountpoint] {
-			continue
-		}
-		seen[mount.mountpoint] = true
+	// Collapse to one row per backing device (see collapseMountsByDevice) so a
+	// btrfs device mounted at several subvolumes emits a single row instead of
+	// N identical capacity readings (and N identical alerts).
+	representatives := collapseMountsByDevice(mounts)
 
-		var stat syscall.Statfs_t
-		if err := syscall.Statfs(mount.mountpoint, &stat); err != nil {
-			disks = append(disks, DiskMetric{
-				Name:       diskName(mount.device),
-				Mountpoint: mount.mountpoint,
-				FSType:     mount.fsType,
-				Capacity:   unavailableCapacity(err.Error()),
-			})
-			continue
-		}
-		total, totalOK := statfsBytes(stat.Blocks, stat.Bsize)
-		free, freeOK := statfsBytes(stat.Bavail, stat.Bsize)
-		capacity := unavailableCapacity("invalid disk capacity counters")
-		if totalOK && freeOK {
-			capacity = availableCapacityFromTotalFree(total, free, "invalid disk capacity counters")
-		}
+	disks := make([]DiskMetric, 0, len(representatives))
+	for _, mount := range representatives {
 		disks = append(disks, DiskMetric{
 			Name:       diskName(mount.device),
 			Mountpoint: mount.mountpoint,
 			FSType:     mount.fsType,
-			Capacity:   capacity,
+			Capacity:   statfsCapacity(mount.mountpoint),
 		})
 	}
 
@@ -1011,6 +1008,327 @@ func collectDisks() []DiskMetric {
 		return disks[i].Mountpoint < disks[j].Mountpoint
 	})
 	return ensureDiskMetrics(disks, "no local filesystems found")
+}
+
+// collapseMountsByDevice returns one representative mount per backing device,
+// keeping the shortest (root-most) mountpoint. Keying on the device rather than
+// the mountpoint is what turns the five btrfs subvolume rows (/root, /srv,
+// /var/cache, ...) into a single "/" row. Pure (no I/O) so it is unit-testable
+// against synthetic mounts, and the order of devices is stable (first-seen).
+func collapseMountsByDevice(mounts []mountInfo) []mountInfo {
+	best := map[string]mountInfo{}
+	order := []string{}
+	for _, mount := range mounts {
+		existing, ok := best[mount.device]
+		if !ok {
+			best[mount.device] = mount
+			order = append(order, mount.device)
+			continue
+		}
+		if isMoreRootMountpoint(mount.mountpoint, existing.mountpoint) {
+			best[mount.device] = mount
+		}
+	}
+	out := make([]mountInfo, 0, len(order))
+	for _, device := range order {
+		out = append(out, best[device])
+	}
+	return out
+}
+
+// readIncludedMounts returns the local (non-pseudo, non-remote) mounts from
+// /proc/mounts that back the per-mountpoint disk rows.
+func readIncludedMounts() ([]mountInfo, error) {
+	return readMounts(shouldIncludeMount)
+}
+
+// readStorageMounts returns the mounts used for per-device storage grouping. It
+// is readIncludedMounts plus removable media (see shouldIncludeStorageMount), so
+// an external drive still reports its capacity on the storage panel.
+func readStorageMounts() ([]mountInfo, error) {
+	return readMounts(shouldIncludeStorageMount)
+}
+
+// readMounts parses /proc/mounts and keeps the entries the filter accepts.
+func readMounts(include func(mountInfo) bool) ([]mountInfo, error) {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return nil, err
+	}
+	var out []mountInfo
+	for _, mount := range parseMounts(string(data)) {
+		if include(mount) {
+			out = append(out, mount)
+		}
+	}
+	return out, nil
+}
+
+// statfsCapacity stats one mountpoint and returns its used/total capacity. It is
+// the shared per-mount statfs path for collectDisks and collectStorage.
+func statfsCapacity(mountpoint string) CapacityMetric {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(mountpoint, &stat); err != nil {
+		return unavailableCapacity(err.Error())
+	}
+	total, totalOK := statfsBytes(stat.Blocks, stat.Bsize)
+	free, freeOK := statfsBytes(stat.Bavail, stat.Bsize)
+	if !totalOK || !freeOK {
+		return unavailableCapacity("invalid disk capacity counters")
+	}
+	return availableCapacityFromTotalFree(total, free, "invalid disk capacity counters")
+}
+
+// isMoreRootMountpoint reports whether a is a more root-level mountpoint than b
+// ("/" wins; otherwise the shorter path wins). It is the tie-breaker that keeps
+// "/" as the representative mountpoint when a btrfs device has several
+// subvolume mounts.
+func isMoreRootMountpoint(a, b string) bool {
+	if a == "/" {
+		return true
+	}
+	if b == "/" {
+		return false
+	}
+	return len(a) < len(b)
+}
+
+// collectStorage builds the per-physical-drive storage set: each whole block
+// device (NVMe/SATA SSD, HDD) with its physical size, aggregated capacity over
+// the mounted filesystems it backs, and its temperature. It is generic over
+// /sys/block/* (skipping loop/zram/dm-/sr/ram) so SATA and NVMe both work. A
+// drive with nothing mounted (e.g. an unmounted NTFS drive) degrades Capacity to
+// unavailable with "no mounted filesystems" rather than reporting a bogus
+// 0%-of-physical; Temperature degrades independently. Mirrors the GPUSet pattern.
+func collectStorage() StorageSet {
+	return collectStorageFrom("/sys")
+}
+
+// collectStorageFrom builds the per-physical-drive storage set rooted at sysRoot
+// ("/sys" in production), so it is unit-testable against a fake sysfs tree. Each
+// whole block device (NVMe/SATA SSD, HDD) carries its physical size, aggregated
+// capacity over the mounted filesystems it backs, and its temperature. A drive
+// with nothing mounted (e.g. an unmounted NTFS drive) degrades Capacity to
+// unavailable with "no mounted filesystems" rather than reporting a bogus
+// 0%-of-physical; Temperature degrades independently. Mirrors the GPUSet pattern.
+func collectStorageFrom(sysRoot string) StorageSet {
+	blockRoot := filepath.Join(sysRoot, "block")
+	entries, err := os.ReadDir(blockRoot)
+	if err != nil {
+		return unavailableStorage("read " + blockRoot + ": " + err.Error())
+	}
+
+	// Group included mountpoints onto their whole-disk name so each device's
+	// capacity can aggregate the filesystems it actually backs. A partition
+	// (nvme0n1p5) is mapped to its whole disk (nvme0n1); a whole disk maps to
+	// itself. Non-block mounts (tmpfs/overlay) pass through unchanged and never
+	// match a sysRoot/block device, so they are ignored.
+	classBlockRoot := filepath.Join(sysRoot, "class", "block")
+	mountsByDevice := map[string][]mountInfo{}
+	if mounts, err := readStorageMounts(); err == nil {
+		for _, mount := range mounts {
+			whole := linuxWholeDiskForName(diskName(mount.device), classBlockRoot)
+			mountsByDevice[whole] = append(mountsByDevice[whole], mount)
+		}
+	}
+
+	var devices []StorageDevice
+	for _, entry := range entries {
+		name := entry.Name()
+		if shouldSkipBlockDevice(name) {
+			continue
+		}
+		mounts := mountsByDevice[name]
+		devices = append(devices, StorageDevice{
+			Name:        name,
+			Model:       strings.TrimSpace(readFirstLine(filepath.Join(blockRoot, name, "device", "model"))),
+			SizeBytes:   linuxBlockDeviceSize(name, blockRoot),
+			Mountpoints: mountpointsOf(mounts),
+			Capacity:    aggregateDeviceCapacity(mounts),
+			Temperature: linuxStorageTemperature(name, sysRoot),
+		})
+	}
+	if len(devices) == 0 {
+		return unavailableStorage("no block devices found")
+	}
+	sort.Slice(devices, func(i, j int) bool { return devices[i].Name < devices[j].Name })
+	return StorageSet{Available: true, Devices: devices}
+}
+
+// shouldSkipBlockDevice names the /sys/block entries that are not physical
+// drives: loop devices, compressed RAM (zram), device-mapper (dm-), optical
+// (sr), and legacy RAM disks (ram).
+func shouldSkipBlockDevice(name string) bool {
+	for _, prefix := range []string{"loop", "zram", "dm-", "sr", "ram"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// linuxBlockDeviceSize returns a whole block device's capacity in bytes from
+// <blockRoot>/<name>/size (512-byte sectors). The multiply is overflow-checked
+// (sumUint64 adds, so it cannot be reused here).
+func linuxBlockDeviceSize(name, blockRoot string) uint64 {
+	sectors, ok := readUint64File(filepath.Join(blockRoot, name, "size"))
+	if !ok {
+		return 0
+	}
+	const sectorSize = 512
+	if sectors > ^uint64(0)/sectorSize {
+		return 0
+	}
+	return sectors * sectorSize
+}
+
+// mountpointsOf projects the mountpoint paths out of a device's mount list, for
+// the storage row's caption. Every mountpoint is kept (they are distinct paths)
+// even where several share one filesystem.
+func mountpointsOf(mounts []mountInfo) []string {
+	if len(mounts) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(mounts))
+	for _, mount := range mounts {
+		out = append(out, mount.mountpoint)
+	}
+	return out
+}
+
+// aggregateDeviceCapacity sums used/total across the distinct filesystems
+// backing one device. Several mountpoints can share a single filesystem (btrfs
+// subvolumes: /, /root, /srv, /var/log ... are all one filesystem on one
+// partition), and each reports that filesystem's full size, so counting every
+// mountpoint would report a multi-subvolume device at N× its real capacity.
+//
+// The dedup key is the backing device from /proc/mounts, which is exact: two
+// mounts share a filesystem iff they share a device. An earlier version keyed on
+// the observed (total, free) pair instead, which silently collapsed two genuinely
+// distinct sibling partitions whenever they happened to match -- e.g. a drive
+// split into two equal, equally-used volumes reported half its capacity.
+//
+// Deduping before the statfs call also saves the redundant syscalls. A device
+// with no mountpoints (or none stat-able) degrades to unavailable rather than a
+// misleading 0%.
+func aggregateDeviceCapacity(mounts []mountInfo) CapacityMetric {
+	seen := map[string]bool{}
+	var totalSum, usedSum uint64
+	anyAvailable := false
+	for _, mount := range mounts {
+		if seen[mount.device] {
+			continue
+		}
+		seen[mount.device] = true
+		capacity := statfsCapacity(mount.mountpoint)
+		if !capacity.Available {
+			continue
+		}
+		anyAvailable = true
+		total, totalOK := sumUint64(totalSum, capacity.TotalBytes)
+		used, usedOK := sumUint64(usedSum, capacity.UsedBytes)
+		if !totalOK || !usedOK {
+			return unavailableCapacity("capacity counters overflow")
+		}
+		totalSum = total
+		usedSum = used
+	}
+	if !anyAvailable {
+		return unavailableCapacity("no mounted filesystems")
+	}
+	return availableCapacity(usedSum, totalSum)
+}
+
+// linuxWholeDiskForName maps a block-device name (a whole disk or a partition)
+// to its whole-disk name using sysfs rooted at classBlockRoot: a partition
+// carries a "partition" attribute and its parent directory in sysfs is the whole
+// disk. Whole disks map to themselves. Falls back to the input unchanged when
+// sysfs is unavailable or the name is not a known block device (e.g. "tmpfs"),
+// so non-block mounts never match a real device and are simply ignored by the
+// grouping.
+func linuxWholeDiskForName(name, classBlockRoot string) string {
+	if name == "" {
+		return name
+	}
+	link := filepath.Join(classBlockRoot, name)
+	if _, err := os.Stat(filepath.Join(link, "partition")); err != nil {
+		return name
+	}
+	target, err := os.Readlink(link)
+	if err != nil {
+		return name
+	}
+	resolved := filepath.Join(classBlockRoot, target)
+	return filepath.Base(filepath.Dir(filepath.Clean(resolved)))
+}
+
+// linuxStorageTemperature reads one block device's temperature from the sysfs
+// tree rooted at sysRoot. NVMe drives expose their Composite sensor under
+// <sysRoot>/class/nvme/<controller>/hwmon; other devices (SATA SSD/HDD) may
+// expose one under <sysRoot>/block/<dev>/device/hwmon.
+func linuxStorageTemperature(diskName, sysRoot string) NumberMetric {
+	if controller, ok := nvmeControllerForDisk(diskName); ok {
+		return nvmeStorageTemperature(controller, filepath.Join(sysRoot, "class", "nvme"))
+	}
+	return blockDeviceStorageTemperature(diskName, filepath.Join(sysRoot, "block"))
+}
+
+// nvmeControllerForDisk maps an NVMe whole-disk name to its controller: nvme0n1
+// -> nvme0, nvme12n0 -> nvme12. Returns false for non-NVMe names.
+func nvmeControllerForDisk(disk string) (string, bool) {
+	if !strings.HasPrefix(disk, "nvme") {
+		return "", false
+	}
+	rest := strings.TrimPrefix(disk, "nvme")
+	idx := strings.IndexByte(rest, 'n')
+	if idx <= 0 {
+		return "", false
+	}
+	return "nvme" + rest[:idx], true
+}
+
+// nvmeStorageTemperature reads the controller's Composite temperature from
+// <classRoot>/<controller>/hwmon*, falling back to the first available sensor if
+// none is labelled Composite. Returns unavailable (never an error) when the
+// hwmon is absent.
+func nvmeStorageTemperature(controller, classRoot string) NumberMetric {
+	paths, _ := filepath.Glob(filepath.Join(classRoot, controller, "hwmon*", "temp*_input"))
+	sort.Strings(paths)
+	var fallback NumberMetric
+	fallbackOK := false
+	for _, p := range paths {
+		value, ok := readTemperatureMilliC(p)
+		if !ok {
+			continue
+		}
+		base := strings.TrimSuffix(filepath.Base(p), "_input")
+		label := strings.TrimSpace(readFirstLine(filepath.Join(filepath.Dir(p), base+"_label")))
+		if strings.EqualFold(label, "Composite") {
+			return availableNumber(value, "C")
+		}
+		if !fallbackOK {
+			fallback = availableNumber(value, "C")
+			fallbackOK = true
+		}
+	}
+	if fallbackOK {
+		return fallback
+	}
+	return unavailableNumber("C", "no NVMe temperature sensor exposed")
+}
+
+// blockDeviceStorageTemperature reads a non-NVMe block device's temperature
+// from <blockRoot>/<disk>/device/hwmon, the path SATA/SAS HBA temperature
+// sensors use.
+func blockDeviceStorageTemperature(disk, blockRoot string) NumberMetric {
+	paths, _ := filepath.Glob(filepath.Join(blockRoot, disk, "device", "hwmon", "hwmon*", "temp*_input"))
+	sort.Strings(paths)
+	for _, p := range paths {
+		if value, ok := readTemperatureMilliC(p); ok {
+			return availableNumber(value, "C")
+		}
+	}
+	return unavailableNumber("C", "no block-device temperature sensor exposed")
 }
 
 func statfsBytes(blocks uint64, blockSize int64) (uint64, bool) {
@@ -1042,6 +1360,23 @@ func parseMounts(data string) []mountInfo {
 }
 
 func shouldIncludeMount(mount mountInfo) bool {
+	if !isLocalFilesystemMount(mount) {
+		return false
+	}
+	for _, prefix := range []string{"/proc", "/sys", "/dev", "/run"} {
+		if mount.mountpoint == prefix || strings.HasPrefix(mount.mountpoint, prefix+"/") {
+			return false
+		}
+	}
+	return true
+}
+
+// isLocalFilesystemMount is the filesystem-type half of the mount filter: it
+// rejects pseudo, remote, non-root overlay, and docker-layer mounts, but says
+// nothing about the mountpoint's location. shouldIncludeMount adds the
+// system-directory prefix rejection on top; shouldIncludeStorageMount reuses
+// this half so removable media can opt back in.
+func isLocalFilesystemMount(mount mountInfo) bool {
 	if mount.mountpoint == "" {
 		return false
 	}
@@ -1054,15 +1389,28 @@ func shouldIncludeMount(mount mountInfo) bool {
 	if mount.fsType == "overlay" && mount.mountpoint != "/" {
 		return false
 	}
-	for _, prefix := range []string{"/proc", "/sys", "/dev", "/run"} {
-		if mount.mountpoint == prefix || strings.HasPrefix(mount.mountpoint, prefix+"/") {
-			return false
-		}
-	}
 	if strings.Contains(mount.mountpoint, "/var/lib/docker/overlay2/") {
 		return false
 	}
 	return true
+}
+
+// shouldIncludeStorageMount is the mount filter for per-device storage grouping.
+// It accepts everything shouldIncludeMount does, plus removable media mounted
+// under /run/media -- which shouldIncludeMount rejects via its blanket "/run"
+// prefix rule. That rule exists to keep tmpfs/runtime state out of the
+// per-mountpoint disk rows, but an external SSD auto-mounted at
+// /run/media/<user>/<label> is a real filesystem on a real drive, and excluding
+// it makes its whole drive report "no mounted filesystems" on the storage panel.
+// (/media and /mnt already pass shouldIncludeMount, so they need no special case.)
+func shouldIncludeStorageMount(mount mountInfo) bool {
+	if shouldIncludeMount(mount) {
+		return true
+	}
+	if !isLocalFilesystemMount(mount) {
+		return false
+	}
+	return strings.HasPrefix(mount.mountpoint, "/run/media/")
 }
 
 var skippedLinuxFSType = map[string]bool{

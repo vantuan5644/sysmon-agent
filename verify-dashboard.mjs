@@ -232,6 +232,27 @@ function sampleMetrics() {
       fs_type: "ext4",
       capacity: { available: true, used_bytes: 500, total_bytes: 1000, percent: 50 },
     }],
+    storage: {
+      available: true,
+      devices: [
+        {
+          name: "nvme0n1",
+          model: "CT4000T705SSD3",
+          size_bytes: 4000787030016,
+          mountpoints: ["/"],
+          capacity: { available: true, used_bytes: 250, total_bytes: 1000, percent: 25 },
+          temperature_celsius: { available: true, value: 46, unit: "C" },
+        },
+        {
+          name: "nvme2n1",
+          model: "CT4000T710SSD8",
+          size_bytes: 4000787030016,
+          mountpoints: [],
+          capacity: { available: false, error: "no mounted filesystems" },
+          temperature_celsius: { available: true, value: 41, unit: "C" },
+        },
+      ],
+    },
     network: {
       available: true,
       uplink: { available: true, kind: "wifi", name: "BiBi-Pro-Max" },
@@ -481,7 +502,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v121",
+    dashboard_build: "sysmon-static-v124",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -499,7 +520,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v121",
+    dashboard_build: "sysmon-static-v124",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -779,6 +800,22 @@ assert(document.getElementById("cpuName").textContent === "AMD Ryzen 9 7950X", "
 assert(document.getElementById("gpuName").textContent === "GPU 0", "GPU identity line did not render the GPU model");
 assert(document.getElementById("memName").textContent === "DDR5 · 6000 MT/s", "RAM identity line did not render type + speed");
 assert(document.getElementById("netName").textContent === "📶 BiBi-Pro-Max", "NET identity line did not render the Wi-Fi glyph + SSID");
+assert(document.getElementById("storagePanel").hidden === false, "storage panel did not show for available devices");
+assert(document.getElementById("storageSummary").textContent === "2 drives", "storage panel summary did not render drive count");
+{
+  const storageRows = document.getElementById("storageList").children;
+  assert(storageRows.length === 2, "storage panel did not render one row per device");
+  assert(storageRows[0].className === "storage-row", "storage row class did not render");
+  // First device: model · name · size identity, mountpoint caption, used/total.
+  assert(storageRows[0].children[0].children[0].textContent === "CT4000T705SSD3 · nvme0n1 · 3.6 TB", "storage row 0 identity did not render model · name · size");
+  assert(storageRows[0].children[0].children[1].textContent === "46°C", "storage row 0 temperature did not render");
+  assert(storageRows[0].children[2].children[0].textContent === "/", "storage row 0 mountpoint caption did not render");
+  assert(storageRows[0].children[2].children[1].textContent === "250 B / 1000 B", "storage row 0 capacity did not render used/total");
+  // Second device: unmounted -> "no mounted filesystems" caption + em dash.
+  assert(storageRows[1].children[0].children[1].textContent === "41°C", "storage row 1 temperature did not render");
+  assert(storageRows[1].children[2].children[0].textContent === "no mounted filesystems", "storage row 1 did not render the unmounted caption");
+  assert(storageRows[1].children[2].children[1].textContent === "—", "storage row 1 unmounted capacity did not render em dash");
+}
 assert(document.getElementById("netDetail").textContent === "Tailscale", "NET card detail did not render the Tailscale label");
 {
   const netChildren = document.getElementById("netDetail").children;
@@ -879,7 +916,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v121, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v124, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -927,7 +964,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v121; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v124; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -937,7 +974,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v121",
+    dashboard_build: "sysmon-static-v124",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -947,7 +984,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v121",
+    dashboard_build: "sysmon-static-v124",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -998,6 +1035,31 @@ assert(alertsList.children.length === 7, "expanded alerts did not render every a
 const alertCollapseKey = await alertsPanel.dispatch("keydown", { key: " " });
 assert(alertCollapseKey.defaultPrevented === true, "alert panel space key did not prevent default scrolling");
 assert(alertsPanel.getAttribute("aria-expanded") === "false", "alert panel space key did not collapse details");
+// An overheating drive must raise exactly one NAMED alert. The storage panel
+// only colours its temperature, and the raw per-drive "nvme Composite" sensors
+// are suppressed by isPrimaryCardTemperatureSensor, so storage.devices[] is the
+// only path that can surface a hot drive at all.
+const hotDriveMetrics = alertMetrics();
+hotDriveMetrics.storage.devices[0].temperature_celsius = { available: true, value: 81, unit: "C" };
+hotDriveMetrics.temperatures.sensors = [
+  // Three drives all report this identical anonymous name; none may alert.
+  { name: "nvme Composite", celsius: { available: true, value: 81, unit: "C" } },
+  { name: "nvme Composite", celsius: { available: true, value: 79, unit: "C" } },
+  { name: "nvme Composite", celsius: { available: true, value: 78, unit: "C" } },
+];
+context.render(hotDriveMetrics);
+await alertsPanel.click();
+const hotDriveAlerts = Array.from(alertsList.children).map((row) => row.textContent);
+assert(
+  hotDriveAlerts.filter((text) => text === "CT4000T705SSD3 81°C over 70°C").length === 1,
+  `hot drive did not raise exactly one named storage temperature alert: ${JSON.stringify(hotDriveAlerts)}`,
+);
+assert(
+  hotDriveAlerts.every((text) => !text.startsWith("nvme Composite")),
+  `raw per-drive storage sensors must not double-report: ${JSON.stringify(hotDriveAlerts)}`,
+);
+await alertsPanel.click();
+
 context.render(sampleMetrics());
 assert(document.getElementById("alertsPanel").hidden === true, "normal metrics did not hide threshold alerts panel");
 context.render(sampleMetrics());
@@ -1044,7 +1106,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v121", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v124", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");

@@ -7,7 +7,7 @@ const settingsRoundTrip = args.includes("--settings-roundtrip");
 const clientCheckRoundTrip = args.includes("--client-check-roundtrip");
 const baseURL = normalizeBaseURL(args.find((arg) => !arg.startsWith("--")) || defaultBaseURL);
 const timeoutMS = 5000;
-const dashboardBuild = "sysmon-static-v121";
+const dashboardBuild = "sysmon-static-v124";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,
@@ -257,6 +257,7 @@ function validateMetrics(metrics) {
   validateNetwork(metrics.network);
   validateTemperatures(metrics.temperatures);
   validateGPU(metrics.gpu);
+  validateStorage(metrics.storage);
   validateProcesses(metrics.processes);
   validateCollectionErrors(metrics.collection_errors);
 }
@@ -494,6 +495,40 @@ function validateGPU(gpu) {
   });
 }
 
+// validateStorage tolerantly shape-checks the optional per-drive storage set,
+// mirroring validateProcesses: storage degrades as a whole on warmup and on
+// platforms that cannot enumerate block devices, so an unavailable set is
+// accepted (it need not carry an error). When available, each device's capacity
+// and temperature are allowed to be unavailable per-field (a drive with no
+// mounted filesystem degrades only capacity, not temperature); only a name/model
+// presence is required.
+function validateStorage(storage) {
+  if (storage === undefined) {
+    return;
+  }
+  assertObject(storage, "metrics.storage");
+  assert(typeof storage.available === "boolean", "metrics.storage.available must be boolean");
+  if (!storage.available) {
+    return;
+  }
+  assert(Array.isArray(storage.devices) && storage.devices.length > 0, "metrics.storage.devices must be non-empty when available");
+  storage.devices.forEach((device, index) => {
+    assertObject(device, `metrics.storage.devices[${index}]`);
+    assert(
+      nonEmptyString(device.name) || nonEmptyString(device.model),
+      `metrics.storage.devices[${index}] must include name or model`,
+    );
+    assertInteger(device.size_bytes, `metrics.storage.devices[${index}].size_bytes`, { min: 0 });
+    validateCapacityMetric(device.capacity, `metrics.storage.devices[${index}].capacity`, { allowUnavailable: true });
+    validateNumberMetric(device.temperature_celsius, `metrics.storage.devices[${index}].temperature_celsius`, {
+      unit: "C",
+      allowUnavailable: true,
+      min: -50,
+      max: 150,
+    });
+  });
+}
+
 // validateProcesses tolerantly shape-checks the optional per-process set,
 // mirroring the GPU set validator. It degrades as a whole on platforms that
 // cannot enumerate processes, so an unavailable set is accepted (it need not
@@ -697,6 +732,27 @@ function sampleMetrics() {
       fs_type: "ext4",
       capacity: { available: true, used_bytes: 50_000_000_000, total_bytes: 100_000_000_000, percent: 50 },
     }],
+    storage: {
+      available: true,
+      devices: [
+        {
+          name: "nvme0n1",
+          model: "CT4000T705SSD3",
+          size_bytes: 4_000_787_030_016,
+          mountpoints: ["/"],
+          capacity: { available: true, used_bytes: 50_000_000_000, total_bytes: 100_000_000_000, percent: 50 },
+          temperature_celsius: { available: true, value: 46, unit: "C" },
+        },
+        {
+          name: "nvme2n1",
+          model: "CT4000T710SSD8",
+          size_bytes: 4_000_787_030_016,
+          mountpoints: [],
+          capacity: { available: false, error: "no mounted filesystems" },
+          temperature_celsius: { available: true, value: 41, unit: "C" },
+        },
+      ],
+    },
     network: {
       available: true,
       uplink: { available: true, kind: "wifi", name: "BiBi-Pro-Max" },

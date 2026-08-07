@@ -47,6 +47,11 @@ function New-LhmComputer([bool]$EnablePsu) {
     $computer.IsGpuEnabled = $true
     $computer.IsMotherboardEnabled = $true
     $computer.IsMemoryEnabled = $true
+    # Storage enables NVMe/SATA SMART temperature reads so per-drive storage temps
+    # surface with no Go change (the temperature harvest loop is already generic).
+    if ($computer.PSObject.Properties['IsStorageEnabled']) {
+        $computer.IsStorageEnabled = $true
+    }
     $computer.IsPowerMonitorEnabled = $true
     if ($EnablePsu -and $computer.PSObject.Properties['IsPsuEnabled']) {
         $computer.IsPsuEnabled = $true

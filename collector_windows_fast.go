@@ -242,6 +242,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	var psuOutputPower NumberMetric
 	var swap CapacityMetric
 	var disks []DiskMetric
+	var storage StorageSet
 	var network NetworkSet
 	var temperatures TemperatureSet
 	var gpu GPUSet
@@ -288,6 +289,11 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		return windowsDisks(ctx)
 	}, func(recovered any) []DiskMetric {
 		return unavailableDisk(fmt.Sprintf("Windows disk collector panicked: %v", recovered))
+	})
+	collectMetricAsync(&wg, &storage, func() StorageSet {
+		return windowsStorage(ctx, bridgeResult, bridgeErr)
+	}, func(recovered any) StorageSet {
+		return unavailableStorage(fmt.Sprintf("Windows storage collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &network, func() NetworkSet {
 		return c.windowsNetwork(ctx)
@@ -337,6 +343,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		m.PSUOutputPower = psuOutputPower
 		m.MemorySwap = swap
 		m.Disks = disks
+		m.Storage = storage
 		m.Network = network
 		m.Tailscale = tailscale
 		m.Temperatures = temperatures
@@ -362,6 +369,7 @@ func windowsDegradedSlowPatch(message string) func(*Metrics) {
 		m.PSUOutputPower = unavailableNumber("W", message)
 		m.MemorySwap = unavailableCapacity(message)
 		m.Disks = unavailableDisk(message)
+		m.Storage = unavailableStorage(message)
 		m.Network = NetworkSet{Available: false, Error: message}
 		m.Tailscale = TailscaleStatus{Available: false, Error: message}
 		m.Temperatures = TemperatureSet{Available: false, Error: message}

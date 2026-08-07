@@ -110,6 +110,13 @@
         </section>
       </section>
       <section class="page" aria-label="More status">
+        <section id="storagePanel" class="panel storage-panel" role="region" aria-label="Storage devices" aria-live="polite" hidden>
+          <div class="section-head">
+            <h2>Storage</h2>
+            <span id="storageSummary" class="muted">--</span>
+          </div>
+          <div id="storageList" class="rows"></div>
+        </section>
         <section id="issuesPanel" class="panel issues-panel" role="button" tabindex="0" aria-label="Issue details" aria-expanded="false" aria-live="polite" hidden>
           <div class="section-head">
             <h2>Issues</h2>
@@ -167,7 +174,7 @@
         </button>
         <button id="lockCtl" class="control-btn" type="button" data-control="lock_screen" aria-label="Lock the screen" disabled>
           <span class="control-glyph" aria-hidden="true">🔒</span>
-          <span class="control-label">Lock</span>
+          <span class="control-label" id="lockCtlLabel">Lock</span>
         </button>
       </section>
     </footer>

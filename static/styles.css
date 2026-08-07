@@ -61,9 +61,24 @@ button {
 
 .shell {
   width: min(100%, 760px);
-  min-height: 100vh;
-  min-height: 100svh;
+  /* DEFINITE height, not min-height. A percentage height on a descendant
+     (.page) only resolves against a containing block whose height is definite;
+     with min-height alone the chain is content-driven, so .page's height
+     collapsed to auto, the pager sized itself to the tallest page, and the
+     DOCUMENT scrolled -- leaving pages 1 and 2 with blank space below them.
+     Pinning the shell to the viewport is what makes the pager's flex height
+     definite, which is what lets each .page become its own scroller.
+     box-sizing: border-box (global reset) keeps the padding inside this height. */
+  height: 100vh;
+  height: 100svh;
   margin: 0 auto;
+  /* Flex column so the pager (flex: 1 1 auto) grows to fill the viewport and the
+     page dots + host controls stay docked at the bottom on every page, instead
+     of being pushed below the fold by a tall page 3. Each .page then owns its
+     own vertical scroller (see .page below), so the document never has to grow
+     past the viewport. */
+  display: flex;
+  flex-direction: column;
   padding:
     calc(var(--pad-top) + env(safe-area-inset-top))
     calc(var(--pad-x) + env(safe-area-inset-right))
@@ -156,6 +171,14 @@ h2 {
 .control-btn.active {
   border-color: var(--accent);
   background: #153247;
+}
+
+/* Armed state for the Lock Screen confirm flow: amber border/background signal
+   "tap again to confirm". Purely additive to .active; added at runtime via JS
+   (never in the HTML) so the static markup stays stable. */
+.control-btn.armed {
+  border-color: var(--warn);
+  background: #3a2c0e;
 }
 
 .status-strip {
@@ -323,10 +346,15 @@ h2 {
      page grows with the issue count). A flex row sizes itself to the TALLER page
      and stretches the shorter one, leaving dead space below it -- the "blank
      below the gauges" when issues pile up. flex-start keeps each page at its
-     natural height so it stays measurable, and app.js (setupPager) pins the
-     pager to the ACTIVE page's height so neither page shows filler. */
-  align-items: flex-start;
-  transition: height 0.18s ease;
+     natural height so it stays measurable. With the shell now a flex column,
+     the pager grows to fill the viewport (flex: 1 1 auto, min-height: 0) and each
+     .page scrolls internally, so the document never grows past the viewport. */
+  /* stretch (not flex-start): each page must fill the pager's now-definite
+     height so it can be its own scroller. flex-start sized every page to its
+     own content instead, which is what left the short pages ending mid-screen. */
+  align-items: stretch;
+  flex: 1 1 auto;
+  min-height: 0;
   margin-top: 4px;
   overflow-x: auto;
   overflow-y: hidden;
@@ -345,6 +373,15 @@ h2 {
   flex: 0 0 100%;
   width: 100%;
   min-width: 100%;
+  /* Each page owns its own vertical scroller: align-items: stretch on the pager
+     gives it the pager's full (definite) height, and overflow-y: auto makes a
+     tall page 3 scroll internally instead of inflating the whole shell.
+     min-height: 0 lets it actually shrink to that height rather than being
+     floored by its content. overscroll-behavior: contain stops a page scroll
+     from chaining to the document/body bounce. */
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   scroll-snap-align: start;
   scroll-snap-stop: always;
 }
@@ -688,6 +725,83 @@ h2 {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 0.78rem;
+}
+
+/* Per-drive storage panel (page 2). Each device is one row: model/name/size +
+   temperature up top, a horizontal fill bar coloured by the disk_warn
+   threshold, and used/total + mountpoints beneath. Mirrors the .rows/.row
+   density of the alerts/issues panels. */
+.storage-row {
+  padding: 7px 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.storage-row:last-child {
+  border-bottom: 0;
+}
+
+.storage-row-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.storage-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+  font-size: 0.88rem;
+}
+
+.storage-temp {
+  flex: 0 0 auto;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-bar {
+  height: 6px;
+  margin: 5px 0 4px;
+  border-radius: 3px;
+  background: var(--panel-strong);
+  overflow: hidden;
+}
+
+.storage-bar-fill {
+  display: block;
+  height: 100%;
+  width: var(--w, 0%);
+  background: var(--c, var(--accent));
+  border-radius: 3px;
+}
+
+.storage-bar-fill.unavailable {
+  width: 0;
+}
+
+.storage-row-foot {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
+.storage-mounts {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-cap {
+  flex: 0 0 auto;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
 }
 
 .rows {
@@ -1233,9 +1347,15 @@ h2 {
 }
 
 @supports (min-height: 100dvh) {
-  body,
-  .shell {
+  body {
     min-height: 100dvh;
+  }
+
+  /* The shell must stay a DEFINITE height (see .shell). Setting min-height here
+     would win over height: 100svh whenever dvh > svh (browser chrome visible)
+     and let the shell grow again, which is the exact bug this layout fixes. */
+  .shell {
+    height: 100dvh;
   }
 }
 

@@ -17,7 +17,10 @@ func TestWindowsInstallerDefaults(t *testing.T) {
 		`[ValidatePattern('^[A-Za-z0-9_.-]+$')]`,
 		`[ValidateRange(1, 65535)]`,
 		`[ValidateRange(1, 300)]`,
-		`$ReadinessTimeoutSeconds = 20`,
+		// Assert the typed readiness-timeout param exists but not its exact default:
+		// sysmon-agent/CLAUDE.md lists $ReadinessTimeoutSeconds as a cosmetic value the
+		// release and monorepo copies are allowed to diverge on (it is 45 here, was 20).
+		`[int]$ReadinessTimeoutSeconds =`,
 		`$ServiceName = 'HomelabSysmonAgent'`,
 		`$SettingsPath = "$env:ProgramData\SysmonAgent\settings.json"`,
 		`-Profile Domain,Private`,

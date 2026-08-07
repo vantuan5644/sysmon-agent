@@ -34,6 +34,7 @@ func TestLinuxCollectorRunsMetricGroupsConcurrently(t *testing.T) {
 		`collectMetricAsync(&wg, &cpu`,
 		`collectMetricAsync(&wg, &memory`,
 		`collectMetricAsync(&wg, &disks`,
+		`collectMetricAsync(&wg, &storage`,
 		`collectMetricAsync(&wg, &network`,
 		`collectMetricAsync(&wg, &temperatures`,
 		`collectMetricAsync(&wg, &gpu`,
@@ -41,6 +42,7 @@ func TestLinuxCollectorRunsMetricGroupsConcurrently(t *testing.T) {
 		`metrics.CPU = cpu`,
 		`metrics.Memory = memory`,
 		`metrics.Disks = disks`,
+		`metrics.Storage = storage`,
 		`metrics.Network = network`,
 		`metrics.Temperatures = temperatures`,
 		`metrics.GPU = gpu`,
@@ -517,5 +519,237 @@ func TestReadProcCPUInfoClockAveragesMHz(t *testing.T) {
 func TestReadProcCPUInfoClockRejectsGarbage(t *testing.T) {
 	if _, ok := parseProcCPUInfoClock("processor : 0\nflags : fpu\n"); ok {
 		t.Fatal("parseProcCPUInfoClock should fail when no cpu MHz line is present")
+	}
+}
+
+func TestCollapseMountsByDeviceCollapsesBtrfsSubvolumes(t *testing.T) {
+	// Six btrfs subvolume mounts of one device collapse to one row, keeping the
+	// root-most mountpoint "/". A second device with two real mounts keeps the
+	// shorter of the two.
+	mounts := []mountInfo{
+		{device: "/dev/nvme0n1p5", mountpoint: "/srv", fsType: "btrfs"},
+		{device: "/dev/nvme0n1p5", mountpoint: "/var/cache", fsType: "btrfs"},
+		{device: "/dev/nvme0n1p5", mountpoint: "/var/log", fsType: "btrfs"},
+		{device: "/dev/nvme0n1p5", mountpoint: "/var/tmp", fsType: "btrfs"},
+		{device: "/dev/nvme0n1p5", mountpoint: "/root", fsType: "btrfs"},
+		{device: "/dev/nvme0n1p5", mountpoint: "/", fsType: "btrfs"},
+		{device: "/dev/sda2", mountpoint: "/home", fsType: "ext4"},
+		{device: "/dev/sda2", mountpoint: "/", fsType: "ext4"},
+	}
+	got := collapseMountsByDevice(mounts)
+	if len(got) != 2 {
+		t.Fatalf("collapsed %d mounts to %d rows, want 2", len(mounts), len(got))
+	}
+	// First-seen device order is preserved (nvme0n1p5 then sda2).
+	if got[0].device != "/dev/nvme0n1p5" || got[0].mountpoint != "/" {
+		t.Fatalf("nvme0n1p5 representative = %+v, want mountpoint %q", got[0], "/")
+	}
+	if got[1].device != "/dev/sda2" || got[1].mountpoint != "/" {
+		t.Fatalf("sda2 representative = %+v, want mountpoint %q", got[1], "/")
+	}
+}
+
+func TestAggregateDeviceCapacityCountsEachFilesystemOnce(t *testing.T) {
+	// All mountpoints below are the same real directory, so every statfs returns
+	// identical counters. That isolates the dedup rule: what varies between the
+	// cases is only the backing DEVICE, which is the key.
+	dir := t.TempDir()
+	single := statfsCapacity(dir)
+	if !single.Available {
+		t.Skipf("statfs unavailable on %s: %s", dir, single.Error)
+	}
+
+	// btrfs shape: one device mounted at several subvolume paths. Each mount
+	// reports the whole filesystem, so the device must be counted exactly once.
+	subvolumes := []mountInfo{
+		{device: "/dev/nvme0n1p5", mountpoint: dir, fsType: "btrfs"},
+		{device: "/dev/nvme0n1p5", mountpoint: dir, fsType: "btrfs"},
+		{device: "/dev/nvme0n1p5", mountpoint: dir, fsType: "btrfs"},
+	}
+	got := aggregateDeviceCapacity(subvolumes)
+	if got.TotalBytes != single.TotalBytes || got.UsedBytes != single.UsedBytes {
+		t.Fatalf("three subvolumes of one device = used %d / total %d, want one filesystem's %d / %d",
+			got.UsedBytes, got.TotalBytes, single.UsedBytes, single.TotalBytes)
+	}
+
+	// Regression: two DISTINCT sibling partitions whose counters happen to match
+	// exactly (a drive split into two equal, equally-used volumes) must both
+	// count. Keying the dedup on the observed (total, free) pair collapsed them
+	// and reported half the drive's capacity.
+	siblings := []mountInfo{
+		{device: "/dev/nvme0n1p1", mountpoint: dir, fsType: "ext4"},
+		{device: "/dev/nvme0n1p2", mountpoint: dir, fsType: "ext4"},
+	}
+	got = aggregateDeviceCapacity(siblings)
+	if got.TotalBytes != 2*single.TotalBytes || got.UsedBytes != 2*single.UsedBytes {
+		t.Fatalf("two identical sibling partitions = used %d / total %d, want %d / %d (both counted)",
+			got.UsedBytes, got.TotalBytes, 2*single.UsedBytes, 2*single.TotalBytes)
+	}
+}
+
+func TestAggregateDeviceCapacityDegradesWithoutMounts(t *testing.T) {
+	// No mounted filesystems -> unavailable with the honest error.
+	empty := aggregateDeviceCapacity(nil)
+	if empty.Available || empty.Error != "no mounted filesystems" {
+		t.Fatalf("empty capacity = %+v, want unavailable \"no mounted filesystems\"", empty)
+	}
+
+	// A mountpoint that cannot be stat-ed degrades the same way rather than
+	// reporting a bogus 0%.
+	missing := aggregateDeviceCapacity([]mountInfo{
+		{device: "/dev/nvme9n1p1", mountpoint: filepath.Join(t.TempDir(), "definitely-not-mounted"), fsType: "ext4"},
+	})
+	if missing.Available || missing.Error != "no mounted filesystems" {
+		t.Fatalf("unstat-able mount = %+v, want unavailable", missing)
+	}
+}
+
+func TestShouldIncludeStorageMountAcceptsRemovableMedia(t *testing.T) {
+	// An external SSD auto-mounted under /run/media is rejected by the disk-row
+	// filter (blanket "/run" prefix) but must count for per-device storage, or
+	// its whole drive reports "no mounted filesystems".
+	external := mountInfo{device: "/dev/nvme1n1p2", mountpoint: "/run/media/someone/EXT-short", fsType: "exfat"}
+	if shouldIncludeMount(external) {
+		t.Fatal("shouldIncludeMount should still reject /run/media (per-mountpoint disk rows)")
+	}
+	if !shouldIncludeStorageMount(external) {
+		t.Fatal("shouldIncludeStorageMount should accept /run/media removable media")
+	}
+
+	// Ordinary mounts still pass both filters.
+	root := mountInfo{device: "/dev/nvme0n1p5", mountpoint: "/", fsType: "btrfs"}
+	if !shouldIncludeMount(root) || !shouldIncludeStorageMount(root) {
+		t.Fatal("both filters should accept /")
+	}
+
+	// Runtime state under /run that is NOT removable media stays rejected by both.
+	runtime := mountInfo{device: "/dev/loop0", mountpoint: "/run/something", fsType: "ext4"}
+	if shouldIncludeMount(runtime) || shouldIncludeStorageMount(runtime) {
+		t.Fatal("non-media /run mounts must stay excluded from both views")
+	}
+
+	// Pseudo/remote filesystems stay rejected even under /run/media.
+	pseudo := mountInfo{device: "tmpfs", mountpoint: "/run/media/someone/ramdisk", fsType: "tmpfs"}
+	if shouldIncludeStorageMount(pseudo) {
+		t.Fatal("tmpfs under /run/media must stay excluded")
+	}
+}
+
+func TestLinuxWholeDiskForNameMapsPartitionToWholeDisk(t *testing.T) {
+	root := t.TempDir()
+	classBlock := filepath.Join(root, "class", "block")
+
+	// Partition nvme0n1p5: a real device dir backing it + a class-block symlink,
+	// carrying a "partition" attribute. The symlink target is relative so the
+	// resolved parent's base name is the whole disk (nvme0n1).
+	realPart := filepath.Join(root, "devices", "nvme0", "nvme0n1", "nvme0n1p5")
+	if err := writeTestFile(filepath.Join(realPart, "partition"), "5\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(classBlock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../devices/nvme0/nvme0n1/nvme0n1p5", filepath.Join(classBlock, "nvme0n1p5")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := linuxWholeDiskForName("nvme0n1p5", classBlock); got != "nvme0n1" {
+		t.Fatalf("nvme0n1p5 -> %q, want nvme0n1", got)
+	}
+	// Whole disk (no partition attribute) maps to itself.
+	if got := linuxWholeDiskForName("nvme0n1", classBlock); got != "nvme0n1" {
+		t.Fatalf("nvme0n1 -> %q, want nvme0n1", got)
+	}
+	// Non-block name (tmpfs) is not a sysfs entry, so it passes through unchanged.
+	if got := linuxWholeDiskForName("tmpfs", classBlock); got != "tmpfs" {
+		t.Fatalf("tmpfs -> %q, want tmpfs", got)
+	}
+}
+
+func TestNvmeControllerForDisk(t *testing.T) {
+	cases := map[string]string{
+		"nvme0n1":  "nvme0",
+		"nvme12n0": "nvme12",
+		"nvme3n1":  "nvme3",
+	}
+	for disk, want := range cases {
+		got, ok := nvmeControllerForDisk(disk)
+		if !ok || got != want {
+			t.Fatalf("nvmeControllerForDisk(%q) = %q,%t, want %q,true", disk, got, ok, want)
+		}
+	}
+	for _, disk := range []string{"sda", "mmcblk0", "nvme", "nvme0"} {
+		if _, ok := nvmeControllerForDisk(disk); ok {
+			t.Fatalf("nvmeControllerForDisk(%q) returned ok=true, want false", disk)
+		}
+	}
+}
+
+func TestLinuxBlockDeviceSizeMultipliesSectorsBy512(t *testing.T) {
+	root := t.TempDir()
+	blockRoot := filepath.Join(root, "block")
+	// /sys/block/nvme0n1/size is in 512-byte sectors; size_bytes must be sectors*512.
+	if err := writeTestFile(filepath.Join(blockRoot, "nvme0n1", "size"), "7814037168\n"); err != nil {
+		t.Fatal(err)
+	}
+	got := linuxBlockDeviceSize("nvme0n1", blockRoot)
+	if want := uint64(7814037168) * 512; got != want {
+		t.Fatalf("linuxBlockDeviceSize = %d, want %d (sectors*512)", got, want)
+	}
+}
+
+func TestNvmeStorageTemperaturePrefersComposite(t *testing.T) {
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "class", "nvme", "nvme0", "hwmon2")
+	files := map[string]string{
+		filepath.Join(hwmon, "temp1_input"): "45850\n", // 45.85C
+		filepath.Join(hwmon, "temp1_label"): "Composite\n",
+		filepath.Join(hwmon, "temp2_input"): "60000\n", // 60C (should NOT win)
+		filepath.Join(hwmon, "temp2_label"): "Sensor 2\n",
+	}
+	for path, value := range files {
+		if err := writeTestFile(path, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := nvmeStorageTemperature("nvme0", filepath.Join(root, "class", "nvme"))
+	if !got.Available || got.Value != 45.85 {
+		t.Fatalf("Composite temperature = %+v, want 45.85C", got)
+	}
+}
+
+func TestNvmeStorageTemperatureMissingHwmonIsUnavailableNotError(t *testing.T) {
+	root := t.TempDir()
+	got := nvmeStorageTemperature("nvme9", filepath.Join(root, "class", "nvme"))
+	if got.Available {
+		t.Fatalf("missing hwmon reported available: %+v", got)
+	}
+	if got.Unit != "C" {
+		t.Fatalf("unit = %q, want C", got.Unit)
+	}
+	// An error STRING is fine (it explains why); the metric must still be a
+	// well-formed unavailable NumberMetric, never a hard collector error.
+	if got.Error == "" {
+		t.Fatalf("missing hwmon reported available-without-error: %+v", got)
+	}
+}
+
+func TestNvmeStorageTemperatureFallsBackToFirstSensor(t *testing.T) {
+	// No Composite label: fall back to the first readable sensor.
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "class", "nvme", "nvme0", "hwmon0")
+	files := map[string]string{
+		filepath.Join(hwmon, "temp1_input"): "52000\n",
+		filepath.Join(hwmon, "temp1_label"): "Warning\n",
+	}
+	for path, value := range files {
+		if err := writeTestFile(path, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := nvmeStorageTemperature("nvme0", filepath.Join(root, "class", "nvme"))
+	if !got.Available || got.Value != 52 {
+		t.Fatalf("fallback temperature = %+v, want 52C", got)
 	}
 }

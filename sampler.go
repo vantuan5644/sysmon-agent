@@ -140,6 +140,7 @@ func warmingMetrics(hostname string) Metrics {
 	m.PSUOutputPower = unavailableNumber("W", warming)
 	m.Memory = unavailableCapacity(warming)
 	m.Disks = unavailableDisk(warming)
+	m.Storage = unavailableStorage(warming)
 	m.Network = NetworkSet{Available: false, Error: warming}
 	m.Tailscale = TailscaleStatus{Available: false, Error: warming}
 	m.Temperatures = TemperatureSet{Available: false, Error: warming}

@@ -208,6 +208,9 @@ func validateMetricsShape(metrics Metrics) error {
 	if err := validateGPUSet(metrics.GPU); err != nil {
 		return err
 	}
+	if err := validateStorageSet(metrics.Storage); err != nil {
+		return err
+	}
 	if err := validateProcessSet(metrics.Processes); err != nil {
 		return err
 	}
@@ -295,6 +298,35 @@ func validateGPUSet(gpu GPUSet) error {
 			return err
 		}
 		if err := validateNumberMetric(fmt.Sprintf("gpu.devices[%d].temperature_celsius", i), device.Temperature, true, "C"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateStorageSet tolerantly shape-checks the per-drive storage set,
+// mirroring the MemorySwap/process handling: storage is an optional subsystem
+// (unavailable on warmup and on platforms that cannot enumerate block devices),
+// so an unavailable set is always accepted -- it need not carry an error, just
+// like swap. When available it validates that each device carries a name/model
+// and that capacity/temperature are well-formed metrics with the right units,
+// but both are allowed to be unavailable per-field (a drive with no mounted
+// filesystem degrades only capacity, not temperature).
+func validateStorageSet(storage StorageSet) error {
+	if !storage.Available {
+		return nil
+	}
+	if len(storage.Devices) == 0 {
+		return fmt.Errorf("storage available without devices")
+	}
+	for i, device := range storage.Devices {
+		if strings.TrimSpace(device.Name) == "" && strings.TrimSpace(device.Model) == "" {
+			return fmt.Errorf("storage.devices[%d] missing name and model", i)
+		}
+		if err := validateCapacityMetric(fmt.Sprintf("storage.devices[%d].capacity", i), device.Capacity, true); err != nil {
+			return err
+		}
+		if err := validateNumberMetric(fmt.Sprintf("storage.devices[%d].temperature_celsius", i), device.Temperature, true, "C"); err != nil {
 			return err
 		}
 	}
@@ -549,7 +581,7 @@ func checkClientCheck(handler http.Handler) error {
 		return fmt.Errorf("GET /api/client-checks was not empty before dashboard POST")
 	}
 
-	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v121","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
+	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v124","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
 	if post.Code != http.StatusOK {
 		return fmt.Errorf("POST /api/client-check returned %d: %s", post.Code, strings.TrimSpace(post.Body.String()))
 	}

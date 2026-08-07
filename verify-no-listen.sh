@@ -82,10 +82,14 @@ if command -v node >/dev/null 2>&1; then
     node --check verify-api.mjs
     node --check verify-dashboard.mjs
     node --check verify-render.mjs
+    node --check verify-pager.mjs
     report "javascript_syntax=pass"
 
     run_step "api_schema_sample" "API schema sample and interactive round trips" node verify-api.mjs --sample --settings-roundtrip --client-check-roundtrip
     run_step "dashboard_runtime" "dashboard runtime smoke" node verify-dashboard.mjs
+    # Geometry guard for the swipe pager. The two verifiers above are layout-blind
+    # (mock DOM / own fixture), so only this one can catch a pager regression.
+    run_step "pager_layout" "pager layout geometry" node verify-pager.mjs
 
     echo "Checking dashboard render smoke..."
     render_output="$(node verify-render.mjs)"
