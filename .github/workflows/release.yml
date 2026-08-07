@@ -1,0 +1,119 @@
+name: release
+
+# Build and publish a release when a v* tag is pushed.
+#
+# The three assets are a contract, not a convention: the agent's in-dashboard
+# self-update (update.go) and `install-windows.ps1 -Action Update` both download
+# SHA256SUMS.txt and verify the binary against it before swapping it in. The
+# service runs as LocalSystem, so an unverified swap would be a SYSTEM-level RCE
+# vector — both engines refuse to proceed when that asset is missing. Publishing
+# by hand is how a release ends up missing one; this workflow makes all three
+# come from the same build.
+#
+# Everything is produced by dist/build-installer.sh, the same script used for
+# manual builds, so CI and a local build cannot drift.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (no leading v), e.g. 0.1.7. Builds artifacts only; does not publish."
+        required: true
+
+permissions:
+  contents: write        # required to create the release
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # build scripts use `git describe` when no version is passed
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: go.mod
+
+      # makensis is cross-platform: the Windows installer builds on Linux with
+      # no wine, which is why this whole job fits on ubuntu-latest.
+      - name: Install NSIS
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nsis
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            version="${{ github.event.inputs.version }}"
+          else
+            # refs/tags/v0.1.7 -> 0.1.7. The installer embeds the bare version and
+            # names its output SysmonAgent-Setup-<version>.exe.
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::version '$version' is not MAJOR.MINOR.PATCH; the installer and update engines expect a semver tag"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building version $version"
+
+      # Guard the release against shipping a broken tree. Cheap relative to the
+      # cost of a bad auto-update reaching LocalSystem services in the field.
+      - name: Verify before building
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          [ -z "$unformatted" ] || { echo "::error::gofmt not clean:"; echo "$unformatted"; exit 1; }
+          go vet ./...
+          go test ./...
+
+      - name: Build exe + installer + checksums
+        run: ./dist/build-installer.sh "${{ steps.version.outputs.version }}"
+
+      - name: Verify the checksum manifest covers both binaries
+        run: |
+          set -euo pipefail
+          cd dist/out
+          version="${{ steps.version.outputs.version }}"
+          for asset in "sysmon-agent.exe" "SysmonAgent-Setup-$version.exe"; do
+            [ -f "$asset" ] || { echo "::error::missing build output $asset"; exit 1; }
+            grep -qF "$asset" SHA256SUMS.txt || { echo "::error::SHA256SUMS.txt has no entry for $asset"; exit 1; }
+          done
+          # Re-verify rather than trust the generator: this is the exact check
+          # both update engines perform against the published file.
+          sha256sum -c SHA256SUMS.txt
+          echo "checksum manifest verified"
+          cat SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sysmon-agent-${{ steps.version.outputs.version }}
+          path: |
+            dist/out/sysmon-agent.exe
+            dist/out/SysmonAgent-Setup-${{ steps.version.outputs.version }}.exe
+            dist/out/SHA256SUMS.txt
+          if-no-files-found: error
+
+      # Publish only for a real tag push. workflow_dispatch builds and uploads
+      # artifacts so a release can be rehearsed without creating one.
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "dist/out/sysmon-agent.exe" \
+            "dist/out/SysmonAgent-Setup-$version.exe" \
+            "dist/out/SHA256SUMS.txt"

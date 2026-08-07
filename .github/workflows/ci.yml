@@ -1,0 +1,110 @@
+name: ci
+
+# Validates this repo on its own, which matters most for the automated
+# `sync/upstream` PRs: those are machine-generated snapshots of the monorepo, and
+# this is the gate that proves the snapshot is coherent HERE — against this
+# repo's release-owned files (README, install-windows.ps1, dist/, and the
+# release-owned tests), which the sync deliberately never touches.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt is not clean:"; echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt clean"
+
+      - name: go vet
+        run: go vet ./...
+
+      # Catches a half-finished dashboard build-token bump, which is silent at
+      # build time and only shows up as a stale shell on a real device.
+      - name: Dashboard build-token lockstep
+        run: ./check-build-token.sh
+
+      - name: go test
+        run: go test ./...
+
+      - name: Self-check
+        run: go run . -self-check
+
+      - name: Cross-compile for Windows
+        run: |
+          GOOS=windows go build -o /dev/null .
+          GOOS=windows go test -c -o /dev/null .
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: JavaScript syntax
+        run: |
+          node --check static/app.js
+          node --check static/sw.js
+          node --check verify-api.mjs
+          node --check verify-dashboard.mjs
+          node --check verify-render.mjs
+          node --check verify-pager.mjs
+
+      - name: API schema verifier
+        run: node verify-api.mjs --sample --settings-roundtrip
+
+      - name: Dashboard runtime verifier
+        run: node verify-dashboard.mjs
+
+      - name: Pager layout geometry verifier
+        run: node verify-pager.mjs
+
+      - name: Dashboard render verifier
+        run: node verify-render.mjs
+
+  # Proves the release path still works without publishing anything, so a broken
+  # installer build is caught on merge rather than at tag time.
+  installer-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: go.mod
+
+      - name: Install NSIS
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nsis
+
+      - name: Build exe + installer + checksums
+        run: ./dist/build-installer.sh 0.0.0-ci
+
+      - name: Verify the checksum manifest
+        run: |
+          set -euo pipefail
+          cd dist/out
+          for asset in "sysmon-agent.exe" "SysmonAgent-Setup-0.0.0-ci.exe"; do
+            [ -f "$asset" ] || { echo "::error::missing build output $asset"; exit 1; }
+            grep -qF "$asset" SHA256SUMS.txt || { echo "::error::SHA256SUMS.txt has no entry for $asset"; exit 1; }
+          done
+          sha256sum -c SHA256SUMS.txt
