@@ -481,7 +481,7 @@ if ($errors.Count -gt 0) {
     $errors | ForEach-Object { Write-Error "$($verifyPath): $_" }
     exit 1
 }
-function Import-VerifyFunction([string]$Name) {
+function Get-VerifyFunctionText([string]$Name) {
     $functionAst = $ast.Find({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
@@ -490,10 +490,14 @@ function Import-VerifyFunction([string]$Name) {
     if ($null -eq $functionAst) {
         throw "missing function $Name"
     }
-    . ([scriptblock]::Create($functionAst.Extent.Text))
+    return $functionAst.Extent.Text
 }
+# Dot-source at THIS scope, not inside a helper. The dot operator defines into
+# the scope it runs in, so doing it inside a function would define the imported
+# functions in that function's scope and discard them on return -- the call
+# below would then fail with "Get-DetectedDeviceUrl is not recognized".
 foreach ($name in @("Normalize-BaseUrl", "Get-UrlHost", "Get-BaseUrlPart", "Get-DirectLanDeviceUrl", "Get-DetectedDeviceUrl")) {
-    Import-VerifyFunction $name
+    . ([scriptblock]::Create((Get-VerifyFunctionText $name)))
 }
 function Get-TailscaleHostName { return "" }
 function Get-CandidateDeviceHosts { return @("100.90.1.2", "192.168.1.40") }
