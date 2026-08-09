@@ -720,8 +720,14 @@ function sampleMetrics() {
     cpu_percent: { available: true, value: 37, unit: "%" },
     cpu_power: { available: false, unit: "W", error: "no CPU package power counters found" },
     psu_output_power: { available: false, unit: "W", error: "no PSU output power sensor exposed on Linux" },
+    // The four clock fields are distinct measurements, not aliases -- see the
+    // Metrics clock-field comment. When no clock source is readable at all they
+    // degrade together, except cpu_clock_max, which reports that it has nothing
+    // to peak-hold yet rather than that a sysfs node is missing.
     cpu_clock: { available: false, unit: "MHz", error: "CPU clock frequency not exposed" },
-    cpu_clock_max: { available: false, unit: "MHz", error: "CPU max clock frequency not exposed" },
+    cpu_clock_peak_core: { available: false, unit: "MHz", error: "per-core CPU clock frequency not exposed" },
+    cpu_clock_max: { available: false, unit: "MHz", error: "CPU boost ceiling not yet observed" },
+    cpu_clock_rated: { available: false, unit: "MHz", error: "CPU rated max clock frequency not exposed" },
     cpu_clock_base: { available: false, unit: "MHz", error: "CPU base clock frequency not exposed" },
     cpu_temperature: { available: false, unit: "C", error: "no CPU temperature sensor reported" },
     cpu_cores: { available: true, cores: [95, 12, 88, 4], count: 4, busy: 2, busy_threshold: 80 },

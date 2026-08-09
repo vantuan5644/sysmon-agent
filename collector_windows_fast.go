@@ -236,9 +236,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	var cpuCorePower NumberMetric
 	var cpuSocPower NumberMetric
 	var cpuMiscPower NumberMetric
-	var cpuClock NumberMetric
-	var cpuClockMax NumberMetric
-	var cpuClockBase NumberMetric
+	var cpuClocks cpuClockSet
 	var psuOutputPower NumberMetric
 	var swap CapacityMetric
 	var disks []DiskMetric
@@ -275,15 +273,10 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	}, func(recovered any) NumberMetric {
 		return unavailableNumber("W", fmt.Sprintf("Windows PSU output power collector panicked: %v", recovered))
 	})
-	collectMetricAsync(&wg, &cpuClock, func() NumberMetric {
-		cur, mx, base := c.windowsCPUClocks(ctx, bridgeResult, bridgeErr)
-		cpuClockMax = mx
-		cpuClockBase = base
-		return cur
-	}, func(recovered any) NumberMetric {
-		cpuClockMax = unavailableNumber("MHz", fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
-		cpuClockBase = unavailableNumber("MHz", fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
-		return unavailableNumber("MHz", fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
+	collectMetricAsync(&wg, &cpuClocks, func() cpuClockSet {
+		return c.windowsCPUClockSet(ctx, bridgeResult, bridgeErr)
+	}, func(recovered any) cpuClockSet {
+		return degradedCPUClockSet(fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &disks, func() []DiskMetric {
 		return windowsDisks(ctx)
@@ -327,20 +320,26 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	})
 	wg.Wait()
 
-	cpuTemperature := pickCPUTemperature(temperatures)
+	cpuTemperature, cpuTemperatureSensor := pickCPUTemperatureSensor(temperatures)
+	power := c.powerSmooth.observe(cpuPowerSample{
+		Package: cpuPower,
+		Core:    cpuCorePower,
+		Soc:     cpuSocPower,
+		Misc:    cpuMiscPower,
+		PSUOut:  psuOutputPower,
+	})
 	return func(m *Metrics) {
 		m.Platform = platform
 		m.CPUName = cpuName
 		m.MemoryName = memoryName
-		m.CPUPower = cpuPower
-		m.CPUCorePower = cpuCorePower
-		m.CPUSocPower = cpuSocPower
-		m.CPUMiscPower = cpuMiscPower
-		m.CPUClock = cpuClock
-		m.CPUClockMax = cpuClockMax
-		m.CPUClockBase = cpuClockBase
+		m.CPUPower = power.Package
+		m.CPUCorePower = power.Core
+		m.CPUSocPower = power.Soc
+		m.CPUMiscPower = power.Misc
+		cpuClocks.applyTo(m)
 		m.CPUTemperature = cpuTemperature
-		m.PSUOutputPower = psuOutputPower
+		m.CPUTemperatureSensor = cpuTemperatureSensor
+		m.PSUOutputPower = power.PSUOut
 		m.MemorySwap = swap
 		m.Disks = disks
 		m.Storage = storage
@@ -362,10 +361,9 @@ func windowsDegradedSlowPatch(message string) func(*Metrics) {
 		m.CPUCorePower = unavailableNumber("W", message)
 		m.CPUSocPower = unavailableNumber("W", message)
 		m.CPUMiscPower = unavailableNumber("W", message)
-		m.CPUClock = unavailableNumber("MHz", message)
-		m.CPUClockMax = unavailableNumber("MHz", message)
-		m.CPUClockBase = unavailableNumber("MHz", message)
+		degradedCPUClockSet(message).applyTo(m)
 		m.CPUTemperature = unavailableNumber("C", message)
+		m.CPUTemperatureSensor = ""
 		m.PSUOutputPower = unavailableNumber("W", message)
 		m.MemorySwap = unavailableCapacity(message)
 		m.Disks = unavailableDisk(message)

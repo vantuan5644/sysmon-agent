@@ -197,14 +197,41 @@ type Metrics struct {
 	// distinction is worth keeping visible: AMD Adrenalin and Ryzen Master label
 	// the cores-only rail "CPU power", which on a chiplet part runs ~30 W below
 	// the socket total because it excludes the IO die (SoC) and misc rails.
-	CPUPower             NumberMetric    `json:"cpu_power"`
-	CPUCorePower         NumberMetric    `json:"cpu_core_power"`
-	CPUSocPower          NumberMetric    `json:"cpu_soc_power"`
-	CPUMiscPower         NumberMetric    `json:"cpu_misc_power"`
-	CPUClock             NumberMetric    `json:"cpu_clock"`
-	CPUClockMax          NumberMetric    `json:"cpu_clock_max"`
-	CPUClockBase         NumberMetric    `json:"cpu_clock_base"`
-	CPUTemperature       NumberMetric    `json:"cpu_temperature"`
+	CPUPower     NumberMetric `json:"cpu_power"`
+	CPUCorePower NumberMetric `json:"cpu_core_power"`
+	CPUSocPower  NumberMetric `json:"cpu_soc_power"`
+	CPUMiscPower NumberMetric `json:"cpu_misc_power"`
+	// The four clock fields answer four different questions and are deliberately
+	// NOT interchangeable -- conflating them is what made the same 7950X report a
+	// 5.9 GHz ceiling on Linux and 5.5 GHz on Windows:
+	//
+	//   CPUClock         live clock, averaged across every core. On a 16-core part
+	//                    this sits ~1 GHz below whichever core is boosting.
+	//   CPUClockPeakCore live clock of the single fastest core right now. This is
+	//                    the number that answers "does my CPU actually hit its
+	//                    rated boost?"; the average never will.
+	//   CPUClockMax      observed boost ceiling: a peak-hold of CPUClockPeakCore,
+	//                    seeded near base and ratcheted up, never down. Same
+	//                    definition on every platform, so the dashboard ring
+	//                    scales identically everywhere. Process state -- it
+	//                    re-seeds on restart (see cpuClockPeakTracker).
+	//   CPUClockRated    the ceiling the firmware *declares*. Linux-only
+	//                    (cpuinfo_max_freq); reported because on amd-pstate it is
+	//                    an extrapolation of the CPPC perf table, not an
+	//                    achievable clock -- on a 7950X it computes to
+	//                    nominal_freq x highest_perf/nominal_perf = 4501 x 166/127
+	//                    = 5883 MHz, ~180 MHz above the rated 5.7 GHz boost. It is
+	//                    kept visible but is NOT what the ring scales to.
+	CPUClock         NumberMetric `json:"cpu_clock"`
+	CPUClockPeakCore NumberMetric `json:"cpu_clock_peak_core"`
+	CPUClockMax      NumberMetric `json:"cpu_clock_max"`
+	CPUClockRated    NumberMetric `json:"cpu_clock_rated"`
+	CPUClockBase     NumberMetric `json:"cpu_clock_base"`
+	CPUTemperature   NumberMetric `json:"cpu_temperature"`
+	// CPUTemperatureSensor names the sensor CPUTemperature was read from, so a
+	// reading is self-describing and two hosts can be checked for comparability
+	// instead of assumed comparable. Empty when no sensor was resolved.
+	CPUTemperatureSensor string          `json:"cpu_temperature_sensor,omitempty"`
 	CPUCores             CPUCoreSet      `json:"cpu_cores"`
 	PSUOutputPower       NumberMetric    `json:"psu_output_power"`
 	Memory               CapacityMetric  `json:"memory"`
@@ -220,17 +247,117 @@ type Metrics struct {
 	CollectionErrors     []string        `json:"collection_errors,omitempty"`
 }
 
-// pickCPUTemperature returns the best CPU package/core reading from a temperature
-// set so the dashboard can show a dedicated CPU temperature next to CPU usage
-// instead of only the global hottest sensor. GPU die sensors are excluded
-// because each GPU device already carries its own temperature_celsius field;
-// the picker then prefers a CPU die by name and returns the warmest plausible
-// candidate so a stuck low reading does not mask a real hot core.
+// pickCPUTemperature returns the canonical whole-CPU die reading from a
+// temperature set so the dashboard can show a dedicated CPU temperature next to
+// CPU usage instead of only the global hottest sensor.
+//
+// It deliberately does NOT return the warmest CPU-ish sensor, which is what it
+// used to do. Taking a max made `cpu_temperature` mean a different physical
+// quantity per platform, because the candidate set is not comparable: Linux
+// hwmon offers roughly `k10temp Tctl` + `Tccd1/2` -- one die -- while
+// LibreHardwareMonitor offers ten survivors spanning four locations. Measured on
+// a 7950X at idle, the max picked `Core (Tctl/Tdie)` at 59.5 C while the same
+// tree also carried `Package` 43.34 C, `IOD Hotspot` 43.5 C, `CCD1 (Tdie)` 37 C,
+// `L3 (CCD1)` 32.75 C and a board super-IO `... NCT6799D CPU` at 52 C. Comparing
+// that number against a Linux host compares two different registers -- the same
+// defect cpu_clock_peak.go documents for cpu_clock_max.
+//
+// So the picker ranks by what the sensor *is* (see cpuDieTemperatureRank) and
+// only breaks ties within a rank by temperature, which still covers a genuine
+// multi-socket or multi-die host. Sensors that are CPU-adjacent but are not the
+// whole-CPU die -- per-CCD, L3, IO die, pre-averaged aggregates, and board
+// super-IO socket sensors -- are excluded outright rather than allowed to win by
+// being hot.
+//
+// Eligibility still comes from isCPUTemperatureSensor, which is unchanged and
+// mirrored by isPrimaryCardTemperatureSensor in static/app.js; the ranking is
+// layered on top so that mirror stays accurate.
 func pickCPUTemperature(temps TemperatureSet) NumberMetric {
+	value, _ := pickCPUTemperatureSensor(temps)
+	return value
+}
+
+// cpuCanonicalTemperatureSensor names one platform's authoritative whole-CPU die
+// sensor, so a host the agent knows about always reports the same register
+// rather than whatever the ranking heuristics happen to select.
+//
+// Match mode differs by source because the naming does. Linux hwmon names are
+// composed by collectHWMONTemperatures as "<chip> <label>" and both halves are
+// stable, so those match exactly. LibreHardwareMonitor prefixes the CPU model
+// ("AMD Ryzen 9 7950X Core (Tctl/Tdie)"), so only the tail is stable and a
+// literal would break on the next CPU -- those match by suffix.
+type cpuCanonicalTemperatureSensor struct {
+	match  string
+	suffix bool
+	source string
+}
+
+// cpuCanonicalTemperatureSensors is consulted in order; the first entry with any
+// matching sensor wins regardless of temperature. Adding a platform here is the
+// preferred fix when a host picks a surprising sensor -- extend this table
+// rather than loosening cpuDieTemperatureRank.
+var cpuCanonicalTemperatureSensors = []cpuCanonicalTemperatureSensor{
+	{match: "core (tctl/tdie)", suffix: true, source: "LibreHardwareMonitor, AMD"},
+	{match: "k10temp tctl", source: "Linux hwmon, AMD"},
+	{match: "coretemp package id 0", source: "Linux hwmon, Intel"},
+	{match: "cpu package", suffix: true, source: "LibreHardwareMonitor, Intel"},
+}
+
+// pickCPUTemperatureSensor resolves the CPU temperature and also returns the
+// name of the sensor it came from, which is published as
+// Metrics.CPUTemperatureSensor. Reporting the name is the actual guard against
+// this metric silently changing meaning again: whatever the selection rules do,
+// two hosts (or two points in time) can be checked for comparability directly
+// instead of being assumed comparable.
+func pickCPUTemperatureSensor(temps TemperatureSet) (NumberMetric, string) {
 	if !temps.Available {
-		return unavailableNumber("C", temps.Error)
+		return unavailableNumber("C", temps.Error), ""
 	}
+	// Exact table first. Within one entry, ties go to the warmest so a
+	// multi-socket host reports its hottest package rather than the first one
+	// enumerated.
+	for _, canonical := range cpuCanonicalTemperatureSensors {
+		var best *NumberMetric
+		bestName := ""
+		for i := range temps.Sensors {
+			sensor := temps.Sensors[i]
+			if !sensor.Celsius.Available {
+				continue
+			}
+			n := strings.ToLower(strings.TrimSpace(sensor.Name))
+			matched := n == canonical.match
+			if canonical.suffix {
+				matched = strings.HasSuffix(n, canonical.match)
+			}
+			if !matched {
+				continue
+			}
+			candidate := sensor.Celsius
+			if best == nil || candidate.Value > best.Value {
+				best = &candidate
+				bestName = sensor.Name
+			}
+		}
+		if best != nil {
+			return *best, bestName
+		}
+	}
+	return rankCPUTemperature(temps)
+}
+
+// rankCPUTemperature is the fallback for a host with no canonical sensor in the
+// table: an unknown CPU, an unusual hwmon driver, or a future LHM rename. It
+// still refuses to simply take the warmest CPU-ish sensor.
+func rankCPUTemperature(temps TemperatureSet) (NumberMetric, string) {
 	var best *NumberMetric
+	bestName := ""
+	bestRank := cpuTempRankNone
+	// Fallback across eligible-but-not-die sensors, used only when a host
+	// exposes no whole-CPU die reading at all (e.g. a board that reports just a
+	// socket sensor). Degrading to the old warmest-wins behaviour there beats
+	// reporting nothing.
+	var fallback *NumberMetric
+	fallbackName := ""
 	for i := range temps.Sensors {
 		sensor := temps.Sensors[i]
 		if !sensor.Celsius.Available {
@@ -240,14 +367,81 @@ func pickCPUTemperature(temps TemperatureSet) NumberMetric {
 			continue
 		}
 		candidate := sensor.Celsius
-		if best == nil || candidate.Value > best.Value {
+		rank := cpuDieTemperatureRank(sensor.Name)
+		if rank == cpuTempRankNone {
+			if fallback == nil || candidate.Value > fallback.Value {
+				fallback = &candidate
+				fallbackName = sensor.Name
+			}
+			continue
+		}
+		if best == nil || rank < bestRank || (rank == bestRank && candidate.Value > best.Value) {
 			best = &candidate
+			bestRank = rank
+			bestName = sensor.Name
 		}
 	}
 	if best != nil {
-		return *best
+		return *best, bestName
 	}
-	return unavailableNumber("C", "no CPU temperature sensor reported")
+	if fallback != nil {
+		return *fallback, fallbackName
+	}
+	return unavailableNumber("C", "no CPU temperature sensor reported"), ""
+}
+
+// Ranks for cpuDieTemperatureRank, best first. Ordering encodes which sensor is
+// the canonical whole-CPU die reading on each vendor: AMD publishes Tctl/Tdie,
+// Intel publishes a package sensor (`coretemp Package id 0`), and a per-core
+// reading is the last resort that still describes actual CPU silicon.
+const (
+	cpuTempRankTctl    = iota // AMD "Core (Tctl/Tdie)", "k10temp Tctl"
+	cpuTempRankPackage        // Intel "coretemp Package id 0", AMD LHM "Package"
+	cpuTempRankCore           // "coretemp Core 0"
+	cpuTempRankGeneric        // bare "CPU", vendor model strings
+	cpuTempRankNone           // not a whole-CPU die reading; never picked over the above
+)
+
+// cpuDieTemperatureRank classifies an already-eligible sensor name as a
+// whole-CPU die reading and ranks it, or returns cpuTempRankNone for a sensor
+// that describes something narrower than the whole CPU.
+//
+// Tctl outranks Package deliberately. On AMD the two are distinct registers that
+// disagree by ~16 C at idle, so folding them into one tier and taking the max
+// would reintroduce exactly the arbitrariness this function exists to remove.
+func cpuDieTemperatureRank(name string) int {
+	n := strings.ToLower(name)
+	// Fragments here are matched as substrings, so each one is chosen to be
+	// unambiguous: "soc" would match "socket", "iod" would match "diode", and
+	// "nct" would match "junction", each silently disqualifying a legitimate CPU
+	// die sensor. Prefer a longer, unmistakable fragment over a short one.
+	for _, fragment := range []string{
+		// Narrower than the whole CPU: one core-complex die, cache, IO die, or a
+		// value LHM has already averaged/maxed for display. The IO die needs no
+		// fragment of its own -- LHM names it "IOD Hotspot", caught below.
+		"ccd", "l3", "cache", "hotspot", "hot spot", "average",
+		// Board super-IO chips expose a socket-adjacent sensor also called "CPU".
+		// It reads the socket, not the die, and on this ASUS X670E board it sat
+		// 7 C below Tctl -- close enough to look plausible, far enough to poison
+		// a cross-host comparison.
+		"nuvoton", "nct6", "it87", "w83", "f718",
+		// Rails and regulators, not silicon.
+		"vrm", "vddcr", "vcore",
+	} {
+		if strings.Contains(n, fragment) {
+			return cpuTempRankNone
+		}
+	}
+	switch {
+	case strings.Contains(n, "tctl"), strings.Contains(n, "tdie"):
+		return cpuTempRankTctl
+	case strings.Contains(n, "package"):
+		return cpuTempRankPackage
+	case strings.Contains(n, "core"):
+		return cpuTempRankCore
+	default:
+		return cpuTempRankGeneric
+	}
 }
 
 // isCPUTemperatureSensor classifies a sensor name as a CPU die reading. It first

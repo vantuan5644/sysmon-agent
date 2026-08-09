@@ -87,11 +87,18 @@ type systemCollector struct {
 	// every pass. Guarded by mu.
 	uplink   NetworkUplink
 	uplinkAt time.Time
-	// cpuClockPeakMHz is the highest live CPU clock observed this process. It is
-	// the boost ceiling the dashboard clock ring scales to, because
-	// Win32_Processor.MaxClockSpeed reports only the rated base clock. Guarded by
-	// mu.
-	cpuClockPeakMHz float64
+	// clockPeak ratchets the observed CPU boost ceiling reported as
+	// cpu_clock_max, because Win32_Processor.MaxClockSpeed reports only the rated
+	// base clock and Windows exposes no boost figure. Shared, untagged
+	// implementation so the field means the same thing here as on Linux. Carries
+	// its own lock (NOT mu).
+	clockPeak cpuClockPeakTracker
+	// powerSmooth rolling-averages the CPU power rails and caps each rail at the
+	// package, because the AMD SMU does not update PPT and the per-rail sensors
+	// on a common cadence and the bridge reads whatever each register holds.
+	// Shared, untagged implementation so cpu_power is the same statistic on both
+	// platforms. Carries its own lock (NOT mu).
+	powerSmooth cpuPowerSmoother
 }
 
 type netCounter struct {
@@ -167,9 +174,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	var cpuCorePower NumberMetric
 	var cpuSocPower NumberMetric
 	var cpuMiscPower NumberMetric
-	var cpuClock NumberMetric
-	var cpuClockMax NumberMetric
-	var cpuClockBase NumberMetric
+	var cpuClocks cpuClockSet
 	var psuOutputPower NumberMetric
 	var memory CapacityMetric
 	var swap CapacityMetric
@@ -211,15 +216,10 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	}, func(recovered any) NumberMetric {
 		return unavailableNumber("W", fmt.Sprintf("Windows PSU output power collector panicked: %v", recovered))
 	})
-	collectMetricAsync(&wg, &cpuClock, func() NumberMetric {
-		cur, mx, base := c.windowsCPUClocks(ctx, bridgeResult, bridgeErr)
-		cpuClockMax = mx
-		cpuClockBase = base
-		return cur
-	}, func(recovered any) NumberMetric {
-		cpuClockMax = unavailableNumber("MHz", fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
-		cpuClockBase = unavailableNumber("MHz", fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
-		return unavailableNumber("MHz", fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
+	collectMetricAsync(&wg, &cpuClocks, func() cpuClockSet {
+		return c.windowsCPUClockSet(ctx, bridgeResult, bridgeErr)
+	}, func(recovered any) cpuClockSet {
+		return degradedCPUClockSet(fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &memory, func() CapacityMetric {
 		return windowsMemory(ctx)
@@ -268,17 +268,23 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	})
 	wg.Wait()
 
+	power := c.powerSmooth.observe(cpuPowerSample{
+		Package: cpuPower,
+		Core:    cpuCorePower,
+		Soc:     cpuSocPower,
+		Misc:    cpuMiscPower,
+		PSUOut:  psuOutputPower,
+	})
+
 	metrics.CPU = cpu
 	metrics.CPUCores = c.windowsCPUCores(ctx)
-	metrics.CPUPower = cpuPower
-	metrics.CPUCorePower = cpuCorePower
-	metrics.CPUSocPower = cpuSocPower
-	metrics.CPUMiscPower = cpuMiscPower
-	metrics.CPUClock = cpuClock
-	metrics.CPUClockMax = cpuClockMax
-	metrics.CPUClockBase = cpuClockBase
-	metrics.CPUTemperature = pickCPUTemperature(temperatures)
-	metrics.PSUOutputPower = psuOutputPower
+	metrics.CPUPower = power.Package
+	metrics.CPUCorePower = power.Core
+	metrics.CPUSocPower = power.Soc
+	metrics.CPUMiscPower = power.Misc
+	cpuClocks.applyTo(&metrics)
+	metrics.CPUTemperature, metrics.CPUTemperatureSensor = pickCPUTemperatureSensor(temperatures)
+	metrics.PSUOutputPower = power.PSUOut
 	metrics.Memory = memory
 	metrics.MemorySwap = swap
 	metrics.Disks = disks
@@ -314,27 +320,27 @@ func windowsCPU(ctx context.Context) NumberMetric {
 	return windowsCPULoadMetric(result.Average)
 }
 
-// windowsCPUClocks reports the live processor clock, an observed boost ceiling,
-// and the rated base clock in megahertz. The current clock comes from the
+// windowsCPUClockSet resolves the full clock set. The live clocks come from the
 // LibreHardwareMonitor bridge when available, because
 // Win32_Processor.CurrentClockSpeed is NOT a live frequency: Windows refreshes
 // it rarely (often only at boot) and many systems just echo the rated speed, so
 // it pins at a constant value and never reflects idle/boost. LHM reads the
 // per-core MSRs each sample, so it tracks the real frequency, and WMI
-// CurrentClockSpeed is the current-clock fallback on hosts without it.
+// CurrentClockSpeed is the fallback on hosts without it.
 //
-// Win32_Processor.MaxClockSpeed is the rated BASE clock on modern CPUs, not the
-// turbo ceiling, so it is reported as `base`. The ring's upper bound (`max`) is
-// instead a peak-hold of the live clock (see observedCPUClockCeiling): seeded
-// near base on the first sample so the ring has a sane scale immediately, then
-// ratcheted up -- never down -- as boost clocks are observed.
-func (c *systemCollector) windowsCPUClocks(ctx context.Context, bridge lhmBridgeResult, bridgeErr error) (current, max, base NumberMetric) {
+// Win32_Processor.MaxClockSpeed is the rated BASE clock on modern CPUs (4500 on
+// a 7950X), not the turbo ceiling, so it is reported as Base. Windows exposes no
+// declared boost figure at all, hence Rated is permanently unavailable here --
+// unlike Linux, which has cpufreq's (over-optimistic) cpuinfo_max_freq. Max is
+// the peak-hold ceiling, ratcheted from the per-core peak.
+func (c *systemCollector) windowsCPUClockSet(ctx context.Context, bridge lhmBridgeResult, bridgeErr error) cpuClockSet {
 	var result struct {
 		CurrentClockSpeed *float64
 		MaxClockSpeed     *float64
 	}
 	err := runPowerShellJSON(ctx, `Get-CimInstance Win32_Processor | Select-Object -First 1 CurrentClockSpeed,MaxClockSpeed`, &result)
 
+	var base NumberMetric
 	var baseMHz float64
 	var baseOK bool
 	if err != nil {
@@ -348,9 +354,14 @@ func (c *systemCollector) windowsCPUClocks(ctx context.Context, bridge lhmBridge
 
 	// Resolve the live current clock: prefer the LibreHardwareMonitor core clock,
 	// fall back to the (static) WMI CurrentClockSpeed.
+	var current NumberMetric
+	peakCore := unavailableNumber("MHz", "LibreHardwareMonitor did not report per-core CPU clocks")
 	if bridgeErr == nil && bridge.Available {
 		if metric := lhmClockMetric(bridge.CPUClock); metric.Available {
 			current = metric
+		}
+		if metric := lhmClockMetric(bridge.CPUClockPeakCore); metric.Available {
+			peakCore = metric
 		}
 	}
 	if !current.Available {
@@ -363,30 +374,13 @@ func (c *systemCollector) windowsCPUClocks(ctx context.Context, bridge lhmBridge
 		}
 	}
 
-	max = c.observedCPUClockCeiling(current, baseMHz, baseOK)
-	return current, max, base
-}
-
-// observedCPUClockCeiling maintains the peak-hold boost ceiling the dashboard
-// clock ring scales to. On the first call with a known base it seeds the peak
-// near base (base * 1.08) so the ring has a sane upper bound before any boost is
-// seen; thereafter it ratchets the peak up to the live clock whenever that reads
-// a sane value (200..8000 MHz, rejecting transient garbage), never lowering it.
-// Peak is process state -- a daemon rebridge does not reset it; only an agent
-// restart clears it, and the seed re-establishes scale at once. Guarded by mu.
-func (c *systemCollector) observedCPUClockCeiling(current NumberMetric, baseMHz float64, baseOK bool) NumberMetric {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cpuClockPeakMHz == 0 && baseOK && baseMHz > 0 {
-		c.cpuClockPeakMHz = round(baseMHz*1.08, 0)
+	return cpuClockSet{
+		Current:  current,
+		PeakCore: peakCore,
+		Max:      c.clockPeak.observe(peakCore, current, baseMHz, baseOK),
+		Rated:    unavailableNumber("MHz", "Windows exposes no declared CPU boost clock (Win32_Processor.MaxClockSpeed is the base clock)"),
+		Base:     base,
 	}
-	if current.Available && current.Value >= 200 && current.Value <= 8000 && current.Value > c.cpuClockPeakMHz {
-		c.cpuClockPeakMHz = current.Value
-	}
-	if c.cpuClockPeakMHz > 0 {
-		return availableNumber(c.cpuClockPeakMHz, "MHz")
-	}
-	return unavailableNumber("MHz", "CPU boost ceiling not yet observed")
 }
 
 func windowsClockMHz(value *float64) (float64, bool) {
@@ -876,12 +870,19 @@ type lhmBridgeResult struct {
 	// AMD SMU per-rail breakdown of Power. Only Zen parts whose SMU PM-table
 	// version LibreHardwareMonitor has a sensor map for report these, so each is
 	// absent (nil) on Intel and on unmapped AMD parts.
-	CPUCorePower   *lhmBridgeValue `json:"cpu_core_power,omitempty"`
-	CPUSocPower    *lhmBridgeValue `json:"cpu_soc_power,omitempty"`
-	CPUMiscPower   *lhmBridgeValue `json:"cpu_misc_power,omitempty"`
-	CPUClock       *lhmBridgeValue `json:"cpu_clock,omitempty"`
-	PSUOutputPower *lhmBridgeValue `json:"psu_output_power,omitempty"`
-	Temperatures   []lhmBridgeTemp `json:"temperatures,omitempty"`
+	CPUCorePower *lhmBridgeValue `json:"cpu_core_power,omitempty"`
+	CPUSocPower  *lhmBridgeValue `json:"cpu_soc_power,omitempty"`
+	CPUMiscPower *lhmBridgeValue `json:"cpu_misc_power,omitempty"`
+	// CPUClock is the mean across cores; CPUClockPeakCore is the single fastest
+	// core in the same sample. The mean on a many-core part sits ~1 GHz below the
+	// boosting core, so only the peak can answer "does this chip reach its rated
+	// boost?" -- and only the peak is a sane thing to ratchet the ceiling with.
+	// Absent (nil) when the bridge is older than the agent, which degrades
+	// cpu_clock_peak_core rather than the whole clock set.
+	CPUClock         *lhmBridgeValue `json:"cpu_clock,omitempty"`
+	CPUClockPeakCore *lhmBridgeValue `json:"cpu_clock_peak_core,omitempty"`
+	PSUOutputPower   *lhmBridgeValue `json:"psu_output_power,omitempty"`
+	Temperatures     []lhmBridgeTemp `json:"temperatures,omitempty"`
 }
 
 type lhmBridgeValue struct {

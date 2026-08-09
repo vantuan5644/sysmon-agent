@@ -337,7 +337,10 @@ func TestIsCPUTemperatureSensorClassifiesSensors(t *testing.T) {
 	}
 }
 
-func TestPickCPUTemperatureReturnsWarmestCpuDie(t *testing.T) {
+func TestPickCPUTemperaturePrefersTctlOverWarmerPackage(t *testing.T) {
+	// Tctl must win even though Package reads hotter: they are distinct AMD
+	// registers, and letting the warmer one win is what made cpu_temperature
+	// mean different things on Linux and Windows.
 	temps := TemperatureSet{
 		Available: true,
 		Sensors: []TemperatureMetric{
@@ -349,8 +352,183 @@ func TestPickCPUTemperatureReturnsWarmestCpuDie(t *testing.T) {
 		},
 	}
 	got := pickCPUTemperature(temps)
-	if !got.Available || got.Value != 50 {
-		t.Fatalf("pickCPUTemperature = %+v, want 50 C (Package, warmest CPU die)", got)
+	if !got.Available || got.Value != 48 {
+		t.Fatalf("pickCPUTemperature = %+v, want 48 C (Tctl outranks a warmer Package)", got)
+	}
+}
+
+// TestPickCPUTemperatureRejectsHotterNonDieSensors uses the exact sensor set
+// measured on BBLWIN (ASUS X670E Hero + 7950X, LibreHardwareMonitor) at idle.
+// Every rejected candidate here previously outranked or could outrank the die
+// reading purely by being hot. See docs/windows-idle-tuning.md.
+func TestPickCPUTemperatureRejectsHotterNonDieSensors(t *testing.T) {
+	temps := TemperatureSet{
+		Available: true,
+		Sensors: []TemperatureMetric{
+			{Name: "AMD Ryzen 9 7950X CCD1 (Tdie)", Celsius: availableNumber(37, "C")},
+			{Name: "AMD Ryzen 9 7950X CCD2 (Tdie)", Celsius: availableNumber(36.75, "C")},
+			{Name: "AMD Ryzen 9 7950X CCDs Average (Tdie)", Celsius: availableNumber(36.88, "C")},
+			{Name: "AMD Ryzen 9 7950X CCDs Max (Tdie)", Celsius: availableNumber(37, "C")},
+			{Name: "AMD Ryzen 9 7950X Core (Tctl/Tdie)", Celsius: availableNumber(59.5, "C")},
+			{Name: "AMD Ryzen 9 7950X IOD Hotspot", Celsius: availableNumber(43.5, "C")},
+			{Name: "AMD Ryzen 9 7950X L3 (CCD1)", Celsius: availableNumber(32.75, "C")},
+			{Name: "AMD Ryzen 9 7950X Package", Celsius: availableNumber(43.34, "C")},
+			{Name: "ASUS ROG CROSSHAIR X670E HERO Nuvoton NCT6799D CPU", Celsius: availableNumber(52, "C")},
+		},
+	}
+	got := pickCPUTemperature(temps)
+	if !got.Available || got.Value != 59.5 {
+		t.Fatalf("pickCPUTemperature = %+v, want 59.5 C (Core (Tctl/Tdie))", got)
+	}
+}
+
+// The board super-IO sensor is named "... CPU" and can read hotter than the die.
+// It must never win, or the reported CPU temperature silently becomes a socket
+// reading on some boards and a die reading on others.
+func TestPickCPUTemperatureIgnoresHotterBoardSocketSensor(t *testing.T) {
+	temps := TemperatureSet{
+		Available: true,
+		Sensors: []TemperatureMetric{
+			{Name: "k10temp Tctl", Celsius: availableNumber(45, "C")},
+			{Name: "nct6799 CPU", Celsius: availableNumber(61, "C")},
+		},
+	}
+	got := pickCPUTemperature(temps)
+	if !got.Available || got.Value != 45 {
+		t.Fatalf("pickCPUTemperature = %+v, want 45 C (k10temp Tctl, not the board sensor)", got)
+	}
+}
+
+func TestPickCPUTemperaturePrefersIntelPackageOverPerCore(t *testing.T) {
+	temps := TemperatureSet{
+		Available: true,
+		Sensors: []TemperatureMetric{
+			{Name: "coretemp Core 0", Celsius: availableNumber(71, "C")},
+			{Name: "coretemp Core 3", Celsius: availableNumber(74, "C")},
+			{Name: "coretemp Package id 0", Celsius: availableNumber(70, "C")},
+		},
+	}
+	got := pickCPUTemperature(temps)
+	if !got.Available || got.Value != 70 {
+		t.Fatalf("pickCPUTemperature = %+v, want 70 C (Package id 0 outranks a hotter core)", got)
+	}
+}
+
+// A host exposing only narrower-than-die sensors must still report something
+// rather than degrade to unavailable -- the per-metric degradation invariant.
+func TestPickCPUTemperatureFallsBackWhenNoDieSensorExists(t *testing.T) {
+	temps := TemperatureSet{
+		Available: true,
+		Sensors: []TemperatureMetric{
+			{Name: "AMD Ryzen 9 7950X CCD1 (Tdie)", Celsius: availableNumber(37, "C")},
+			{Name: "AMD Ryzen 9 7950X CCD2 (Tdie)", Celsius: availableNumber(39, "C")},
+		},
+	}
+	got := pickCPUTemperature(temps)
+	if !got.Available || got.Value != 39 {
+		t.Fatalf("pickCPUTemperature = %+v, want 39 C (warmest CCD as last resort)", got)
+	}
+}
+
+// The canonical table must win over the ranking, and must report which sensor
+// it used. Tctl is cooler than CCD1 here, exactly as measured on BBLWIN under
+// load, so a temperature-driven pick would get this wrong.
+func TestPickCPUTemperatureSensorUsesCanonicalTable(t *testing.T) {
+	temps := TemperatureSet{
+		Available: true,
+		Sensors: []TemperatureMetric{
+			{Name: "AMD Ryzen 9 7950X CCD1 (Tdie)", Celsius: availableNumber(66, "C")},
+			{Name: "AMD Ryzen 9 7950X Core (Tctl/Tdie)", Celsius: availableNumber(62.38, "C")},
+			{Name: "AMD Ryzen 9 7950X Package", Celsius: availableNumber(50.2, "C")},
+			{Name: "ASUS ROG CROSSHAIR X670E HERO Nuvoton NCT6799D CPU", Celsius: availableNumber(55.5, "C")},
+		},
+	}
+	value, sensor := pickCPUTemperatureSensor(temps)
+	if !value.Available || value.Value != 62.38 {
+		t.Fatalf("value = %+v, want 62.38 C (canonical Core (Tctl/Tdie))", value)
+	}
+	if sensor != "AMD Ryzen 9 7950X Core (Tctl/Tdie)" {
+		t.Fatalf("sensor = %q, want the canonical AMD LHM sensor", sensor)
+	}
+}
+
+// The LHM name is model-prefixed, so the table matches by suffix. A different
+// AMD part must resolve without a table edit.
+func TestPickCPUTemperatureSensorMatchesAnyModelPrefix(t *testing.T) {
+	for _, name := range []string{
+		"AMD Ryzen 9 7950X Core (Tctl/Tdie)",
+		"AMD Ryzen 5 5600X Core (Tctl/Tdie)",
+		"AMD Ryzen Threadripper PRO 7995WX Core (Tctl/Tdie)",
+	} {
+		temps := TemperatureSet{Available: true, Sensors: []TemperatureMetric{
+			{Name: name, Celsius: availableNumber(51, "C")},
+			{Name: "some board CPU", Celsius: availableNumber(80, "C")},
+		}}
+		value, sensor := pickCPUTemperatureSensor(temps)
+		if !value.Available || value.Value != 51 || sensor != name {
+			t.Errorf("for %q: value = %+v sensor = %q, want 51 C from that sensor", name, value, sensor)
+		}
+	}
+}
+
+// Table order decides, not temperature: a host exposing both the AMD LHM sensor
+// and a hwmon k10temp must not have the choice flip when one runs hotter.
+func TestPickCPUTemperatureSensorTableOrderBeatsTemperature(t *testing.T) {
+	temps := TemperatureSet{
+		Available: true,
+		Sensors: []TemperatureMetric{
+			{Name: "k10temp Tctl", Celsius: availableNumber(70, "C")},
+			{Name: "AMD Ryzen 9 7950X Core (Tctl/Tdie)", Celsius: availableNumber(44, "C")},
+		},
+	}
+	_, sensor := pickCPUTemperatureSensor(temps)
+	if sensor != "AMD Ryzen 9 7950X Core (Tctl/Tdie)" {
+		t.Fatalf("sensor = %q, want the first table entry regardless of temperature", sensor)
+	}
+}
+
+func TestPickCPUTemperatureSensorFallsBackToRankOffTable(t *testing.T) {
+	temps := TemperatureSet{
+		Available: true,
+		Sensors: []TemperatureMetric{
+			{Name: "some-soc CPU", Celsius: availableNumber(58, "C")},
+			{Name: "some-soc CPU Package", Celsius: availableNumber(55, "C")},
+		},
+	}
+	value, sensor := pickCPUTemperatureSensor(temps)
+	// "some-soc CPU Package" ends with the canonical Intel LHM suffix, so the
+	// table claims it before the ranking runs.
+	if !value.Available || value.Value != 55 || sensor != "some-soc CPU Package" {
+		t.Fatalf("value = %+v sensor = %q, want the canonical package sensor", value, sensor)
+	}
+}
+
+func TestPickCPUTemperatureSensorReportsEmptyNameWhenUnresolved(t *testing.T) {
+	_, sensor := pickCPUTemperatureSensor(TemperatureSet{Available: false, Error: "no sensors"})
+	if sensor != "" {
+		t.Fatalf("sensor = %q, want empty when nothing was resolved", sensor)
+	}
+}
+
+// Guards the substring traps called out in cpuDieTemperatureRank: "socket"
+// contains "soc", "diode" contains "iod", and "junction" contains "nct".
+func TestCPUDieTemperatureRankSubstringTraps(t *testing.T) {
+	for _, name := range []string{"CPU Socket", "CPU Diode", "CPU Junction"} {
+		if got := cpuDieTemperatureRank(name); got == cpuTempRankNone {
+			t.Errorf("cpuDieTemperatureRank(%q) = none, want a real rank", name)
+		}
+	}
+	for _, name := range []string{
+		"AMD Ryzen 9 7950X CCD1 (Tdie)",
+		"AMD Ryzen 9 7950X L3 (CCD1)",
+		"AMD Ryzen 9 7950X IOD Hotspot",
+		"AMD Ryzen 9 7950X CCDs Average (Tdie)",
+		"ASUS ROG CROSSHAIR X670E HERO Nuvoton NCT6799D CPU",
+		"CPU VRM",
+	} {
+		if got := cpuDieTemperatureRank(name); got != cpuTempRankNone {
+			t.Errorf("cpuDieTemperatureRank(%q) = %d, want none", name, got)
+		}
 	}
 }
 

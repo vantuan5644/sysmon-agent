@@ -34,6 +34,18 @@ type systemCollector struct {
 	// Guarded by mu. See collectProcesses.
 	prevProc map[int]procSample
 
+	// clockPeak ratchets the observed CPU boost ceiling reported as
+	// cpu_clock_max. Shared, untagged implementation so the field means the same
+	// thing here as on Windows. Carries its own lock.
+	clockPeak cpuClockPeakTracker
+
+	// powerSmooth rolling-averages cpu_power. RAPL is already an integrated
+	// energy delta and needs no denoising, but smoothing only on Windows would
+	// make cpu_power a different statistic on each platform -- the defect this
+	// codebase has now hit three times. Shared, untagged so both stay symmetric.
+	// Carries its own lock.
+	powerSmooth cpuPowerSmoother
+
 	// hardwareOnce resolves the static identity strings (CPU model, RAM
 	// type/speed) exactly once -- they never change at runtime and RAM needs a
 	// dmidecode spawn -- so the slow lane reuses the cached values every pass.
@@ -112,9 +124,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	var wg sync.WaitGroup
 	var cpu NumberMetric
 	var cpuPower NumberMetric
-	var cpuClock NumberMetric
-	var cpuClockMax NumberMetric
-	var cpuClockBase NumberMetric
+	var cpuClocks cpuClockSet
 	var memory CapacityMetric
 	var swap CapacityMetric
 	var disks []DiskMetric
@@ -135,15 +145,10 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	}, func(recovered any) NumberMetric {
 		return unavailableNumber("W", fmt.Sprintf("Linux CPU power collector panicked: %v", recovered))
 	})
-	collectMetricAsync(&wg, &cpuClock, func() NumberMetric {
-		cur, mx, base := collectCPUClocks()
-		cpuClockMax = mx
-		cpuClockBase = base
-		return cur
-	}, func(recovered any) NumberMetric {
-		cpuClockMax = unavailableNumber("MHz", fmt.Sprintf("Linux CPU clock collector panicked: %v", recovered))
-		cpuClockBase = unavailableNumber("MHz", fmt.Sprintf("Linux CPU clock collector panicked: %v", recovered))
-		return unavailableNumber("MHz", fmt.Sprintf("Linux CPU clock collector panicked: %v", recovered))
+	collectMetricAsync(&wg, &cpuClocks, func() cpuClockSet {
+		return c.collectCPUClockSet()
+	}, func(recovered any) cpuClockSet {
+		return degradedCPUClockSet(fmt.Sprintf("Linux CPU clock collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &memory, func() CapacityMetric {
 		m, s := collectMemoryAndSwap()
@@ -190,14 +195,20 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	})
 	wg.Wait()
 
+	power := c.powerSmooth.observe(cpuPowerSample{
+		Package: cpuPower,
+		Core:    unavailableNumber("W", linuxNoPowerRailsMessage),
+		Soc:     unavailableNumber("W", linuxNoPowerRailsMessage),
+		Misc:    unavailableNumber("W", linuxNoPowerRailsMessage),
+		PSUOut:  unavailableNumber("W", "no PSU output power sensor exposed on Linux"),
+	})
+
 	metrics.CPU = cpu
 	metrics.CPUCores = c.collectCPUCores(ctx)
-	metrics.CPUPower = cpuPower
+	metrics.CPUPower = power.Package
 	unavailableCPUPowerRails(&metrics, linuxNoPowerRailsMessage)
-	metrics.CPUClock = cpuClock
-	metrics.CPUClockMax = cpuClockMax
-	metrics.CPUClockBase = cpuClockBase
-	metrics.CPUTemperature = pickCPUTemperature(temperatures)
+	cpuClocks.applyTo(&metrics)
+	metrics.CPUTemperature, metrics.CPUTemperatureSensor = pickCPUTemperatureSensor(temperatures)
 	metrics.PSUOutputPower = unavailableNumber("W", "no PSU output power sensor exposed on Linux")
 	metrics.Memory = memory
 	metrics.MemorySwap = swap
@@ -261,9 +272,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 
 	var wg sync.WaitGroup
 	var cpuPower NumberMetric
-	var cpuClock NumberMetric
-	var cpuClockMax NumberMetric
-	var cpuClockBase NumberMetric
+	var cpuClocks cpuClockSet
 	var disks []DiskMetric
 	var storage StorageSet
 	var network NetworkSet
@@ -277,15 +286,10 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	}, func(recovered any) NumberMetric {
 		return unavailableNumber("W", fmt.Sprintf("Linux CPU power collector panicked: %v", recovered))
 	})
-	collectMetricAsync(&wg, &cpuClock, func() NumberMetric {
-		cur, mx, base := collectCPUClocks()
-		cpuClockMax = mx
-		cpuClockBase = base
-		return cur
-	}, func(recovered any) NumberMetric {
-		cpuClockMax = unavailableNumber("MHz", fmt.Sprintf("Linux CPU clock collector panicked: %v", recovered))
-		cpuClockBase = unavailableNumber("MHz", fmt.Sprintf("Linux CPU clock collector panicked: %v", recovered))
-		return unavailableNumber("MHz", fmt.Sprintf("Linux CPU clock collector panicked: %v", recovered))
+	collectMetricAsync(&wg, &cpuClocks, func() cpuClockSet {
+		return c.collectCPUClockSet()
+	}, func(recovered any) cpuClockSet {
+		return degradedCPUClockSet(fmt.Sprintf("Linux CPU clock collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &disks, func() []DiskMetric {
 		return collectDisks()
@@ -324,17 +328,23 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	})
 	wg.Wait()
 
-	cpuTemperature := pickCPUTemperature(temperatures)
+	cpuTemperature, cpuTemperatureSensor := pickCPUTemperatureSensor(temperatures)
+	power := c.powerSmooth.observe(cpuPowerSample{
+		Package: cpuPower,
+		Core:    unavailableNumber("W", linuxNoPowerRailsMessage),
+		Soc:     unavailableNumber("W", linuxNoPowerRailsMessage),
+		Misc:    unavailableNumber("W", linuxNoPowerRailsMessage),
+		PSUOut:  unavailableNumber("W", "no PSU output power sensor exposed on Linux"),
+	})
 	return func(m *Metrics) {
 		m.Platform = platform
 		m.CPUName = cpuName
 		m.MemoryName = memoryName
-		m.CPUPower = cpuPower
+		m.CPUPower = power.Package
 		unavailableCPUPowerRails(m, linuxNoPowerRailsMessage)
-		m.CPUClock = cpuClock
-		m.CPUClockMax = cpuClockMax
-		m.CPUClockBase = cpuClockBase
+		cpuClocks.applyTo(m)
 		m.CPUTemperature = cpuTemperature
+		m.CPUTemperatureSensor = cpuTemperatureSensor
 		m.PSUOutputPower = unavailableNumber("W", "no PSU output power sensor exposed on Linux")
 		m.Disks = disks
 		m.Storage = storage
@@ -360,10 +370,9 @@ func linuxDegradedSlowPatch(message string) func(*Metrics) {
 	return func(m *Metrics) {
 		m.CPUPower = unavailableNumber("W", message)
 		unavailableCPUPowerRails(m, message)
-		m.CPUClock = unavailableNumber("MHz", message)
-		m.CPUClockMax = unavailableNumber("MHz", message)
-		m.CPUClockBase = unavailableNumber("MHz", message)
+		degradedCPUClockSet(message).applyTo(m)
 		m.CPUTemperature = unavailableNumber("C", message)
+		m.CPUTemperatureSensor = ""
 		m.PSUOutputPower = unavailableNumber("W", message)
 		m.Disks = unavailableDisk(message)
 		m.Storage = unavailableStorage(message)
@@ -680,32 +689,58 @@ func readCPUTimes() (cpuTimes, error) {
 // megahertz. It prefers the cpufreq sysfs interface (scaling_cur_freq, in kHz)
 // because it reflects live frequency, and falls back to the "cpu MHz" lines in
 // /proc/cpuinfo on kernels that do not expose cpufreq (some VMs/servers).
-// collectCPUClocks reports the average current CPU clock, the advertised
-// maximum (boost) clock, and the rated base clock so the dashboard can render a
-// clock ring scaled from base to peak. Current prefers cpufreq scaling_cur_freq
-// (averaged across cores) with a /proc/cpuinfo fallback; max prefers
-// cpuinfo_max_freq (real boost) and falls back to scaling_max_freq; base reads
-// the Intel-only base_frequency node (AMD does not expose it, so base degrades
-// to unavailable there).
-func collectCPUClocks() (current, max, base NumberMetric) {
-	if mhz, ok := readCPUFreqClock(); ok {
-		current = availableNumber(mhz, "MHz")
-	} else if mhz, ok := readProcCPUInfoClock(); ok {
-		current = availableNumber(mhz, "MHz")
+// collectCPUClocks reports the live cross-core average clock, the live clock of
+// the fastest single core, the firmware-declared ceiling, and the rated base
+// clock. See the Metrics clock-field comment for what each one means; the short
+// version is that the average and the per-core peak differ by ~1 GHz on a
+// many-core part, and the declared ceiling is not an achievable clock on
+// amd-pstate.
+//
+// Current and peak come from one pass over the cpufreq scaling_cur_freq nodes
+// (with a /proc/cpuinfo fallback for kernels that expose no cpufreq); rated
+// prefers cpuinfo_max_freq and falls back to scaling_max_freq; base prefers the
+// Intel-only base_frequency node and falls back to the CPPC nominal frequency,
+// which is what AMD parts expose instead.
+// collectCPUClockSet reads the clocks and folds the per-core peak into this
+// collector's peak-hold ceiling, producing the full set the sampler publishes.
+func (c *systemCollector) collectCPUClockSet() cpuClockSet {
+	current, peakCore, rated, base := collectCPUClocks()
+	baseMHz, baseOK := 0.0, false
+	if base.Available {
+		baseMHz, baseOK = base.Value, true
+	}
+	return cpuClockSet{
+		Current:  current,
+		PeakCore: peakCore,
+		Max:      c.clockPeak.observe(peakCore, current, baseMHz, baseOK),
+		Rated:    rated,
+		Base:     base,
+	}
+}
+
+func collectCPUClocks() (current, peakCore, rated, base NumberMetric) {
+	avgMHz, peakMHz, ok := readCPUFreqClocks()
+	if !ok {
+		avgMHz, peakMHz, ok = readProcCPUInfoClocks()
+	}
+	if ok {
+		current = availableNumber(avgMHz, "MHz")
+		peakCore = availableNumber(peakMHz, "MHz")
 	} else {
 		current = unavailableNumber("MHz", "CPU clock frequency not exposed")
+		peakCore = unavailableNumber("MHz", "per-core CPU clock frequency not exposed")
 	}
 	if mhz, ok := readCPUFreqMaxClock(); ok {
-		max = availableNumber(mhz, "MHz")
+		rated = availableNumber(mhz, "MHz")
 	} else {
-		max = unavailableNumber("MHz", "CPU max clock frequency not exposed")
+		rated = unavailableNumber("MHz", "CPU rated max clock frequency not exposed")
 	}
 	if mhz, ok := readCPUFreqBaseClock(); ok {
 		base = availableNumber(mhz, "MHz")
 	} else {
 		base = unavailableNumber("MHz", "CPU base clock frequency not exposed")
 	}
-	return current, max, base
+	return current, peakCore, rated, base
 }
 
 func readCPUFreqMaxClock() (float64, bool) {
@@ -718,11 +753,29 @@ func readCPUFreqMaxClock() (float64, bool) {
 	return 0, false
 }
 
-// readCPUFreqBaseClock reads the rated base (non-turbo) frequency from the
-// Intel-only base_frequency cpufreq node. AMD and most VMs do not expose it, so
-// this returns false there and base clock degrades to unavailable.
+// readCPUFreqBaseClock reads the rated base (non-turbo) frequency. cpufreq's
+// base_frequency node is Intel-only, so AMD parts fall back to the ACPI CPPC
+// nominal frequency, which is the same figure: on a 7950X acpi_cppc/nominal_freq
+// reads 4501, matching the rated 4.5 GHz base. Without this fallback base clock
+// was permanently unavailable on AMD, which cost the dashboard ring its lower
+// bound and the peak-hold tracker its seed.
 func readCPUFreqBaseClock() (float64, bool) {
-	return readCPUFreqValue("base_frequency")
+	if mhz, ok := readCPUFreqValue("base_frequency"); ok {
+		return mhz, true
+	}
+	return readCPPCNominalFreq()
+}
+
+// readCPPCNominalFreq reads the CPPC nominal (base) frequency. Note the unit:
+// unlike every cpufreq node, which reports kHz, the acpi_cppc nodes report MHz
+// already -- so this deliberately does not reuse readCPUFreqValue, which divides
+// by 1000.
+func readCPPCNominalFreq() (float64, bool) {
+	mhz, ok := readUint64File("/sys/devices/system/cpu/cpu0/acpi_cppc/nominal_freq")
+	if !ok || mhz == 0 {
+		return 0, false
+	}
+	return float64(mhz), true
 }
 
 // readCPUFreqValue reads a single per-package cpufreq value (kHz -> MHz) from
@@ -736,11 +789,26 @@ func readCPUFreqValue(name string) (float64, bool) {
 	return float64(kHz) / 1000.0, true
 }
 
-func readCPUFreqClock() (float64, bool) {
+// readCPUFreqClocks returns the mean and the maximum live core clock in MHz from
+// one pass over every CPU's cpufreq scaling_cur_freq node. Both come from the
+// same pass so the pair is always self-consistent (peak >= mean) rather than
+// straddling two samples taken microseconds apart.
+//
+// SMT siblings each expose their own node reporting the same physical core's
+// frequency. That double-counts hyperthreaded cores in the mean, which is
+// harmless (every core is counted the same number of times, so the mean is
+// unchanged) and irrelevant to the max.
+//
+// This lives on the SLOW sampler lane on purpose. On amd-pstate each read is
+// serviced by an IPI to the target CPU to sample APERF/MPERF, so polling 32
+// nodes at the fast-lane rate would wake every idle core five times a second --
+// the monitor would measurably degrade the deep C-state residency that keeps the
+// host cool, i.e. it would change the thing it is trying to measure.
+func readCPUFreqClocks() (mean, peak float64, ok bool) {
 	pattern := "/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq"
 	paths, err := filepath.Glob(pattern)
 	if err != nil || len(paths) == 0 {
-		return 0, false
+		return 0, 0, false
 	}
 	var total float64
 	count := 0
@@ -749,46 +817,66 @@ func readCPUFreqClock() (float64, bool) {
 		if !ok {
 			continue
 		}
-		total += float64(kHz) / 1000.0
+		mhz := float64(kHz) / 1000.0
+		total += mhz
+		if mhz > peak {
+			peak = mhz
+		}
 		count++
 	}
 	if count == 0 {
-		return 0, false
+		return 0, 0, false
 	}
-	return total / float64(count), true
+	return total / float64(count), peak, true
 }
 
-func readProcCPUInfoClock() (float64, bool) {
+func readProcCPUInfoClocks() (mean, peak float64, ok bool) {
 	data, err := os.ReadFile("/proc/cpuinfo")
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
-	return parseProcCPUInfoClock(string(data))
+	return parseProcCPUInfoClocks(string(data))
 }
 
-func parseProcCPUInfoClock(data string) (float64, bool) {
-	var total float64
-	count := 0
-	for _, line := range strings.Split(data, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "cpu MHz") && !strings.HasPrefix(trimmed, "BogoMIPS") {
-			continue
+// parseProcCPUInfoClocks averages and peaks the per-CPU clock lines in
+// /proc/cpuinfo, the fallback for kernels that expose no cpufreq interface (some
+// VMs and servers).
+//
+// x86 reports "cpu MHz" per CPU; ARM reports no such line and "BogoMIPS" is the
+// nearest usable stand-in. The two are read as alternatives, never mixed: an x86
+// /proc/cpuinfo carries a lowercase "bogomips" line too, and averaging a real
+// frequency together with a BogoMIPS figure (~2x the clock on x86) would inflate
+// both the mean and, far worse, the peak -- which then ratchets the peak-hold
+// ceiling somewhere it can never come back down from.
+func parseProcCPUInfoClocks(data string) (mean, peak float64, ok bool) {
+	for _, prefix := range []string{"cpu MHz", "BogoMIPS"} {
+		var total float64
+		var high float64
+		count := 0
+		for _, line := range strings.Split(data, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if !strings.HasPrefix(trimmed, prefix) {
+				continue
+			}
+			parts := strings.SplitN(trimmed, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			value, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+			if err != nil || !isFinite(value) || value <= 0 {
+				continue
+			}
+			total += value
+			if value > high {
+				high = value
+			}
+			count++
 		}
-		parts := strings.SplitN(trimmed, ":", 2)
-		if len(parts) != 2 {
-			continue
+		if count > 0 {
+			return total / float64(count), high, true
 		}
-		value, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-		if err != nil || !isFinite(value) || value <= 0 {
-			continue
-		}
-		total += value
-		count++
 	}
-	if count == 0 {
-		return 0, false
-	}
-	return total / float64(count), true
+	return 0, 0, false
 }
 
 func parseCPUTimes(data string) (cpuTimes, error) {

@@ -506,19 +506,50 @@ func TestReadRAPLCountersPermissionDeniedSurfacesUdevHint(t *testing.T) {
 
 func TestReadProcCPUInfoClockAveragesMHz(t *testing.T) {
 	data := "processor : 0\nvendor_id : AuthenticAMD\ncpu MHz : 3600.000\n\ncpu MHz : 4500.500\n"
-	mhz, ok := parseProcCPUInfoClock(data)
+	mhz, peak, ok := parseProcCPUInfoClocks(data)
 	if !ok {
-		t.Fatal("parseProcCPUInfoClock returned ok=false on valid data")
+		t.Fatal("parseProcCPUInfoClocks returned ok=false on valid data")
 	}
 	// (3600 + 4500.5) / 2 = 4050.25
 	if mhz < 4050.2 || mhz > 4050.3 {
 		t.Fatalf("cpu MHz = %v, want ~4050.25", mhz)
 	}
+	if peak != 4500.5 {
+		t.Fatalf("peak MHz = %v, want 4500.5 (the fastest core, not the average)", peak)
+	}
 }
 
 func TestReadProcCPUInfoClockRejectsGarbage(t *testing.T) {
-	if _, ok := parseProcCPUInfoClock("processor : 0\nflags : fpu\n"); ok {
-		t.Fatal("parseProcCPUInfoClock should fail when no cpu MHz line is present")
+	if _, _, ok := parseProcCPUInfoClocks("processor : 0\nflags : fpu\n"); ok {
+		t.Fatal("parseProcCPUInfoClocks should fail when no cpu MHz line is present")
+	}
+}
+
+// An x86 /proc/cpuinfo carries a lowercase "bogomips" line alongside "cpu MHz",
+// and BogoMIPS runs at roughly twice the clock there. Mixing the two would
+// inflate the mean and -- far worse -- ratchet the peak-hold ceiling to a
+// frequency the part can never reach, permanently, since the ceiling never
+// falls. "cpu MHz" must win outright when present.
+func TestReadProcCPUInfoClockPrefersCPUMHzOverBogoMIPS(t *testing.T) {
+	data := "processor : 0\ncpu MHz : 3600.000\nBogoMIPS : 9000.61\n"
+	mean, peak, ok := parseProcCPUInfoClocks(data)
+	if !ok {
+		t.Fatal("parseProcCPUInfoClocks returned ok=false on valid data")
+	}
+	if mean != 3600 || peak != 3600 {
+		t.Fatalf("mean/peak = %v/%v, want 3600/3600 (BogoMIPS must not contribute)", mean, peak)
+	}
+}
+
+// ARM exposes no "cpu MHz" line at all, so BogoMIPS remains the fallback there.
+func TestReadProcCPUInfoClockFallsBackToBogoMIPS(t *testing.T) {
+	data := "processor : 0\nBogoMIPS : 2000.00\n\nprocessor : 1\nBogoMIPS : 2400.00\n"
+	mean, peak, ok := parseProcCPUInfoClocks(data)
+	if !ok {
+		t.Fatal("parseProcCPUInfoClocks should fall back to BogoMIPS when no cpu MHz line exists")
+	}
+	if mean != 2200 || peak != 2400 {
+		t.Fatalf("mean/peak = %v/%v, want 2200/2400", mean, peak)
 	}
 }
 

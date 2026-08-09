@@ -80,7 +80,7 @@ function New-LhmComputer([bool]$EnablePsu) {
 }
 
 function New-ErrorObject([string]$message) {
-    return @{ available = $false; error = $message; power = $null; cpu_clock = $null; psu_output_power = $null; temperatures = @() }
+    return @{ available = $false; error = $message; power = $null; cpu_clock = $null; cpu_clock_peak_core = $null; psu_output_power = $null; temperatures = @() }
 }
 
 # Some LibreHardwareMonitor temperature sensors expose static configuration
@@ -195,6 +195,7 @@ function Read-LhmSnapshot($computer) {
     $cpuSocPower = $null
     $cpuMiscPower = $null
     $cpuClock = $null
+    $cpuClockPeakCore = $null
     $psuOutputPower = $null
     $temperatures = New-Object System.Collections.Generic.List[object]
 
@@ -220,27 +221,37 @@ function Read-LhmSnapshot($computer) {
                 $cpuMiscPower = Select-PowerSensor $sensors 'Misc Power'
             }
         }
-        # Live CPU clock: the average per-core clock in MHz. LHM reads the
-        # per-core MSRs on each Update(), so unlike Win32_Processor's static
-        # CurrentClockSpeed this tracks real load. Prefer LHM's own 'Cores
-        # (Average)' aggregate; otherwise average the individual 'Core #N'
-        # clocks. Per-domain ('Bus Speed', 'Fabric', 'Memory', 'Uncore') and
-        # '(Effective)' sensors are excluded - effective clocks collapse toward
-        # 0 in idle C-states and would read as a misleading sub-GHz value.
+        # Live CPU clock, emitted as TWO figures in MHz (selection rules kept
+        # line-for-line identical to lhm-bridge.ps1 -- see the longer rationale
+        # there): cpu_clock is the cross-core average, which is what the dashboard
+        # shows live; cpu_clock_peak_core is the fastest single core in the same
+        # sample, which pins near the boost ceiling by design and is what the
+        # agent ratchets its observed-ceiling peak-hold with. LHM reads the
+        # per-core MSRs on each Update(), so both track real load. For the
+        # average, prefer LHM's own 'Cores (Average)' aggregate; otherwise average
+        # the individual 'Core #N' clocks. Per-domain ('Bus Speed', 'Fabric',
+        # 'Memory', 'Uncore') and '(Effective)' sensors are excluded - effective
+        # clocks collapse toward 0 in idle C-states and would read as a misleading
+        # sub-GHz value.
         if ($null -eq $cpuClock -and (Test-CpuNode $hw)) {
             $clockSensors = @($sensors | Where-Object { $_.SensorType -eq 'Clock' -and $_.Value -ne $null })
+            # Individual 'Core #N' clocks, gathered unconditionally -- the per-core
+            # peak is the maximum of these and cannot be recovered from the
+            # 'Cores (Average)' aggregate, so this runs even when that aggregate
+            # exists and supplies the average.
+            $coreClocks = @($clockSensors | Where-Object {
+                $_.Name -match 'Core' -and $_.Name -notmatch 'Effective' -and $_.Name -notmatch 'Average'
+            } | ForEach-Object { [double]$_.Value } | Where-Object { $_ -gt 0 })
             $avg = $clockSensors | Where-Object {
                 $_.Name -match 'Average' -and $_.Name -notmatch 'Effective' -and $_.Name -match 'Core'
             } | Select-Object -First 1
             if ($avg) {
                 $cpuClock = [double]$avg.Value
-            } else {
-                $coreClocks = @($clockSensors | Where-Object {
-                    $_.Name -match 'Core' -and $_.Name -notmatch 'Effective' -and $_.Name -notmatch 'Average'
-                } | ForEach-Object { [double]$_.Value } | Where-Object { $_ -gt 0 })
-                if ($coreClocks.Count -gt 0) {
-                    $cpuClock = ($coreClocks | Measure-Object -Average).Average
-                }
+            } elseif ($coreClocks.Count -gt 0) {
+                $cpuClock = ($coreClocks | Measure-Object -Average).Average
+            }
+            if ($coreClocks.Count -gt 0) {
+                $cpuClockPeakCore = ($coreClocks | Measure-Object -Maximum).Maximum
             }
         }
         # PSU total output power: only hardware LHM classifies as a PSU
@@ -281,6 +292,7 @@ function Read-LhmSnapshot($computer) {
         cpu_soc_power    = if ($null -ne $cpuSocPower) { @{ available = $true; value = [math]::Round($cpuSocPower, 2) } } else { $null }
         cpu_misc_power   = if ($null -ne $cpuMiscPower) { @{ available = $true; value = [math]::Round($cpuMiscPower, 2) } } else { $null }
         cpu_clock        = if ($null -ne $cpuClock -and $cpuClock -gt 0) { @{ available = $true; value = [math]::Round($cpuClock, 0) } } else { $null }
+        cpu_clock_peak_core = if ($null -ne $cpuClockPeakCore -and $cpuClockPeakCore -gt 0) { @{ available = $true; value = [math]::Round($cpuClockPeakCore, 0) } } else { $null }
         psu_output_power = if ($null -ne $psuOutputPower) { @{ available = $true; value = [math]::Round($psuOutputPower, 2) } } else { $null }
         temperatures     = $temperatures
     }

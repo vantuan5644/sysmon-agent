@@ -15,9 +15,16 @@ import (
 	"time"
 )
 
-// goodBridgeJSON is a representative LHM daemon response exercising all four
-// payload fields (CPU package power, CPU clock, PSU output power, temperatures).
-const goodBridgeJSON = `{"available":true,"power":{"available":true,"value":88.08},"cpu_clock":{"available":true,"value":4500},"psu_output_power":{"available":true,"value":312.4},"temperatures":[{"name":"CPU Package","value":55.5}]}`
+// goodBridgeJSON is a representative LHM daemon response exercising every
+// payload field (CPU package power, the mean and per-core-peak CPU clocks, PSU
+// output power, temperatures).
+//
+// This fixture is the only place the wire contract between lhm-bridge-daemon.ps1
+// and the Go struct tags is pinned side by side. A key typo between the two
+// would fail no build and no other test -- it would just degrade that field to
+// available:false forever on the real host, which per-field graceful degradation
+// makes invisible. Keep every key the daemon emits represented here.
+const goodBridgeJSON = `{"available":true,"power":{"available":true,"value":88.08},"cpu_clock":{"available":true,"value":4500},"cpu_clock_peak_core":{"available":true,"value":5504},"psu_output_power":{"available":true,"value":312.4},"temperatures":[{"name":"CPU Package","value":55.5}]}`
 
 // fakeAction controls what a fake daemon instance does for a given request.
 type fakeAction int
@@ -195,6 +202,12 @@ func TestLhmDaemonHappyPath(t *testing.T) {
 	}
 	if result.CPUClock == nil || result.CPUClock.Value != 4500 {
 		t.Fatalf("cpu_clock = %+v, want 4500 MHz", result.CPUClock)
+	}
+	// The per-core peak must survive the round trip as its own field. It is what
+	// the agent ratchets cpu_clock_max with, so a parse failure here silently
+	// caps the reported boost ceiling at the cross-core average.
+	if result.CPUClockPeakCore == nil || result.CPUClockPeakCore.Value != 5504 {
+		t.Fatalf("cpu_clock_peak_core = %+v, want 5504 MHz", result.CPUClockPeakCore)
 	}
 	if result.PSUOutputPower == nil || result.PSUOutputPower.Value != 312.4 {
 		t.Fatalf("psu_output_power = %+v, want 312.4 W", result.PSUOutputPower)
