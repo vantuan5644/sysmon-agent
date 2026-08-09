@@ -39,13 +39,6 @@ type systemCollector struct {
 	// thing here as on Windows. Carries its own lock.
 	clockPeak cpuClockPeakTracker
 
-	// powerSmooth rolling-averages cpu_power. RAPL is already an integrated
-	// energy delta and needs no denoising, but smoothing only on Windows would
-	// make cpu_power a different statistic on each platform -- the defect this
-	// codebase has now hit three times. Shared, untagged so both stay symmetric.
-	// Carries its own lock.
-	powerSmooth cpuPowerSmoother
-
 	// hardwareOnce resolves the static identity strings (CPU model, RAM
 	// type/speed) exactly once -- they never change at runtime and RAM needs a
 	// dmidecode spawn -- so the slow lane reuses the cached values every pass.
@@ -195,17 +188,9 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	})
 	wg.Wait()
 
-	power := c.powerSmooth.observe(cpuPowerSample{
-		Package: cpuPower,
-		Core:    unavailableNumber("W", linuxNoPowerRailsMessage),
-		Soc:     unavailableNumber("W", linuxNoPowerRailsMessage),
-		Misc:    unavailableNumber("W", linuxNoPowerRailsMessage),
-		PSUOut:  unavailableNumber("W", "no PSU output power sensor exposed on Linux"),
-	})
-
 	metrics.CPU = cpu
 	metrics.CPUCores = c.collectCPUCores(ctx)
-	metrics.CPUPower = power.Package
+	metrics.CPUPower = cpuPower
 	unavailableCPUPowerRails(&metrics, linuxNoPowerRailsMessage)
 	cpuClocks.applyTo(&metrics)
 	metrics.CPUTemperature, metrics.CPUTemperatureSensor = pickCPUTemperatureSensor(temperatures)
@@ -329,18 +314,11 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	wg.Wait()
 
 	cpuTemperature, cpuTemperatureSensor := pickCPUTemperatureSensor(temperatures)
-	power := c.powerSmooth.observe(cpuPowerSample{
-		Package: cpuPower,
-		Core:    unavailableNumber("W", linuxNoPowerRailsMessage),
-		Soc:     unavailableNumber("W", linuxNoPowerRailsMessage),
-		Misc:    unavailableNumber("W", linuxNoPowerRailsMessage),
-		PSUOut:  unavailableNumber("W", "no PSU output power sensor exposed on Linux"),
-	})
 	return func(m *Metrics) {
 		m.Platform = platform
 		m.CPUName = cpuName
 		m.MemoryName = memoryName
-		m.CPUPower = power.Package
+		m.CPUPower = cpuPower
 		unavailableCPUPowerRails(m, linuxNoPowerRailsMessage)
 		cpuClocks.applyTo(m)
 		m.CPUTemperature = cpuTemperature

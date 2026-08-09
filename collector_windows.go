@@ -93,12 +93,6 @@ type systemCollector struct {
 	// implementation so the field means the same thing here as on Linux. Carries
 	// its own lock (NOT mu).
 	clockPeak cpuClockPeakTracker
-	// powerSmooth rolling-averages the CPU power rails and caps each rail at the
-	// package, because the AMD SMU does not update PPT and the per-rail sensors
-	// on a common cadence and the bridge reads whatever each register holds.
-	// Shared, untagged implementation so cpu_power is the same statistic on both
-	// platforms. Carries its own lock (NOT mu).
-	powerSmooth cpuPowerSmoother
 }
 
 type netCounter struct {
@@ -268,23 +262,15 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	})
 	wg.Wait()
 
-	power := c.powerSmooth.observe(cpuPowerSample{
-		Package: cpuPower,
-		Core:    cpuCorePower,
-		Soc:     cpuSocPower,
-		Misc:    cpuMiscPower,
-		PSUOut:  psuOutputPower,
-	})
-
 	metrics.CPU = cpu
 	metrics.CPUCores = c.windowsCPUCores(ctx)
-	metrics.CPUPower = power.Package
-	metrics.CPUCorePower = power.Core
-	metrics.CPUSocPower = power.Soc
-	metrics.CPUMiscPower = power.Misc
+	metrics.CPUPower = cpuPower
+	metrics.CPUCorePower = cpuCorePower
+	metrics.CPUSocPower = cpuSocPower
+	metrics.CPUMiscPower = cpuMiscPower
 	cpuClocks.applyTo(&metrics)
 	metrics.CPUTemperature, metrics.CPUTemperatureSensor = pickCPUTemperatureSensor(temperatures)
-	metrics.PSUOutputPower = power.PSUOut
+	metrics.PSUOutputPower = psuOutputPower
 	metrics.Memory = memory
 	metrics.MemorySwap = swap
 	metrics.Disks = disks

@@ -321,25 +321,18 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	wg.Wait()
 
 	cpuTemperature, cpuTemperatureSensor := pickCPUTemperatureSensor(temperatures)
-	power := c.powerSmooth.observe(cpuPowerSample{
-		Package: cpuPower,
-		Core:    cpuCorePower,
-		Soc:     cpuSocPower,
-		Misc:    cpuMiscPower,
-		PSUOut:  psuOutputPower,
-	})
 	return func(m *Metrics) {
 		m.Platform = platform
 		m.CPUName = cpuName
 		m.MemoryName = memoryName
-		m.CPUPower = power.Package
-		m.CPUCorePower = power.Core
-		m.CPUSocPower = power.Soc
-		m.CPUMiscPower = power.Misc
+		m.CPUPower = cpuPower
+		m.CPUCorePower = cpuCorePower
+		m.CPUSocPower = cpuSocPower
+		m.CPUMiscPower = cpuMiscPower
 		cpuClocks.applyTo(m)
 		m.CPUTemperature = cpuTemperature
 		m.CPUTemperatureSensor = cpuTemperatureSensor
-		m.PSUOutputPower = power.PSUOut
+		m.PSUOutputPower = psuOutputPower
 		m.MemorySwap = swap
 		m.Disks = disks
 		m.Storage = storage
