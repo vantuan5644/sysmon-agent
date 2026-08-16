@@ -80,12 +80,21 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming unsupported"})
 				return
 			}
-			// This is a long-lived response, so clear the server's WriteTimeout for
-			// this connection; otherwise the stream would be torn down every few
-			// seconds. Connection-level deadline reset via the response controller.
-			if rc := http.NewResponseController(w); rc != nil {
-				_ = rc.SetWriteDeadline(time.Time{})
+			// This is a long-lived response, so the server's blanket WriteTimeout
+			// must not apply -- it would tear the stream down every few seconds.
+			// Each write still gets its own bounded deadline rather than no
+			// deadline at all: a peer that vanishes without a FIN/RST (host asleep,
+			// WiFi roam) otherwise blocks this goroutine in Write forever, which
+			// leaks the subscriber and keeps the sampler's expensive slow lane
+			// awake for a client that is never coming back.
+			rc := http.NewResponseController(w)
+			armWriteDeadline := func() {
+				if rc == nil {
+					return
+				}
+				_ = rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
 			}
+			armWriteDeadline()
 
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-store")
@@ -107,11 +116,13 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 					if !ok {
 						return
 					}
+					armWriteDeadline()
 					if err := writeSSE(w, data); err != nil {
 						return
 					}
 					flusher.Flush()
 				case <-keepalive.C:
+					armWriteDeadline()
 					if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
 						return
 					}
@@ -302,6 +313,13 @@ const metricsCollectTimeout = 8 * time.Second
 // dropping the connection and lets the server notice a dead client via the
 // write error during quiet periods.
 const streamKeepaliveInterval = 15 * time.Second
+
+// streamWriteTimeout bounds one SSE write. The stream as a whole is unbounded
+// (the connection-wide WriteTimeout is replaced per write, not extended once),
+// but a single frame is a few KB and must still land inside this window. It is
+// what lets the handler notice a peer that disappeared silently, return, and
+// release its sampler subscription.
+const streamWriteTimeout = 10 * time.Second
 
 // writeSSE writes one Server-Sent Events "data:" frame. The payload is a single
 // line of compact JSON (json.Marshal escapes any newlines inside strings), so a

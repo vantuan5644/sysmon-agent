@@ -502,7 +502,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v124",
+    dashboard_build: "sysmon-static-v125",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -520,7 +520,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v124",
+    dashboard_build: "sysmon-static-v125",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -916,7 +916,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v124, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v125, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -964,7 +964,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v124; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v125; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -974,7 +974,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v124",
+    dashboard_build: "sysmon-static-v125",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -984,7 +984,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v124",
+    dashboard_build: "sysmon-static-v125",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1106,7 +1106,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v124", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v125", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -2070,5 +2070,98 @@ await flushMicrotasks();
 assert(document.getElementById("updatePanel").classList.contains("update-applying") === true, "applying banner did not flip to update-applying");
 assert(/will reload automatically/.test(document.getElementById("updateText").textContent), "applying banner text missing reload hint");
 context.fetch = updateFetch;
+
+// --- Stream liveness watchdog ---------------------------------------------
+// Regression: an agent restart, a host reboot, a sleep/resume or a WiFi roam can
+// leave the EventSource in a zombie OPEN state -- the socket is dead but the
+// browser never fires `error`, so handleStreamError never runs. The dashboard
+// used to sit frozen on its last frame until someone tapped the status strip
+// (which refetches). The 5 s liveness tick must rebuild a stream that has gone
+// silent, and give up on streaming altogether if rebuilding does not help.
+const streamSources = [];
+class FakeEventSource {
+  constructor(url) {
+    this.url = url;
+    this.readyState = 1;
+    this.closed = false;
+    streamSources.push(this);
+  }
+
+  close() {
+    this.closed = true;
+    this.readyState = 2;
+  }
+}
+context.EventSource = FakeEventSource;
+document.visibilityState = "visible";
+fakeNow = 500000;
+// The timeout scenarios above leave context.fetch as a never-resolving stub
+// that counts nothing, so this scenario installs its own responder.
+context.fetch = async (path, options = {}) => {
+  if (path === "/api/metrics") {
+    metricsRequests += 1;
+    return response(sampleMetrics());
+  }
+  if (path === "/api/status") {
+    return response(sampleStatus());
+  }
+  if (path === "/api/client-check" && options.method === "POST") {
+    clientCheckRequests += 1;
+    return response({ seen: true });
+  }
+  return response(settings);
+};
+context.schedulePolling();
+assert(streamSources.length === 1, "schedulePolling did not open a stream once EventSource was available");
+assert(streamSources[0].url === "/api/stream", `stream opened the wrong url: ${streamSources[0].url}`);
+
+streamSources[0].onmessage({ data: JSON.stringify(sampleMetrics()) });
+assert(document.getElementById("statusText").textContent === "Live", "stream message did not put the dashboard live");
+assert(document.getElementById("hostname").textContent === "labbox", "stream message did not render metrics");
+
+// A connection that is merely quiet, right up to the limit, is left alone.
+fakeNow += 15000;
+context.checkDashboardLiveness();
+await flushMicrotasks();
+assert(streamSources.length === 1, "watchdog rebuilt a stream that was still inside the silence window");
+assert(streamSources[0].closed === false, "watchdog closed a stream that was still inside the silence window");
+
+// One millisecond past the limit: the zombie is torn down and replaced, and the
+// refetch repaints immediately instead of waiting on the new source.
+const metricsBeforeRevive = metricsRequests;
+fakeNow += 1;
+context.checkDashboardLiveness();
+await flushMicrotasks();
+assert(streamSources[0].closed === true, "watchdog did not close the silent stream");
+assert(streamSources.length === 2, "watchdog did not reopen the stream after silence");
+assert(metricsRequests === metricsBeforeRevive + 1, "watchdog did not refetch metrics while rebuilding the stream");
+assert(document.getElementById("statusText").textContent === "Live", "watchdog rebuild left the dashboard off-live");
+
+// A delivered message resets the reconnect budget, so a stream that recovers is
+// never demoted for failures it already recovered from.
+streamSources[1].onmessage({ data: JSON.stringify(sampleMetrics()) });
+fakeNow += 15001;
+context.checkDashboardLiveness();
+await flushMicrotasks();
+assert(streamSources.length === 3, "second silent window did not rebuild the stream again");
+
+// Strikes two and three with no message in between: reconnecting is not working
+// on this path at all, so streaming is abandoned for the session and the metrics
+// poll takes over.
+fakeNow += 15001;
+context.checkDashboardLiveness();
+await flushMicrotasks();
+assert(streamSources.length === 4, "third silent window did not rebuild the stream");
+const timersBeforeDemotion = context.totalIntervalCount();
+fakeNow += 15001;
+context.checkDashboardLiveness();
+await flushMicrotasks();
+assert(streamSources.length === 4, "watchdog kept reopening the stream past the failure limit");
+assert(streamSources[3].closed === true, "watchdog did not close the stream when demoting to polling");
+assert(
+  context.totalIntervalCount() === timersBeforeDemotion + 1,
+  "demoting to polling did not start the metrics poll timer",
+);
+delete context.EventSource;
 
 console.log("ok: dashboard runtime smoke test passed");

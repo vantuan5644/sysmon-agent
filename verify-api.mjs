@@ -7,7 +7,7 @@ const settingsRoundTrip = args.includes("--settings-roundtrip");
 const clientCheckRoundTrip = args.includes("--client-check-roundtrip");
 const baseURL = normalizeBaseURL(args.find((arg) => !arg.startsWith("--")) || defaultBaseURL);
 const timeoutMS = 5000;
-const dashboardBuild = "sysmon-static-v124";
+const dashboardBuild = "sysmon-static-v125";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,

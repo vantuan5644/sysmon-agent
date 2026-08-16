@@ -17,6 +17,8 @@ const state = {
   stream: null,
   streamFallback: false,
   streamFailures: 0,
+  lastStreamAtMS: 0,
+  streamReconnects: 0,
   metricsInFlight: false,
   settingsInFlight: false,
   settingsRequestSeq: 0,
@@ -81,7 +83,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v124";
+const dashboardBuild = "sysmon-static-v125";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -130,6 +132,13 @@ const auxiliaryTimeoutMS = 3000;
 // for the rest of the session. A successful open/message resets the counter, so
 // transient blips that recover never demote us; persistent failure does.
 const streamFailureLimit = 3;
+// How long an open /api/stream may go silent before the dashboard treats the
+// connection as dead and rebuilds it. The sampler publishes a snapshot every
+// fast-lane tick (~5 Hz by default), so this is ~75 missed frames -- silence
+// this long is a dead socket, never a quiet one. The server's keepalive comments
+// are deliberately not a liveness signal here: EventSource never surfaces them
+// as message events, so only real data frames can reset this timer.
+const streamSilenceLimitMS = 15000;
 const clientCheckIntervalMS = 30000;
 const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;
 const clientCheckDebounceMS = 500;
@@ -352,8 +361,12 @@ function openStream() {
     return;
   }
   state.stream = source;
+  // Give the fresh connection a full silence window before the watchdog may
+  // judge it, so a slow open is never mistaken for a dead socket.
+  state.lastStreamAtMS = nowMS();
   source.onopen = () => {
     state.streamFailures = 0;
+    state.lastStreamAtMS = nowMS();
   };
   source.onmessage = handleStreamMessage;
   source.onerror = handleStreamError;
@@ -381,6 +394,8 @@ function handleStreamMessage(event) {
     return;
   }
   state.streamFailures = 0;
+  state.streamReconnects = 0;
+  state.lastStreamAtMS = nowMS();
   state.lastMetricsAtMS = nowMS();
   render(metrics);
   setConnectionState("ok", "Live");
@@ -430,7 +445,7 @@ function scheduleStalePolling() {
   if (document.visibilityState !== "visible") {
     return;
   }
-  state.staleTimer = setInterval(markStaleIfNeeded, 5000);
+  state.staleTimer = setInterval(checkDashboardLiveness, 5000);
 }
 
 function syncVisibleTimers() {
@@ -591,6 +606,42 @@ async function refreshNow() {
       showTransientStatus(`Client check sent (${acceptedClientCheckModeLabel(clientCheckResult.value)})`);
     }
   });
+}
+
+// checkDashboardLiveness is the periodic health tick: repair a dead stream
+// first, then label the data stale if it is. Order matters -- the repair path
+// refetches metrics, so labelling first would flag a staleness the same tick is
+// already fixing.
+function checkDashboardLiveness() {
+  reviveStreamIfSilent();
+  markStaleIfNeeded();
+}
+
+// reviveStreamIfSilent rebuilds a stream that stopped delivering without the
+// browser ever firing `error`. An agent restart, a host reboot, a sleep/resume
+// or a WiFi roam can leave the EventSource in a zombie OPEN state: the socket is
+// dead but no error event ever arrives, so handleStreamError -- the only other
+// recovery path -- never runs, and the dashboard sits frozen on its last frame
+// until someone taps the status strip. Repeated silent reconnects mean streaming
+// does not work on this path at all, so we demote to polling on the same
+// threshold handleStreamError uses instead of reconnecting forever.
+function reviveStreamIfSilent() {
+  if (!state.stream || state.paused || document.visibilityState !== "visible") {
+    return;
+  }
+  if (nowMS() - state.lastStreamAtMS <= streamSilenceLimitMS) {
+    return;
+  }
+  state.streamReconnects += 1;
+  if (state.streamReconnects >= streamFailureLimit) {
+    state.streamFallback = true;
+  }
+  closeStream();
+  // schedulePolling reopens the stream, or starts the metrics poll once the
+  // reconnect budget is spent; the fetch repaints immediately either way rather
+  // than leaving the last frame up until the new source delivers.
+  schedulePolling();
+  fetchMetrics();
 }
 
 function markStaleIfNeeded() {
