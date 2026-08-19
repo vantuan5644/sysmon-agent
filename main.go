@@ -44,6 +44,15 @@ func main() {
 	controlEmit := flag.String("control-emit", "", "internal: emit one host input (media_play_pause|lock_screen) in the current session, then exit")
 	applyUpdate := flag.String("apply-update", "", "internal: detached helper that swaps in a verified update binary, then restarts the service (Windows-only)")
 	noUpdateCheck := flag.Bool("no-update-check", false, "disable the periodic update check and the in-dashboard self-update")
+	// Claude quota page. The config dir defaults to $CLAUDE_CONFIG_DIR then
+	// $HOME/.claude; a path that does not exist turns the feature (and the
+	// dashboard page) off. Note the LocalSystem trap: the Windows service's
+	// $HOME is the systemprofile dir, so an installed service needs the
+	// explicit flag (install-windows.ps1 passes it). Live polling of
+	// api.anthropic.com is opt-in; by default the agent only reads the local
+	// quota files the claude-quota-monitor skill maintains.
+	claudeConfigDir := flag.String("claude-config-dir", envString("SYSMON_CLAUDE_CONFIG_DIR", ""), "Claude Code config directory holding quota.json (defaults to $CLAUDE_CONFIG_DIR then $HOME/.claude; missing = quota page hidden)")
+	claudeQuotaPoll := flag.Bool("claude-quota-poll", envBool("SYSMON_CLAUDE_QUOTA_POLL", false), "poll api.anthropic.com/api/oauth/usage for Claude quota instead of only reading the local quota files (5-minute cadence)")
 	showVersion := flag.Bool("version", false, "print the build version and exit")
 	flag.Parse()
 
@@ -147,6 +156,14 @@ func main() {
 		Logf:           log.Printf,
 	})
 	state.SetUpdateChecker(updateChecker)
+	// The quota checker always exists (files-only when polling is off); it
+	// resolves the config dir once and serves /api/quota from the local files.
+	quotaChecker := newQuotaChecker(QuotaCheckerOptions{
+		ConfigDir: resolveClaudeConfigDir(*claudeConfigDir),
+		Poll:      *claudeQuotaPoll,
+		Logf:      log.Printf,
+	})
+	state.SetQuotaChecker(quotaChecker)
 	if *selfCheck {
 		// The sampler is intentionally left unstarted here: its Collect() falls
 		// back to a direct platform collection when there is no warm snapshot yet,
@@ -169,9 +186,16 @@ func main() {
 
 	// Start the update checker only on the serve path. It performs one outbound
 	// call at startup (after a short delay) and then once per
-	// updateCheckInterval; -self-check above returns before reaching here.
+	// updateCheckInterval; -self-check above returns before reaching here. The
+	// quota poller follows the same rule: files-only by default, one outbound
+	// usage call per quotaPollInterval when -claude-quota-poll is set, and never
+	// under -self-check (which must make no outbound calls and spawn no
+	// goroutines).
 	updateChecker.Start()
 	defer updateChecker.Stop()
+
+	quotaChecker.Start()
+	defer quotaChecker.Stop()
 
 	serve := func(stop <-chan struct{}, ready func()) error {
 		return serveAgent(listen, handler, stop, ready)

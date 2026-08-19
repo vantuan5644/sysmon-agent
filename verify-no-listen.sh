@@ -197,7 +197,13 @@ if command -v pwsh >/dev/null 2>&1; then
             exit 1
         }
 
-        function Import-VerifyFunction([string]$Name) {
+        # Returns the function SOURCE; the caller dot-sources it. Dot-sourcing
+        # inside this helper would define the function in the helper own scope,
+        # which is discarded the moment it returns -- every import then silently
+        # vanishes and the first call dies with "term not recognized". A foreach
+        # body is not a new scope, so dot-sourcing there lands in script scope
+        # where the fixtures below can see it.
+        function Get-VerifyFunctionSource([string]$Name) {
             $functionAst = $ast.Find({
                 param($node)
                 $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
@@ -206,11 +212,11 @@ if command -v pwsh >/dev/null 2>&1; then
             if ($null -eq $functionAst) {
                 throw "missing function $Name"
             }
-            . ([scriptblock]::Create($functionAst.Extent.Text))
+            return $functionAst.Extent.Text
         }
 
         foreach ($name in @("Test-DeviceClientCheckEvidence", "Test-StandaloneClientCheckEvidence", "Test-InteractionClientCheckEvidence", "Test-CurrentDashboardBuildEvidence", "Get-TimeMilliseconds", "Test-FreshClientCheck", "Write-ClientCheckResult", "Get-LatestSeenClientCheck", "Wait-ForClientCheckEvidence")) {
-            Import-VerifyFunction $name
+            . ([scriptblock]::Create((Get-VerifyFunctionSource $name)))
         }
 
         function Write-Report([string]$Value) {
@@ -292,7 +298,10 @@ if command -v pwsh >/dev/null 2>&1; then
             exit 1
         }
 
-        function Import-InstallerFunction([string]$Name) {
+        # Returns the function SOURCE; the caller dot-sources it. See the same
+        # note above: dot-sourcing inside the helper defines the function in the
+        # helper own scope and it is gone by the time the fixtures run.
+        function Get-InstallerFunctionSource([string]$Name) {
             $functionAst = $ast.Find({
                 param($node)
                 $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
@@ -301,11 +310,11 @@ if command -v pwsh >/dev/null 2>&1; then
             if ($null -eq $functionAst) {
                 throw "missing function $Name"
             }
-            . ([scriptblock]::Create($functionAst.Extent.Text))
+            return $functionAst.Extent.Text
         }
 
         foreach ($name in @("Test-DeviceClientCheckEvidence", "Test-StandaloneClientCheckEvidence", "Get-TimeMilliseconds", "Get-ClientCheckAgeSeconds", "Format-AgeLabel", "Get-LatestHomeScreenClientCheck", "Get-ClientCheckIdentityKey", "Show-RecentHomeScreenActivity")) {
-            Import-InstallerFunction $name
+            . ([scriptblock]::Create((Get-InstallerFunctionSource $name)))
         }
 
         $deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile Safari/604.1"

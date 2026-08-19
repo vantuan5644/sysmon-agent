@@ -121,6 +121,30 @@ window.addEventListener("load", function () {
   if (storage) {
     storage.hidden = false;
   }
+  // Page 4 (Claude quota) is conditional: renderQuota() un-hides it only on a
+  // configured host. The fixture must un-hide and FILL it like the real render
+  // path does, or it measures 0px and trips the every-page-fills-the-pager
+  // assert below -- a failure that reads as a layout bug but is only a fixture
+  // artefact.
+  var quotaPage = document.getElementById("quotaPage");
+  if (quotaPage) {
+    quotaPage.hidden = false;
+    var quotaList = document.getElementById("quotaList");
+    for (var q = 0; q < 4; q++) {
+      var quotaRow = document.createElement("div");
+      quotaRow.className = "quota-row";
+      quotaRow.innerHTML =
+        '<div class="quota-row-head"><span class="quota-label">Weekly (model ' + q + ')</span>' +
+        '<span class="quota-pct">' + (q * 20) + '%</span></div>' +
+        '<div class="quota-bar"><span class="quota-bar-fill"></span></div>' +
+        '<div class="quota-note">resets in 3d</div>';
+      quotaList.appendChild(quotaRow);
+    }
+  }
+  var quotaDot = document.getElementById("pageDot3");
+  if (quotaDot) {
+    quotaDot.hidden = false;
+  }
 
   var shell = document.querySelector(".shell");
   var pager = document.getElementById("pager");
@@ -136,6 +160,7 @@ window.addEventListener("load", function () {
         height: page.offsetHeight,
         contentHeight: page.scrollHeight,
         scrollsInternally: page.scrollHeight > page.clientHeight + 1,
+        hidden: page.hidden,
       };
     }),
   };
@@ -231,6 +256,18 @@ function assertPagerInvariants(m) {
 
   if (m.pages.length < 2) {
     throw new Error(`expected at least 2 pager pages, found ${m.pages.length}. ${detail}`);
+  }
+
+  // A conditional page left hidden measures 0px and would fail the fill assert
+  // below as a bogus layout bug. The fixture above must un-hide every
+  // conditional page before measuring; this guard turns the failure into the
+  // actual diagnosis.
+  for (const [index, page] of m.pages.entries()) {
+    if (page.hidden) {
+      throw new Error(
+        `page ${index} is hidden; the fixture must un-hide every conditional page before measuring. ${detail}`,
+      );
+    }
   }
 
   // 2. Every page is the pager's height -- never its own content height. A page

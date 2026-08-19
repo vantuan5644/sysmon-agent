@@ -150,12 +150,24 @@
           <div id="processesBody" class="processes-body" role="rowgroup"></div>
         </section>
       </section>
+      <section class="page" id="quotaPage" aria-label="Claude quota" hidden>
+        <section id="quotaPanel" class="panel quota-panel">
+          <div class="section-head">
+            <h2>Claude quota</h2>
+            <span id="quotaSummary" class="muted">--</span>
+          </div>
+          <div id="quotaList" class="rows"></div>
+          <p id="quotaEmpty" class="quota-empty muted" aria-live="polite" hidden>No quota data yet -- run a Claude Code session</p>
+          <div id="quotaFooter" class="quota-footer muted">--</div>
+        </section>
+      </section>
     </div>
 
     <nav id="pageDots" class="page-dots" aria-label="Dashboard pages">
       <button id="pageDot0" class="page-dot active" type="button" aria-label="Live metrics" aria-current="true"></button>
       <button id="pageDot1" class="page-dot" type="button" aria-label="More status" aria-current="false"></button>
       <button id="pageDot2" class="page-dot" type="button" aria-label="App details" aria-current="false"></button>
+      <button id="pageDot3" class="page-dot" type="button" aria-label="Claude quota" aria-current="false" hidden></button>
     </nav>
 
     <footer class="bottom-controls" aria-label="Host controls">

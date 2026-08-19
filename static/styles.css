@@ -386,6 +386,23 @@ h2 {
   scroll-snap-stop: always;
 }
 
+/* The landscape-kiosk media query below sets `.page { display: flex }`, and an
+   author `display` declaration outranks the UA rule that makes the `hidden`
+   attribute work -- the same trap `.update-panel` documents. Without this
+   override, the conditional fourth page (Claude quota) would be VISIBLE in
+   landscape on every host, configured or not. File scope + [hidden] gives
+   specificity (0,2,0), which beats the media query's `.page` (0,1,0) regardless
+   of source order. (TestHiddenElementsAreActuallyHidden enforces the class.) */
+.page[hidden] {
+  display: none;
+}
+
+/* Defensive: `.page-dot` sets no `display` today, but a hidden conditional dot
+   must never rely on that staying true. */
+.page-dot[hidden] {
+  display: none;
+}
+
 .page-dots {
   display: flex;
   justify-content: center;
@@ -802,6 +819,83 @@ h2 {
   flex: 0 0 auto;
   color: var(--text);
   font-variant-numeric: tabular-nums;
+}
+
+/* Claude quota page (fourth pager page): one row per usage window -- label +
+   percent up top, a horizontal fill bar coloured at the 60/85 warn/critical
+   marks, and the reset countdown / credits note beneath. Mirrors the storage
+   row anatomy so the two list pages read as siblings. */
+.quota-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.quota-row {
+  padding: 7px 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.quota-row:last-child {
+  border-bottom: 0;
+}
+
+.quota-row-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.quota-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+  font-size: 0.88rem;
+}
+
+.quota-pct {
+  flex: 0 0 auto;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.quota-bar {
+  height: 6px;
+  margin: 5px 0 4px;
+  border-radius: 3px;
+  background: var(--panel-strong);
+  overflow: hidden;
+}
+
+.quota-bar-fill {
+  display: block;
+  height: 100%;
+  width: var(--w, 0%);
+  background: var(--c, var(--accent));
+  border-radius: 3px;
+}
+
+.quota-note {
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
+/* Empty state for a configured host with no rows yet. Deliberately sets no
+   `display`, so the UA `[hidden] { display: none }` rule is enough and this
+   class stays outside TestHiddenElementsAreActuallyHidden's override
+   requirement. */
+.quota-empty {
+  margin: 0;
+  padding: 14px 4px;
+  text-align: center;
+  font-size: 0.82rem;
+}
+
+.quota-footer {
+  font-size: 0.74rem;
 }
 
 .rows {

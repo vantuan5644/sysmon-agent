@@ -67,6 +67,13 @@ const state = {
     gpu: [],
     net: [],
   },
+  // quotaSupported starts true (unknown) and latches false on the first
+  // /api/quota response that says the host is unconfigured (or 404s). An
+  // unconfigured host -- every public-release user -- then stops asking
+  // entirely rather than emitting a 404 a minute forever. Trade-off: a host
+  // that installs Claude Code mid-session needs a reload to see the page.
+  quotaSupported: true,
+  quotaInFlight: false,
   settings: {
     dim: false,
     shift: true,
@@ -83,7 +90,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v125";
+const dashboardBuild = "sysmon-static-v127";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -155,6 +162,13 @@ const wakePreferenceKey = "sysmon:wake-wanted";
 // the pager to re-measure the active page and resize to fit it.
 let pagerSyncHeight = null;
 
+// Set by setupPager so a render that flips a conditional page's `hidden` (the
+// Claude quota page appears/disappears with /api/quota) can ask the pager to
+// re-derive the visible page set: re-clamp activePage into range, restyle the
+// dots, and re-measure. Reads derive from `hidden`; only activePage and the
+// scroll offset need the imperative re-clamp.
+let pagerRefresh = null;
+
 // Per-process "App details" page UI state. Client-only -- not persisted
 // server-side -- so a reload returns to the Apps view sorted by CPU. appsView
 // is "apps" (grouped by executable) or "processes" (one row per PID); procSort
@@ -212,6 +226,10 @@ document.addEventListener("DOMContentLoaded", () => {
   restoreWakePreference();
   fetchSettings();
   fetchStatus();
+  // One quota fetch at load reveals (or hides) the fourth page; afterwards the
+  // existing 60 s status tick refreshes it. No interval of its own -- quota
+  // moves on a minutes cadence and the verifier pins the interval inventory.
+  fetchQuota();
   syncVisibleTimers();
   fetchMetrics();
   sendClientCheck();
@@ -221,9 +239,18 @@ document.addEventListener("DOMContentLoaded", () => {
 // does the swiping, this only keeps the page dots in sync and lets a dot tap jump
 // to its page. Every scroll API is feature-guarded so the headless verifier (whose
 // mock DOM has no scroll geometry) is a no-op rather than a crash.
+//
+// The page set is CONDITIONAL: the fourth page (Claude quota) and its dot carry
+// `hidden` until /api/quota reports a usable source, so every read here derives
+// from the currently-visible dots/pages rather than a cached count. Two reasons
+// this is not optional: when a page disappears while the user is standing on it,
+// activePage would stay out of range and a hidden dot would keep
+// aria-current="true"; and resolving dot taps by position (indexOf in the visible
+// list, not the static array index) keeps the mapping correct if a page other
+// than the last ever becomes conditional too.
 function setupPager() {
   const pager = $("pager");
-  const dots = [$("pageDot0"), $("pageDot1"), $("pageDot2")];
+  const dots = [$("pageDot0"), $("pageDot1"), $("pageDot2"), $("pageDot3")];
   if (!pager || dots.some((dot) => !dot)) {
     return;
   }
@@ -233,8 +260,11 @@ function setupPager() {
     typeof pager.querySelectorAll === "function"
       ? Array.from(pager.querySelectorAll(".page"))
       : [];
-  const pageCount = dots.length;
   let activePage = 0;
+
+  // The visible page set, derived from `hidden` on every call.
+  const shownDots = () => dots.filter((dot) => !dot.hidden);
+  const shownPages = () => pages.filter((page) => !page.hidden);
 
   // Landscape kiosk mode (CSS `@media (orientation: landscape) and
   // (max-height: 500px)`) deliberately flexes the pager to fill the viewport
@@ -257,24 +287,61 @@ function setupPager() {
   };
   pagerSyncHeight = syncHeight;
 
+  // Restyles every dot against the current visible set. A hidden dot never
+  // carries active/aria-current -- otherwise the page-disappeared-under-me case
+  // would leave a hidden dot claiming to be the current page.
+  const syncDots = () => {
+    const visible = shownDots();
+    dots.forEach((dot) => {
+      const index = visible.indexOf(dot);
+      const on = index !== -1 && index === activePage;
+      dot.classList.toggle("active", on);
+      dot.setAttribute("aria-current", on ? "true" : "false");
+    });
+  };
+
   const setActive = (index) => {
-    const clamped = Math.max(0, Math.min(pageCount - 1, index));
+    const clamped = Math.max(0, Math.min(shownDots().length - 1, index));
     if (clamped === activePage) {
       return;
     }
     activePage = clamped;
-    dots.forEach((dot, i) => {
-      const on = i === clamped;
-      dot.classList.toggle("active", on);
-      dot.setAttribute("aria-current", on ? "true" : "false");
-    });
+    syncDots();
     // Reset the incoming page's vertical scroll to the top so swiping back from
     // a scrolled-down page lands at the top instead of inheriting a stale
     // scrollTop. Feature-guarded for the layout-less verifier DOM.
-    const incoming = pages[clamped];
+    const incoming = shownPages()[clamped];
     if (incoming && typeof incoming.scrollTop === "number") {
       incoming.scrollTop = 0;
     }
+  };
+
+  // Re-derive the page set after a conditional page's `hidden` flips.
+  // setActive(activePage) re-clamps into the new visible range (and early-
+  // returns when the index still holds, which is why syncDots runs afterwards
+  // too -- un-hiding a page while already on page 0 must still style the new
+  // dot). The scroll snap keeps the pager honest when a page appears/disappears
+  // before the active one.
+  let shownCount = shownDots().length;
+  pagerRefresh = () => {
+    const count = shownDots().length;
+    const changed = count !== shownCount;
+    shownCount = count;
+    setActive(activePage);
+    syncDots();
+    // Re-anchor the scroll ONLY when the visible set actually changed. This
+    // hook runs on every quota render, i.e. once per 60 s status tick, and an
+    // unconditional scrollTo there yanks a user who is mid-swipe back to the
+    // snapped position once a minute.
+    if (changed) {
+      const width = pager.clientWidth || 0;
+      if (typeof pager.scrollTo === "function") {
+        pager.scrollTo({ left: width * activePage });
+      } else {
+        pager.scrollLeft = width * activePage;
+      }
+    }
+    syncHeight();
   };
 
   // Re-measure once the horizontal swipe settles rather than mid-scroll, so a
@@ -284,6 +351,8 @@ function setupPager() {
   pager.addEventListener("scroll", () => {
     const width = pager.clientWidth || 0;
     if (width > 0) {
+      // scrollLeft is a position among the VISIBLE pages (hidden pages take
+      // no space), so the index here is the visible-page index.
       setActive(Math.round((pager.scrollLeft || 0) / width));
     }
     if (settleTimer) {
@@ -292,15 +361,22 @@ function setupPager() {
     settleTimer = setTimeout(syncHeight, 90);
   });
 
-  dots.forEach((dot, index) => {
+  dots.forEach((dot) => {
     dot.addEventListener("click", () => {
+      // Resolve the target by position in the VISIBLE list, not by its static
+      // array index -- hidden pages take no layout space, so dot 3's page sits
+      // at visible offset 3 only while every page is shown.
+      const visibleIndex = shownDots().indexOf(dot);
+      if (visibleIndex === -1) {
+        return;
+      }
       const width = pager.clientWidth || 0;
       if (typeof pager.scrollTo === "function") {
-        pager.scrollTo({ left: width * index, behavior: "smooth" });
+        pager.scrollTo({ left: width * visibleIndex, behavior: "smooth" });
       } else {
-        pager.scrollLeft = width * index;
+        pager.scrollLeft = width * visibleIndex;
       }
-      setActive(index);
+      setActive(visibleIndex);
       syncHeight();
     });
   });
@@ -316,6 +392,7 @@ function setupPager() {
 
   window.addEventListener("resize", syncHeight);
   window.addEventListener("orientationchange", syncHeight);
+  syncDots();
   syncHeight();
 }
 
@@ -436,6 +513,10 @@ function scheduleStatusPolling() {
   state.statusTimer = setInterval(() => {
     if (shouldPollStatus()) {
       fetchStatus();
+      // The quota refresh rides the existing status tick (no new timer): the
+      // data is minutes-cadence, and fetchQuota itself stops asking once the
+      // host has reported itself unconfigured.
+      fetchQuota();
     }
   }, 60000);
 }
@@ -1723,6 +1804,17 @@ function syncPagerAfterRender() {
   }
 }
 
+// refreshPagerPages re-derives the pager's visible page set after a render
+// flips a conditional page's `hidden` (the Claude quota page). Reads derive
+// from `hidden`; only activePage and the scroll offset are imperatively
+// re-clamped, inside the hook setupPager installs. No-op until setupPager has
+// run / in the layout-less verifier.
+function refreshPagerPages() {
+  if (typeof pagerRefresh === "function") {
+    pagerRefresh();
+  }
+}
+
 function renderMetricAlerts(metrics) {
   const panel = $("alertsPanel");
   const list = $("alertsList");
@@ -2213,6 +2305,218 @@ function storageFootLeft(device, cap) {
     return cap.error || "not mounted";
   }
   return "";
+}
+
+// fetchQuota refreshes the Claude quota page (the fourth swipe page) from
+// /api/quota. It deliberately owns NO timer of its own: one fetch at load, then
+// the existing 60 s status tick. A definitive "not configured" (configured:false
+// or 404 from an older agent) latches quotaSupported off so an unconfigured
+// host -- every public-release user -- stops asking entirely rather than
+// emitting a 404 a minute forever. Trade-off: a host that installs Claude Code
+// mid-session needs a reload to see the page.
+async function fetchQuota() {
+  if (!state.quotaSupported || state.quotaInFlight) {
+    return;
+  }
+  state.quotaInFlight = true;
+  try {
+    const response = await fetchWithTimeout("/api/quota", { cache: "no-store" }, auxiliaryTimeoutMS);
+    if (!response.ok) {
+      // Handle !ok explicitly: the verifier's fetch stub resolves unknown
+      // paths to 404, and an unhandled rejection inside node:vm would fail the
+      // whole dashboard step. 404 means "agent without the route" -- treat it
+      // exactly like an unconfigured host (hide + latch off). Other failures
+      // (e.g. a transient 500) leave the page and the latch as-is.
+      if (response.status === 404) {
+        state.quotaSupported = false;
+        renderQuota({ configured: false, source: "none", rows: [] });
+      }
+      return;
+    }
+    const payload = await response.json();
+    if (!payload || payload.configured !== true) {
+      state.quotaSupported = false;
+    }
+    renderQuota(payload || {});
+  } catch {
+    // Transient network failure: leave the page (and the latch) as-is. The
+    // next status tick retries.
+  } finally {
+    state.quotaInFlight = false;
+  }
+}
+
+// renderQuota drives the fourth pager page: one row per usage window (label +
+// percent, a fill bar, reset/credits note) plus a source+age footer. The page
+// and its dot are revealed only while /api/quota reports a configured host, so
+// a public-release user sees exactly the three pages they had before. The page
+// is STATIC markup toggled via `hidden` -- never created and appended at
+// runtime -- because `pages` is captured once in setupPager and the verifier's
+// DOM mock cannot re-query. The `hidden` flip happens before
+// refreshPagerPages() so the pager re-derives the visible set afterwards.
+function renderQuota(payload) {
+  const page = $("quotaPage");
+  const dot = $("pageDot3");
+  const list = $("quotaList");
+  const summary = $("quotaSummary");
+  const footer = $("quotaFooter");
+  const empty = $("quotaEmpty");
+  if (!page || !dot || !list || !summary || !footer || !empty) {
+    return;
+  }
+  list.textContent = "";
+  if (!payload || payload.configured !== true) {
+    page.hidden = true;
+    dot.hidden = true;
+    empty.hidden = true;
+    summary.textContent = "--";
+    footer.textContent = "--";
+    refreshPagerPages();
+    return;
+  }
+  const rows = Array.isArray(payload.rows) ? payload.rows : [];
+  summary.textContent = rows.length > 0 ? `${rows.length} window${rows.length === 1 ? "" : "s"}` : "--";
+  for (const row of rows) {
+    list.append(quotaRowElement(row));
+  }
+  // A configured host with nothing to show yet (no quota.json, or a widget
+  // cache that failed to parse) keeps the page -- the footer carries the
+  // diagnostic -- but says so in the body rather than rendering a bare header
+  // over an empty list. Mirrors #issuesEmpty on the "More status" page.
+  empty.hidden = rows.length > 0;
+  footer.textContent = quotaFooterLabel(payload);
+  page.hidden = false;
+  dot.hidden = false;
+  refreshPagerPages();
+}
+
+// quotaRowElement builds one usage-window row: label + percent (warn/critical
+// colour at the 60%/85% marks the CLI and widget use), fill bar, and the reset
+// countdown / credits note beneath.
+function quotaRowElement(row) {
+  const el = document.createElement("div");
+  el.className = "quota-row";
+
+  const percent = quotaRowPercent(row);
+
+  const head = document.createElement("div");
+  head.className = "quota-row-head";
+  const label = document.createElement("span");
+  label.className = "quota-label";
+  label.textContent = nonEmptyText(row?.label) || "quota";
+  const pct = document.createElement("span");
+  pct.className = "quota-pct";
+  if (percent !== null) {
+    pct.textContent = `${Math.round(percent)}%`;
+    pct.style.color = quotaColorFor(percent);
+  } else {
+    pct.textContent = "--";
+  }
+  head.append(label, pct);
+  el.append(head);
+
+  const bar = document.createElement("div");
+  bar.className = "quota-bar";
+  const fill = document.createElement("span");
+  fill.className = "quota-bar-fill";
+  if (percent !== null) {
+    fill.style.setProperty("--w", `${clamp(percent, 0, 100)}%`);
+    fill.style.setProperty("--c", quotaColorFor(percent));
+  }
+  bar.append(fill);
+  el.append(bar);
+
+  const noteText = [quotaResetLabel(row?.resets_at), nonEmptyText(row?.note)]
+    .filter(Boolean)
+    .join(" \u00b7 ");
+  if (noteText) {
+    const note = document.createElement("div");
+    note.className = "quota-note";
+    note.textContent = noteText;
+    el.append(note);
+  }
+  return el;
+}
+
+function quotaRowPercent(row) {
+  const numeric = finiteNumber(row?.percent);
+  return numeric === null ? null : clamp(numeric, 0, 100);
+}
+
+// quotaColorFor matches the CLI/widget thresholds: yellow from 60%, red from
+// 85% -- NOT the metric thresholds (colorFor), whose warn+15 critical step
+// would disagree with every other quota surface.
+function quotaColorFor(percent) {
+  const value = finiteNumber(percent);
+  if (value === null) {
+    return "var(--good)";
+  }
+  if (value >= 85) {
+    return "var(--bad)";
+  }
+  if (value >= 60) {
+    return "var(--warn)";
+  }
+  return "var(--good)";
+}
+
+// quotaResetLabel renders an RFC3339 reset time as a countdown, mirroring the
+// CLI's formatReset: "resets in 42m", "resets in 3h07m", "resets in 2d",
+// "resetting" once it has passed.
+function quotaResetLabel(resetsAt) {
+  const parsed = Date.parse(String(resetsAt || ""));
+  if (!Number.isFinite(parsed)) {
+    return "";
+  }
+  const mins = Math.round((parsed - nowMS()) / 60000);
+  if (mins <= 0) {
+    return "resetting";
+  }
+  if (mins < 60) {
+    return `resets in ${mins}m`;
+  }
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) {
+    return `resets in ${hours}h${String(mins % 60).padStart(2, "0")}m`;
+  }
+  return `resets in ${Math.round(hours / 24)}d`;
+}
+
+// quotaFooterLabel composes the page footer: source + sample age ("snapshot ·
+// 2m ago"), a stale marker, and any error the agent reported alongside rows.
+function quotaFooterLabel(payload) {
+  const parts = [];
+  const source = nonEmptyText(payload?.source);
+  if (source && source !== "none") {
+    const age = quotaAgeLabel(payload?.age_seconds);
+    parts.push(age ? `${source} \u00b7 ${age}` : source);
+    if (payload?.stale === true) {
+      parts.push("stale");
+    }
+  }
+  const error = nonEmptyText(payload?.error);
+  if (error) {
+    parts.push(error);
+  }
+  return parts.length > 0 ? parts.join(" \u00b7 ") : "--";
+}
+
+function quotaAgeLabel(seconds) {
+  const value = finiteNumber(seconds);
+  if (value === null || value < 0) {
+    return "";
+  }
+  const total = Math.floor(value);
+  if (total < 60) {
+    return `${total}s ago`;
+  }
+  if (total < 3600) {
+    return `${Math.floor(total / 60)}m ago`;
+  }
+  if (total < 86400) {
+    return `${Math.floor(total / 3600)}h ago`;
+  }
+  return `${Math.floor(total / 86400)}d ago`;
 }
 
 // setProcSort re-sorts the process rows by a column. Tapping the active column

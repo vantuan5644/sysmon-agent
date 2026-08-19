@@ -128,6 +128,7 @@ type RuntimeState struct {
 	clientChecks  []ClientCheck
 	settingsPath  string
 	updateChecker *UpdateChecker
+	quotaChecker  *QuotaChecker
 }
 
 func NewRuntimeState(settingsPath string) (*RuntimeState, error) {
@@ -195,6 +196,22 @@ func (s *RuntimeState) UpdateChecker() *UpdateChecker {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.updateChecker
+}
+
+// SetQuotaChecker wires the Claude quota checker into the state so GET
+// /api/quota can serve its merged status. Set once at startup in main.go; a
+// bare state (unit tests) leaves it nil and the route reports unconfigured.
+func (s *RuntimeState) SetQuotaChecker(checker *QuotaChecker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.quotaChecker = checker
+}
+
+// QuotaChecker returns the wired quota checker, or nil if none.
+func (s *RuntimeState) QuotaChecker() *QuotaChecker {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.quotaChecker
 }
 
 func (s *RuntimeState) GetClientCheck() ClientCheck {

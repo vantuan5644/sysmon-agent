@@ -7,7 +7,7 @@ const settingsRoundTrip = args.includes("--settings-roundtrip");
 const clientCheckRoundTrip = args.includes("--client-check-roundtrip");
 const baseURL = normalizeBaseURL(args.find((arg) => !arg.startsWith("--")) || defaultBaseURL);
 const timeoutMS = 5000;
-const dashboardBuild = "sysmon-static-v125";
+const dashboardBuild = "sysmon-static-v127";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,
@@ -46,6 +46,8 @@ if (sampleMode) {
   validateSettings(sampleSettings());
   validateClientCheck(sampleClientCheck(false));
   validateClientCheckHistory(sampleClientCheckHistory(false));
+  validateQuota(sampleQuotaUnconfigured());
+  validateQuota(sampleQuotaConfigured());
   if (settingsRoundTrip) {
     validateSettings(roundTripSampleSettings(), roundTripSettings);
     validateStatus(sampleStatus(roundTripSampleSettings()), roundTripSettings);
@@ -77,6 +79,9 @@ if (sampleMode) {
 
   const clientCheckHistory = await fetchJSON("/api/client-checks");
   validateClientCheckHistory(clientCheckHistory);
+
+  const quota = await fetchJSON("/api/quota");
+  validateQuota(quota);
 
   if (settingsRoundTrip) {
     await assertSettingsRejectsMissingOrigin();
@@ -407,6 +412,52 @@ function validateClientCheckHistory(history, expectedLatest = {}) {
     assert(lastSeen <= previousLastSeen, "clientCheckHistory.checks must be newest first");
     previousLastSeen = lastSeen;
   });
+}
+
+// validateQuota checks the /api/quota shape. The route is always 200 with a
+// well-formed body: configured:false is the feature-off state a public-release
+// host serves (and the dashboard latches on to hide the page), while a
+// configured host carries per-window rows merged from the local quota files.
+function validateQuota(quota) {
+  assertObject(quota, "quota");
+  assert(typeof quota.configured === "boolean", "quota.configured must be a boolean");
+  assertNonEmptyString(quota.source, "quota.source");
+  assert(
+    ["live", "cache", "snapshot", "none"].includes(quota.source),
+    `quota.source = ${quota.source}, want live|cache|snapshot|none`,
+  );
+  assert(Array.isArray(quota.rows), "quota.rows must be an array");
+  if (quota.rows.length > 0) {
+    assert(quota.configured, "quota.rows must be empty while unconfigured");
+    assert(quota.source !== "none", "quota.source must not be none while rows exist");
+  }
+  const ids = new Set();
+  quota.rows.forEach((row, index) => {
+    assertObject(row, `quota.rows[${index}]`);
+    assertNonEmptyString(row.id, `quota.rows[${index}].id`);
+    assert(!ids.has(row.id), `quota.rows[${index}].id ${row.id} is duplicated`);
+    ids.add(row.id);
+    assertNonEmptyString(row.label, `quota.rows[${index}].label`);
+    assertFiniteNumber(row.percent, `quota.rows[${index}].percent`);
+    assert(row.percent >= 0 && row.percent <= 100, `quota.rows[${index}].percent out of range`);
+    if ("resets_at" in row && row.resets_at !== "" && row.resets_at !== undefined && row.resets_at !== null) {
+      assert(typeof row.resets_at === "string", `quota.rows[${index}].resets_at must be a string`);
+      assert(Number.isFinite(Date.parse(row.resets_at)), `quota.rows[${index}].resets_at is not RFC3339`);
+    }
+    if ("note" in row && row.note !== undefined && row.note !== null) {
+      assert(typeof row.note === "string", `quota.rows[${index}].note must be a string`);
+    }
+  });
+  if ("fetched_at" in quota && quota.fetched_at !== undefined && quota.fetched_at !== null) {
+    assertTimestamp(quota.fetched_at, "quota.fetched_at", { allowStale: true });
+  }
+  if ("age_seconds" in quota && quota.age_seconds !== undefined && quota.age_seconds !== null) {
+    assertInteger(quota.age_seconds, "quota.age_seconds", { min: 0 });
+  }
+  assert(typeof quota.stale === "boolean", "quota.stale must be a boolean");
+  if ("error" in quota && quota.error !== undefined && quota.error !== null) {
+    assert(typeof quota.error === "string", "quota.error must be a string");
+  }
 }
 
 function validateNetwork(network) {
@@ -864,4 +915,28 @@ function sampleClientCheckHistory(seen) {
     return { checks: [] };
   }
   return { checks: [sampleClientCheck(true)] };
+}
+
+// sampleQuotaUnconfigured is what an agent without a Claude config dir serves:
+// the feature-off body the dashboard latches on.
+function sampleQuotaUnconfigured() {
+  return { configured: false, source: "none", rows: [], stale: false };
+}
+
+// sampleQuotaConfigured mirrors the merged body a real host produces: fresh
+// 5h/weekly from the snapshot plus cache-carried per-model weekly + credits.
+function sampleQuotaConfigured() {
+  return {
+    configured: true,
+    source: "snapshot",
+    rows: [
+      { id: "five_hour", label: "Session (5h)", percent: 12, resets_at: "2026-08-19T06:39:59Z" },
+      { id: "seven_day", label: "Weekly (all)", percent: 41, resets_at: "2026-08-22T16:00:00Z" },
+      { id: "weekly_fable", label: "Weekly (Fable)", percent: 29, resets_at: "2026-08-22T16:00:00Z", note: "as of 5m ago" },
+      { id: "credits", label: "Usage credits", percent: 10, note: "$5.00 of $50.00 used · as of 5m ago" },
+    ],
+    fetched_at: new Date(Date.now() - 10_000).toISOString(),
+    age_seconds: 10,
+    stale: false,
+  };
 }

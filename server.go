@@ -134,6 +134,23 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, newAgentStatus(state, controller.Capabilities(), time.Now().UTC()))
 	})
+	// GET /api/quota serves the Claude Code quota page's data. Read-only like
+	// /api/status, so no same-origin gate. It is deliberately NOT part of
+	// /api/status or the SSE stream: quota refreshes on a minutes cadence, not
+	// per sample, so a separate route keeps the metrics schema (which
+	// verify-api.mjs, server_test.go and selfcheck.go all pin) untouched and
+	// avoids shipping the quota block at 5 Hz for nothing. The checker caches
+	// the merged file read for quotaStatusTTL so a dashboard refresh loop does
+	// not stat files per request. An unwired checker (tests, pre-wiring) yields
+	// the unconfigured body; the page then stays hidden.
+	mux.HandleFunc("GET /api/quota", func(w http.ResponseWriter, r *http.Request) {
+		checker := state.QuotaChecker()
+		if checker == nil {
+			writeJSON(w, http.StatusOK, QuotaStatus{Configured: false, Source: "none", Rows: []QuotaRow{}})
+			return
+		}
+		writeJSON(w, http.StatusOK, checker.Status(time.Now().UTC()))
+	})
 	mux.HandleFunc("GET /api/settings", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, state.GetSettings())
 	})

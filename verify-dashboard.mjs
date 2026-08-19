@@ -502,7 +502,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v125",
+    dashboard_build: "sysmon-static-v127",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -520,7 +520,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v125",
+    dashboard_build: "sysmon-static-v127",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -538,6 +538,26 @@ function sampleObservedStatus(clientCheck = {}) {
     ...sampleStatus(),
     client_check: check,
     device_client_check: check,
+  };
+}
+
+// sampleQuotaConfigured is a configured /api/quota body with the row set the
+// merge produces on a real host: fresh 5h/weekly from the snapshot plus
+// cache-carried per-model weekly (Fable) and credits, annotated with their own
+// sample age.
+function sampleQuotaConfigured() {
+  return {
+    configured: true,
+    source: "snapshot",
+    rows: [
+      { id: "five_hour", label: "Session (5h)", percent: 12, resets_at: "2026-08-19T06:39:59Z" },
+      { id: "seven_day", label: "Weekly (all)", percent: 41, resets_at: "2026-08-22T16:00:00Z" },
+      { id: "weekly_fable", label: "Weekly (Fable)", percent: 29, resets_at: "2026-08-22T16:00:00Z", note: "as of 5m ago" },
+      { id: "credits", label: "Usage credits", percent: 10, note: "$5.00 of $50.00 used \u00b7 as of 5m ago" },
+    ],
+    fetched_at: new Date(fakeNow - 10_000).toISOString(),
+    age_seconds: 10,
+    stale: false,
   };
 }
 
@@ -619,6 +639,11 @@ let settings = defaultSettings();
 let fakeNow = 1000;
 let metricsRequests = 0;
 let statusRequests = 0;
+let quotaRequests = 0;
+// quotaMode steers the main fetch stub's /api/quota branch: "rows" (default,
+// configured with rows), "empty" (configured, no rows), "unconfigured"
+// (configured:false), or "404" (older agent without the route).
+let quotaMode = "rows";
 let clientCheckRequests = 0;
 let beaconRequests = 0;
 let lastClientCheck = null;
@@ -730,6 +755,19 @@ const context = {
     if (path === "/api/status") {
       statusRequests += 1;
       return response(sampleStatus());
+    }
+    if (path === "/api/quota") {
+      quotaRequests += 1;
+      if (quotaMode === "404") {
+        return response({ error: "not found" }, 404);
+      }
+      if (quotaMode === "unconfigured") {
+        return response({ configured: false, source: "none", rows: [], stale: false });
+      }
+      if (quotaMode === "empty") {
+        return response({ configured: true, source: "cache", rows: [], stale: true, error: "quota.json: not found" });
+      }
+      return response(sampleQuotaConfigured());
     }
     if (path === "/api/settings" && options.method === "POST") {
       settings = mergeDashboardSettings(settings, JSON.parse(options.body));
@@ -916,7 +954,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v125, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v127, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -964,7 +1002,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v125; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v127; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -974,7 +1012,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v125",
+    dashboard_build: "sysmon-static-v127",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -984,7 +1022,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v125",
+    dashboard_build: "sysmon-static-v127",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1106,7 +1144,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v125", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v127", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -1118,6 +1156,63 @@ assert(initialPassiveClientCheck.visibility === "visible", "client check did not
 assert(initialPassiveClientCheck.orientation === "portrait-primary", "client check did not include orientation");
 assert(!("interaction" in initialPassiveClientCheck), "passive client check should not include interaction evidence");
 const healthyFetch = context.fetch;
+
+// --- Claude quota page (fourth swipe page) --------------------------------
+// fetchQuota runs once at load (no interval of its own), reveals the page +
+// dot on a configured host, and latches off on a definitive unconfigured
+// response so the status tick stops asking. The latch is one-way, so the
+// fetch-driven scenarios run in an order that ends latched-off.
+assert(quotaRequests === 1, "initial load did not fetch quota once");
+assert(document.getElementById("quotaPage").hidden === false, "configured host did not reveal the quota page");
+assert(document.getElementById("pageDot3").hidden === false, "configured host did not reveal the quota dot");
+assert(document.getElementById("quotaList").children.length === 4, "quota rows did not render");
+assert(document.getElementById("quotaSummary").textContent === "4 windows", "quota summary did not render");
+assert(document.getElementById("quotaEmpty").hidden === true, "quota empty state showed while rows rendered");
+assert(document.getElementById("quotaFooter").textContent === "snapshot \u00b7 10s ago", `quota footer rendered ${JSON.stringify(document.getElementById("quotaFooter").textContent)}`);
+// The 60 s status tick refreshes quota alongside status (verify-dashboard pins
+// the interval inventory; a fifth interval would fail those counts).
+runIntervalsForDelay(60000);
+await flushMicrotasks();
+assert(quotaRequests === 2, "status tick did not refetch quota");
+// Configured with no rows: the page still appears, list cleared, footer
+// carries the stale flag + the agent's error.
+quotaMode = "empty";
+await context.fetchQuota();
+await flushMicrotasks();
+assert(document.getElementById("quotaPage").hidden === false, "configured-empty host hid the quota page");
+assert(document.getElementById("quotaList").children.length === 0, "configured-empty quota list not cleared");
+assert(document.getElementById("quotaEmpty").hidden === false, "configured-empty host did not show the quota empty state");
+assert(document.getElementById("quotaFooter").textContent.includes("stale"), "stale flag missing from quota footer");
+assert(document.getElementById("quotaFooter").textContent.includes("not found"), "quota error missing from footer");
+// Back to rows...
+quotaMode = "rows";
+await context.fetchQuota();
+await flushMicrotasks();
+assert(document.getElementById("quotaList").children.length === 4, "quota rows did not restore");
+assert(document.getElementById("quotaEmpty").hidden === true, "quota empty state survived the row refresh");
+// ...then a 404 from an older agent: unconfigured, hidden, and latched off.
+quotaMode = "404";
+await context.fetchQuota();
+await flushMicrotasks();
+assert(document.getElementById("quotaPage").hidden === true, "404 quota response left the page visible");
+assert(document.getElementById("pageDot3").hidden === true, "404 quota response left the dot visible");
+assert(document.getElementById("quotaEmpty").hidden === true, "hidden quota page left its empty state showing");
+let quotaBeforeLatch = quotaRequests;
+runIntervalsForDelay(60000);
+await flushMicrotasks();
+assert(quotaRequests === quotaBeforeLatch, "latched-off quota kept polling on the status tick");
+// configured:false hides via the exact render path fetchQuota uses...
+context.renderQuota({ configured: false, source: "none", rows: [], stale: false });
+assert(document.getElementById("quotaPage").hidden === true, "unconfigured payload did not hide the quota page");
+assert(document.getElementById("pageDot3").hidden === true, "unconfigured payload did not hide the quota dot");
+// ...and once latched, even a configured body stops arriving: re-showing via
+// renderQuota then letting the tick run must not fetch (or flip) again.
+quotaMode = "rows";
+context.renderQuota(sampleQuotaConfigured());
+assert(document.getElementById("quotaPage").hidden === false, "re-showing the quota page failed");
+runIntervalsForDelay(60000);
+await flushMicrotasks();
+assert(quotaRequests === quotaBeforeLatch, "latched-off quota polled again after re-show");
 context.fetch = async (path, options = {}) => {
   if (path === "/api/status") {
     statusRequests += 1;
