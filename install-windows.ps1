@@ -11,6 +11,12 @@ param(
     [ValidateRange(1, 300)]
     [int]$ReadinessTimeoutSeconds = 45,
     [string]$SettingsPath = "$env:ProgramData\SysmonAgent\settings.json",
+    # Claude Code config directory for the dashboard quota page. Defaults to the
+    # installing user profile when it exists. The service runs as LocalSystem,
+    # whose HOME is the systemprofile directory, so without this the service can
+    # never find the interactive user .claude folder and the quota page stays
+    # hidden. Pass an empty string to skip the flag entirely.
+    [string]$ClaudeConfigDir = "$(if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.claude')) { Join-Path $env:USERPROFILE '.claude' } else { '' })",
     [switch]$NoFirewall,
     # Update-only: pin/downgrade to a specific vX.Y.Z tag (default: latest).
     [string]$UpdateVersion,
@@ -49,7 +55,11 @@ function Quote-Arg([string]$Value) {
 
 function Get-BinaryPath {
     $agent = Get-AgentPath
-    return "$(Quote-Arg $agent) -bind $(Quote-Arg $Bind) -port $Port -settings $(Quote-Arg $SettingsPath)"
+    $binPath = "$(Quote-Arg $agent) -bind $(Quote-Arg $Bind) -port $Port -settings $(Quote-Arg $SettingsPath)"
+    if ($ClaudeConfigDir) {
+        $binPath += " -claude-config-dir $(Quote-Arg $ClaudeConfigDir)"
+    }
+    return $binPath
 }
 
 function Get-FirewallRuleName {
