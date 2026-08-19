@@ -46,6 +46,9 @@ years-old handset with nothing plugged in makes a perfect, near-zero-power desk 
   inner**), a small live trend per card, and amber/red warning thresholds.
 - 🔘 **Quick controls** — mute mic, play/pause media, mute speaker, and lock the screen
   straight from the dashboard footer.
+- 🧮 **Claude Code quota page** — an optional fourth page showing plan usage (5-hour
+  session, weekly, per-model weeklies, usage credits). Reads the local files Claude Code
+  already writes; hidden unless you point the agent at a config directory.
 - ♻️ **Graceful degradation** — a sensor that can't be read shows `unavailable` with a
   reason; it never breaks the rest of the dashboard.
 - 🐧 🪟 **Cross-platform** — Linux (`/proc` + sysfs + RAPL) and Windows (PowerShell + an
@@ -137,6 +140,8 @@ value keeps the saved default.
 | `-cpu-warn` / `-mem-warn` / `-disk-warn` / `-gpu-warn` | 50–90 | utilization warn thresholds (%) |
 | `-temp-warn` / `SYSMON_TEMP_WARN` | 50–90 (°C) | temperature warn threshold |
 | `-settings` / `SYSMON_SETTINGS` | path | optional JSON file for persisted settings |
+| `-claude-config-dir` / `SYSMON_CLAUDE_CONFIG_DIR` | path | Claude Code config dir for the quota page (default `$CLAUDE_CONFIG_DIR`, then `$HOME/.claude`; missing = page hidden) |
+| `-claude-quota-poll` / `SYSMON_CLAUDE_QUOTA_POLL` | bool, off | also poll `api.anthropic.com` for quota instead of only reading local files |
 | `-tls` / `SYSMON_TLS` | bool | enable direct TLS (`-cert`/`-key`) |
 | `-self-check` / `-wait-health` / `-wait-ready` | bool | in-process checks / startup gates |
 
@@ -210,7 +215,8 @@ SYSTEM-privileged process executes it, and both engines refuse to update without
 **Turning the check off.** It is on by default. Toggle `update_check_enabled` via
 `POST /api/settings`, or hard-disable it host-side with `-no-update-check` /
 `SYSMON_UPDATE_CHECK=0` (flag/env wins over the setting). Disabled means no outbound calls
-at all; the only endpoint ever contacted is `api.github.com`.
+at all. With the quota page left in its default files-only mode, `api.github.com` is the
+only endpoint the agent ever contacts.
 </details>
 
 <details>
@@ -231,6 +237,38 @@ A **resident sampler** keeps one warm snapshot refreshed by a fast lane (CPU/RAM
 a slow lane (power/temps/disk/net/GPU, ~0.7 Hz), so `/api/metrics` reads memory instead of
 spawning a collection per request. Concurrent requests share one in-flight collection, and
 `/api/stream` pushes fresh snapshots over SSE with a keepalive every 15 s.
+</details>
+
+<details>
+<summary><b>Claude Code quota page</b></summary>
+
+An optional fourth swipe page showing Claude Code plan usage next to CPU and GPU: the
+5-hour session window, the shared weekly, any per-model weeklies, and usage credits. It is
+**hidden unless configured**, so if you do not use Claude Code the dashboard is exactly the
+three pages it has always been.
+
+Point the agent at your Claude config directory to switch it on:
+
+```bash
+./sysmon-agent -claude-config-dir ~/.claude
+```
+
+It defaults to `$CLAUDE_CONFIG_DIR`, then `$HOME/.claude`. On the **Windows service** pass it
+explicitly (the installer does this for you): the service runs as LocalSystem, whose home is
+the systemprofile directory, so it can never discover your profile on its own.
+
+**Where the numbers come from.** By default the agent makes *no network calls for this at
+all* — it reads two files Claude Code and its quota widget already maintain, `quota.json`
+and `widgets/quota-live-cache.json`, and merges them: freshest source wins per window, and
+rows only the API knows about (per-model weeklies, credits) are carried over labelled with
+their own age rather than dropped. Files-first is deliberate — the usage endpoint
+rate-limits hard, so a second poller would just fight whatever else is already polling.
+
+`-claude-quota-poll` opts a host with no such widget into polling
+`api.anthropic.com/api/oauth/usage` directly, every 5 minutes (backing off to 15 after a
+rate-limit). The OAuth token Claude Code already stores is read per poll, sent only to
+`api.anthropic.com`, and is never logged, persisted, or included in any response the agent
+serves.
 </details>
 
 <details>
