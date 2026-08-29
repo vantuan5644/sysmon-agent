@@ -269,6 +269,13 @@ rate-limits hard, so a second poller would just fight whatever else is already p
 rate-limit). The OAuth token Claude Code already stores is read per poll, sent only to
 `api.anthropic.com`, and is never logged, persisted, or included in any response the agent
 serves.
+
+On the installed Windows service, pass `-ClaudeQuotaPoll` to `install-windows.ps1`
+rather than hand-editing the service command line: `Get-BinaryPath` rebuilds that line
+from the parameters on every install, so a manual edit is dropped by the next one.
+Polling is what lets the page stay fresh with no Claude Code session open and no desktop
+widget running — bounded by the OAuth token’s lifetime, since only Claude Code itself
+refreshes it. Run one poller per account: the agent or the desktop widget, not both.
 </details>
 
 <details>

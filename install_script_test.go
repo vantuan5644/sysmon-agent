@@ -66,6 +66,13 @@ func TestWindowsInstallerDefaults(t *testing.T) {
 		`thresholds: CPU $($settings.thresholds.cpu_warn)% / RAM $($settings.thresholds.memory_warn)% / Disk $($settings.thresholds.disk_warn)% / GPU $($settings.thresholds.gpu_warn)% / Temp $($settings.thresholds.temp_warn_c)C`,
 		`Dashboard settings unavailable at ${statusUrl}`,
 		`Dashboard settings failed at ${statusUrl}`,
+		// Claude quota page: the -ClaudeQuotaPoll switch and its Status readout.
+		// Code-only needles -- the monorepo copy comment prose differs.
+		`[switch]$ClaudeQuotaPoll,`,
+		`$binPath += ' -claude-quota-poll'`,
+		`function Get-QuotaCheckUrl`,
+		`function Show-QuotaStatus`,
+		`Claude quota page: source=`,
 		`function Test-DeviceClientCheckEvidence`,
 		`$mobileDevice = $userAgent.Contains('Mobile') -or $userAgent.Contains('iPhone') -or $userAgent.Contains('iPad') -or $userAgent.Contains('iPod') -or $userAgent.Contains('Android')`,
 		`function Test-StandaloneClientCheckEvidence`,

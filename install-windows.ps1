@@ -17,6 +17,14 @@ param(
     # never find the interactive user .claude folder and the quota page stays
     # hidden. Pass an empty string to skip the flag entirely.
     [string]$ClaudeConfigDir = "$(if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.claude')) { Join-Path $env:USERPROFILE '.claude' } else { '' })",
+    # Let the service run its own 5-minute api.anthropic.com usage poll instead
+    # of only reading the local quota files. Without this the quota page is only
+    # as fresh as whatever last wrote quota.json or widgets/quota-live-cache.json
+    # (a rendering Claude Code status line, or the desktop quota widget), so an
+    # idle desktop leaves the page stale. Ignored without -ClaudeConfigDir,
+    # which the poller needs in order to read the OAuth token. Do not combine
+    # with the desktop widget: two pollers on one account fight the rate limit.
+    [switch]$ClaudeQuotaPoll,
     [switch]$NoFirewall,
     # Update-only: pin/downgrade to a specific vX.Y.Z tag (default: latest).
     [string]$UpdateVersion,
@@ -58,6 +66,11 @@ function Get-BinaryPath {
     $binPath = "$(Quote-Arg $agent) -bind $(Quote-Arg $Bind) -port $Port -settings $(Quote-Arg $SettingsPath)"
     if ($ClaudeConfigDir) {
         $binPath += " -claude-config-dir $(Quote-Arg $ClaudeConfigDir)"
+        # Nested deliberately: the quota checker returns early without a config
+        # dir, so the poll flag on its own would be a dead argument.
+        if ($ClaudeQuotaPoll) {
+            $binPath += ' -claude-quota-poll'
+        }
     }
     return $binPath
 }
@@ -241,6 +254,10 @@ function Get-AgentBaseUrl {
     return "http://$(Format-UrlHost (Resolve-HealthHost)):$Port"
 }
 
+function Get-QuotaCheckUrl {
+    return "$(Get-AgentBaseUrl)/api/quota"
+}
+
 function Wait-AgentReady {
     $readyUrl = Get-ReadinessCheckUrl
     $deadline = (Get-Date).AddSeconds($ReadinessTimeoutSeconds)
@@ -342,6 +359,43 @@ function Show-DashboardSettings {
         Write-Host "  thresholds: CPU $($settings.thresholds.cpu_warn)% / RAM $($settings.thresholds.memory_warn)% / Disk $($settings.thresholds.disk_warn)% / GPU $($settings.thresholds.gpu_warn)% / Temp $($settings.thresholds.temp_warn_c)C"
     } catch {
         Write-Warning "Dashboard settings failed at ${statusUrl}: $($_.Exception.Message)"
+    }
+}
+
+function Show-QuotaStatus {
+    $quotaUrl = Get-QuotaCheckUrl
+    try {
+        $quota = Invoke-RestMethod -Method Get -Uri $quotaUrl -TimeoutSec 4
+    } catch {
+        Write-Warning "Claude quota check failed at ${quotaUrl}: $($_.Exception.Message)"
+        return
+    }
+    if (-not $quota.configured) {
+        Write-Host 'Claude quota page: not configured (no -claude-config-dir, or the directory is missing).'
+        return
+    }
+    # age_seconds is an int with omitempty, so a 0-second age -- the freshest
+    # reading there is -- is omitted from the JSON entirely. Treat a missing age
+    # as 0 whenever fetched_at is present, or the best case reads as 'unknown'.
+    $age = if ($null -ne $quota.age_seconds) {
+        "$([int]$quota.age_seconds)s"
+    } elseif ($quota.fetched_at) {
+        '0s'
+    } else {
+        'unknown'
+    }
+    $flag = if ($quota.stale) { ' STALE' } else { '' }
+    Write-Host "Claude quota page: source=$($quota.source), age=$age, rows=$(@($quota.rows).Count)$flag"
+    # Read the live command line rather than $quota.source: source legitimately
+    # reports 'snapshot' even with polling on, because the merge prefers the
+    # freshest contributor and a rendering status line beats a 5-minute poll.
+    $configured = & sc.exe qc $ServiceName 2>$null
+    if ($LASTEXITCODE -eq 0 -and ($configured -join ' ') -notmatch '-claude-quota-poll') {
+        Write-Host '  Live polling is off: the page is only as fresh as quota.json or the desktop widget cache.'
+        Write-Host '  Reinstall with -ClaudeQuotaPoll to let the service poll on its own.'
+    }
+    if ($quota.error) {
+        Write-Warning "Claude quota: $($quota.error)"
     }
 }
 
@@ -951,6 +1005,7 @@ function Show-Status {
         Show-LhmLibraryStatus
         Show-PwshStatus
         Show-DashboardSettings
+        Show-QuotaStatus
         Show-ClientCheckStatus
     } else {
         Write-Host "Service $ServiceName is not installed."
