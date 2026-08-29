@@ -121,6 +121,25 @@ window.addEventListener("load", function () {
   if (storage) {
     storage.hidden = false;
   }
+  // Page 2 also carries the alerts panel (moved off the fixed shell chrome),
+  // which renderMetricAlerts() un-hides and fills at the collapsed row count.
+  // Same fixture contract as the quota page: a conditional element left hidden
+  // measures 0px, so un-hide and FILL it before measuring.
+  var alertsPanel = document.getElementById("alertsPanel");
+  if (alertsPanel) {
+    alertsPanel.hidden = false;
+    var alertsList = document.getElementById("alertsList");
+    for (var a = 0; a < 5; a++) {
+      var alertRow = document.createElement("div");
+      alertRow.className = "row alert-row";
+      alertRow.textContent = "Motherboard 75\u00B0C over 70\u00B0C";
+      alertsList.appendChild(alertRow);
+    }
+  }
+  var alertsChip = document.getElementById("alertsChip");
+  if (alertsChip) {
+    alertsChip.hidden = false;
+  }
   // Page 4 (Claude quota) is conditional: renderQuota() un-hides it only on a
   // configured host. The fixture must un-hide and FILL it like the real render
   // path does, or it measures 0px and trips the every-page-fills-the-pager
@@ -149,12 +168,16 @@ window.addEventListener("load", function () {
   var shell = document.querySelector(".shell");
   var pager = document.getElementById("pager");
   var pages = Array.prototype.slice.call(document.querySelectorAll(".page"));
+  var alertsPanelEl = document.getElementById("alertsPanel");
+  var alertsChipEl = document.getElementById("alertsChip");
   var report = {
     cssLoaded: getComputedStyle(shell).display === "flex",
     viewport: window.innerHeight,
     documentScrollHeight: document.documentElement.scrollHeight,
     shellHeight: shell.offsetHeight,
     pagerHeight: pager.offsetHeight,
+    alertsPanelInPager: !!(alertsPanelEl && alertsPanelEl.closest(".page")),
+    alertsChipInPager: !!(alertsChipEl && alertsChipEl.closest("#pager")),
     pages: pages.map(function (page) {
       return {
         height: page.offsetHeight,
@@ -292,6 +315,23 @@ function assertPagerInvariants(m) {
   if (!tallest.scrollsInternally) {
     throw new Error(
       `the tallest page (${tallest.contentHeight}px of content in a ${m.pagerHeight}px pager) does not scroll internally; its content is being clipped. ${detail}`,
+    );
+  }
+
+  // 4. The alerts detail lives INSIDE a pager page ("More status") so a
+  // populated alert list scrolls with its page instead of shrinking the pager
+  // on every page, while the chip linking to it stays OUTSIDE the pager,
+  // riding the status-strip row in the shell chrome. This is the measured
+  // regression guard for the alerts-chip move -- the string tests can only
+  // prove the markup moved, this proves the layout followed.
+  if (!m.alertsPanelInPager) {
+    throw new Error(
+      `#alertsPanel is not inside a .page; the alerts detail must scroll with the "More status" page instead of permanently shrinking the pager. ${detail}`,
+    );
+  }
+  if (m.alertsChipInPager) {
+    throw new Error(
+      `#alertsChip is inside the pager; it must stay outside it, riding the status-strip row. ${detail}`,
     );
   }
 }

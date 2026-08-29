@@ -502,7 +502,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v127",
+    dashboard_build: "sysmon-static-v129",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -520,7 +520,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v127",
+    dashboard_build: "sysmon-static-v129",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -873,6 +873,7 @@ assert(lastSparklineBar("gpuTrend").style.values.get("--h") === "25%", "GPU spar
 assert(lastSparklineBar("netTrend").style.values.get("--h") === "6%", "network sparkline did not render floored latest value");
 assert(document.getElementById("updatedAt").textContent.endsWith("/ 0s / 142ms"), "metric timestamp did not include sample age and collection duration");
 assert(document.getElementById("alertsPanel").hidden === true, "healthy metrics showed threshold alerts panel");
+assert(document.getElementById("alertsChip").hidden === true, "healthy metrics showed the alerts chip");
 assert(document.getElementById("issuesPanel").hidden === true, "healthy metrics showed collector issues panel");
 assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / app", "agent status metadata did not render");
 
@@ -954,7 +955,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v127, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v129, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1002,7 +1003,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v127; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v129; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1012,7 +1013,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v127",
+    dashboard_build: "sysmon-static-v129",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1022,7 +1023,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v127",
+    dashboard_build: "sysmon-static-v129",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1062,6 +1063,16 @@ context.render(alertMetrics());
 const alertsPanel = document.getElementById("alertsPanel");
 const alertsList = document.getElementById("alertsList");
 assert(alertsPanel.hidden === false, "threshold breaches did not show alerts panel");
+assert(document.getElementById("alertsChip").hidden === false, "threshold breaches did not show the alerts chip");
+assert(document.getElementById("alertsChipCount").textContent === "7", "alerts chip did not render the alert count");
+assert(document.getElementById("alertsChip").getAttribute("aria-label") === "7 alerts; show details", "alerts chip aria-label did not render count + action");
+// The chip must navigate, not throw, even under this layout-less mock: goToPage
+// stays guarded on pagerGoTo being a function, and this click is what proves it.
+await document.getElementById("alertsChip").click();
+// Alerts now live on the "More status" page, so the "All clear" placeholder
+// keys off BOTH lists: with 7 alerts and zero collector issues it must stay
+// hidden rather than render beneath a red alert list.
+assert(document.getElementById("issuesEmpty").hidden === true, "alerts present did not suppress the all-clear placeholder");
 assert(document.getElementById("alertsSummary").textContent === "7 alerts", "threshold alerts summary did not render count");
 assert(alertsPanel.getAttribute("aria-expanded") === "false", "many threshold alerts started expanded");
 assert(alertsList.children.length === 6, "collapsed alerts did not show five rows plus overflow count");
@@ -1100,6 +1111,9 @@ await alertsPanel.click();
 
 context.render(sampleMetrics());
 assert(document.getElementById("alertsPanel").hidden === true, "normal metrics did not hide threshold alerts panel");
+assert(document.getElementById("alertsChip").hidden === true, "normal metrics did not hide the alerts chip");
+assert(document.getElementById("alertsChipCount").textContent === "0", "normal metrics did not reset the alerts chip count");
+assert(document.getElementById("issuesEmpty").hidden === false, "all-clear placeholder did not return once alerts cleared");
 context.render(sampleMetrics());
 assert(context.intervalCountForDelay(2000) === 1, "refresh setting did not keep the metrics timer at the saved interval");
 assert(document.getElementById("dimBtn").getAttribute("aria-pressed") === "false", "inactive dim control exposed pressed state");
@@ -1144,7 +1158,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v127", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v129", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -1699,6 +1713,72 @@ context.fetch = async (path, options = {}) => {
 };
 await context.fetchSettings();
 assert(document.getElementById("issuesPanel").hidden === true, "successful settings fetch did not clear settings read failure issue");
+
+// A settings READ failure must not outlive the next successful status poll.
+// fetchSettings runs once at load and nothing re-runs it on a timer, so before
+// clearSettingsFetchIssue a single load-time race pinned "settings unavailable"
+// for the whole session -- while /api/status carried the same settings block
+// and renderStatus had been applying it every 60 s.
+const settingsReadDownFetch = async (path, options = {}) => {
+  if (path === "/api/metrics") {
+    metricsRequests += 1;
+    return response(sampleMetrics());
+  }
+  if (path === "/api/status") {
+    statusRequests += 1;
+    return response(sampleStatus());
+  }
+  if (path === "/api/settings" && options.method === "POST") {
+    settings = mergeDashboardSettings(settings, JSON.parse(options.body));
+    return response(settings);
+  }
+  if (path === "/api/settings") {
+    throw new Error("settings read down");
+  }
+  return response({ error: "not found" }, 404);
+};
+const settingsHealthyFetch = async (path, options = {}) => {
+  if (path === "/api/metrics") {
+    metricsRequests += 1;
+    return response(sampleMetrics());
+  }
+  if (path === "/api/status") {
+    statusRequests += 1;
+    return response(sampleStatus());
+  }
+  if (path === "/api/settings" && options.method === "POST") {
+    settings = mergeDashboardSettings(settings, JSON.parse(options.body));
+    return response(settings);
+  }
+  if (path === "/api/settings") {
+    return response(settings);
+  }
+  return response({ error: "not found" }, 404);
+};
+context.fetch = settingsReadDownFetch;
+await context.fetchSettings();
+assert(document.getElementById("issuesList").children[0].textContent === "settings unavailable: settings read down", "settings read failure issue did not re-render");
+context.fetch = settingsHealthyFetch;
+context.renderStatus(sampleStatus());
+assert(document.getElementById("issuesPanel").hidden === true, "status poll carrying settings did not clear the settings read failure issue");
+
+// An UPDATE failure is the opposite: the status poll says nothing about whether
+// the user's POST saved, so it must leave that issue standing.
+context.fetch = async (path, options = {}) => {
+  if (path === "/api/settings" && options.method === "POST") {
+    return response({ error: "same-origin required" }, 403);
+  }
+  return settingsHealthyFetch(path, options);
+};
+await context.updateSettings({ dim: false });
+await flushMicrotasks();
+assert(document.getElementById("issuesList").children[0].textContent === "settings update failed: HTTP 403", "settings update failure issue did not render");
+context.fetch = settingsHealthyFetch;
+context.renderStatus(sampleStatus());
+assert(document.getElementById("issuesList").children[0].textContent === "settings update failed: HTTP 403", "status poll cleared a settings update failure it cannot vouch for");
+runTimeouts();
+await context.updateSettings({ dim: false });
+assert(document.getElementById("issuesPanel").hidden === true, "successful settings update did not clear the settings update failure issue");
 
 const steadyPoll = deferredResponse(sampleMetrics());
 context.fetch = async (path, options = {}) => {

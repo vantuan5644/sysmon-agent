@@ -181,6 +181,60 @@ h2 {
   background: #3a2c0e;
 }
 
+/* Alerts moved off the fixed shell chrome onto the "More status" page, so a
+   threshold breach no longer permanently shrinks the pager on every page (the
+   shell is a DEFINITE height -- see .shell -- so anything above the pager is
+   subtracted from it). What stays global is this one-glyph chip: it rides the
+   existing status-strip row, so it costs zero extra vertical space, and tapping
+   it swipes to the page that owns the detail.
+
+   The chip is a SIBLING of the strip, not a child: the strip is itself a
+   role="button" (tap = refresh now, the stale-shell recovery path), and a real
+   button nested inside a role="button" is invalid ARIA and an ambiguous tap
+   target. A flex wrapper also keeps the strip's grid columns / mobile
+   grid-template-areas untouched. */
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#statusStrip {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.alerts-chip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 2px 9px;
+  border: 1px solid var(--bad);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bad) 14%, transparent);
+  color: var(--bad);
+  font-size: 0.78rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+/* `.alerts-chip` sets `display`, which outranks the UA `[hidden] { display:
+   none }` rule -- without this the chip is permanently on screen showing "0",
+   the exact bug `.update-panel` documents. TestHiddenElementsAreActuallyHidden
+   enforces this pairing. */
+.alerts-chip[hidden] {
+  display: none;
+}
+
+.alerts-chip:focus-visible {
+  outline: 2px solid var(--bad);
+  outline-offset: 2px;
+}
+
 .status-strip {
   display: grid;
   grid-template-columns: auto auto 1fr auto;
@@ -1313,6 +1367,11 @@ h2 {
 
   .status-strip {
     min-height: 40px;
+  }
+
+  .alerts-chip {
+    min-height: 34px;
+    padding: 2px 11px;
   }
 
   .metric-card {

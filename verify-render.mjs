@@ -135,22 +135,18 @@ function writeFixture(root) {
         <button class="button" type="button" aria-label="Pause updates" aria-pressed="false" title="Pause updates">&#8545;</button>
       </div>
     </header>
-    <section class="status-strip" role="button" tabindex="0" aria-label="Refresh metrics now">
-      <span class="status-dot ok"></span>
-      <span>Live</span>
-      <span class="muted">up 7h 12m / saved / app</span>
-      <span class="muted">03:16:00 / 4s / 142ms</span>
-    </section>
-    <section class="panel alerts-panel" role="button" tabindex="0" aria-label="Collapse alert details" aria-expanded="true" aria-live="polite">
-      <div class="section-head">
-        <h2>Alerts</h2>
-        <span class="muted">2 alerts</span>
-      </div>
-      <div class="rows">
-        <div class="row alert-row">Disk / 92% over 70%</div>
-        <div class="row alert-row">Motherboard 75C over 70C</div>
-      </div>
-    </section>
+    <div class="status-row">
+      <section class="status-strip" role="button" tabindex="0" aria-label="Refresh metrics now">
+        <span class="status-dot ok"></span>
+        <span>Live</span>
+        <span class="muted">up 7h 12m / saved / app</span>
+        <span class="muted">03:16:00 / 4s / 142ms</span>
+      </section>
+      <button class="alerts-chip" type="button" aria-label="2 alerts; show details">
+        <span aria-hidden="true">&#9888;</span>
+        <span>2</span>
+      </button>
+    </div>
     <section class="panel issues-panel" role="button" tabindex="0" aria-label="Expand issue details" aria-expanded="false" aria-live="polite">
       <div class="section-head">
         <h2>Issues</h2>
@@ -167,6 +163,16 @@ function writeFixture(root) {
       ${gaugeCard("GPU", 74, "74%", "var(--warn)", "NVIDIA GeForce RTX 4090", "61°C · 320 W", sparkline(74, "var(--warn)"))}
       ${gaugeCard("RAM", 61, "61%", "var(--good)", "DDR5 · 6000 MT/s", "⇅ 1.2 GB swap", sparkline(61, "var(--good)"))}
       ${gaugeCard("NET", 30, "3.0M", "var(--accent)", "BiBi-Pro-Max", netDetailMock(), sparkline(30, "var(--accent)"))}
+    </section>
+    <section class="panel alerts-panel" role="button" tabindex="0" aria-label="Collapse alert details" aria-expanded="true" aria-live="polite">
+      <div class="section-head">
+        <h2>Alerts</h2>
+        <span class="muted">2 alerts</span>
+      </div>
+      <div class="rows">
+        <div class="row alert-row">Disk / 92% over 70%</div>
+        <div class="row alert-row">Motherboard 75C over 70C</div>
+      </div>
     </section>
     ${panel("Performance", "CPU 37% / RAM 61%", [
       rowWithBar("CPU", "", "37%", 37, "var(--good)"),
@@ -224,6 +230,7 @@ function verifyStaticLayout(fixturePath) {
     `class="shell"`,
     `class="top-actions"`,
     `class="status-strip"`,
+    `class="alerts-chip"`,
     `up 7h 12m / saved / app`,
     `03:16:00 / 4s / 142ms`,
     `class="panel alerts-panel"`,
@@ -274,6 +281,9 @@ function verifyStaticLayout(fixturePath) {
     `.alert-row,`,
     `.alert-row {`,
     `color: var(--bad);`,
+    `.status-row {`,
+    `.alerts-chip {`,
+    `.alerts-chip[hidden] {`,
     `.issues-panel {`,
     `.issues-panel[role="button"]`,
     `.issues-panel:focus-visible`,

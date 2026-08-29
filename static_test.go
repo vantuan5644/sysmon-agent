@@ -24,6 +24,9 @@ func TestPWAInstallMetadata(t *testing.T) {
 		`apple-mobile-web-app-title`,
 		`id="agentMeta"`,
 		`id="statusStrip" class="status-strip" role="button" tabindex="0" aria-label="Refresh metrics now"`,
+		`class="status-row"`,
+		`id="alertsChip" class="alerts-chip" type="button"`,
+		`id="alertsChipCount"`,
 		`id="alertsPanel" class="panel alerts-panel" role="button" tabindex="0" aria-label="Alert details" aria-expanded="false" aria-live="polite" hidden`,
 		`id="alertsSummary"`,
 		`id="alertsList"`,
@@ -129,7 +132,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v127"`,
+		`const STATIC_CACHE = "sysmon-static-v129"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -404,8 +407,8 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	appJS := string(app)
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
-		`const auxiliaryTimeoutMS = 3000;`,
-		`const dashboardBuild = "sysmon-static-v127";`,
+		`const auxiliaryTimeoutMS = 5000;`,
+		`const dashboardBuild = "sysmon-static-v129";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -415,6 +418,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 		`settingsInFlight: false,`,
 		`if (status?.settings && !state.settingsInFlight) {`,
 		`applySettings(status.settings);`,
+		`clearSettingsFetchIssue();`,
 		`clientCheckAgeLabel(statusProofClientCheck(status))`,
 		`function clientCheckAgeLabel(clientCheck) {`,
 		`function statusProofClientCheck(status) {`,
@@ -698,6 +702,10 @@ func TestDashboardRendersMetricAlertsPanel(t *testing.T) {
 		`function handleAlertsPanelKeydown(event) {`,
 		`function alertRow(message) {`,
 		`row.className = "row alert-row";`,
+		`$("alertsChip").addEventListener("click", showAlertDetails);`,
+		`function showAlertDetails() {`,
+		`function syncAlertsChip(messages) {`,
+		`function syncStatusPageEmpty() {`,
 	} {
 		if !strings.Contains(appJS, needle) {
 			t.Fatalf("app.js missing metric alerts renderer %q", needle)
@@ -720,10 +728,49 @@ func TestDashboardRendersMetricAlertsPanel(t *testing.T) {
 		`.alert-row {`,
 		`color: var(--bad);`,
 		`display: grid;`,
+		`.status-row {`,
+		`.alerts-chip {`,
+		`.alerts-chip[hidden] {`,
 	} {
 		if !strings.Contains(css, needle) {
 			t.Fatalf("styles.css missing metric alerts style %q", needle)
 		}
+	}
+}
+
+// TestAlertsPanelLivesOnTheStatusPage guards the structural decision that the
+// alerts DETAIL lives inside the "More status" pager page (with the storage and
+// issues panels) rather than in the fixed shell chrome above the pager. The
+// shell is a definite height, so anything above the pager is subtracted from it
+// on EVERY page: while the panel sat in the chrome, a hot drive or a warm board
+// sensor permanently shrank the CPU/GPU/RAM/NET gauges by ~250px on a phone.
+// What stays globally visible is the #alertsChip, which must stay outside the
+// pager (it rides the status-strip row). If this test fails, someone hoisted the
+// panel back into the chrome -- do not "fix" the test.
+func TestAlertsPanelLivesOnTheStatusPage(t *testing.T) {
+	index, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexHTML := string(index)
+
+	statusPage := strings.Index(indexHTML, `<section class="page" aria-label="More status">`)
+	alertsPanel := strings.Index(indexHTML, `id="alertsPanel"`)
+	storagePanel := strings.Index(indexHTML, `id="storagePanel"`)
+	if statusPage == -1 || alertsPanel == -1 || storagePanel == -1 {
+		t.Fatalf("index.html missing a structural anchor: statusPage=%d alertsPanel=%d storagePanel=%d", statusPage, alertsPanel, storagePanel)
+	}
+	if !(statusPage < alertsPanel && alertsPanel < storagePanel) {
+		t.Fatalf("#alertsPanel must live inside the \"More status\" page, above #storagePanel (statusPage@%d, alertsPanel@%d, storagePanel@%d)", statusPage, alertsPanel, storagePanel)
+	}
+
+	alertsChip := strings.Index(indexHTML, `id="alertsChip"`)
+	pager := strings.Index(indexHTML, `<div id="pager"`)
+	if alertsChip == -1 || pager == -1 {
+		t.Fatalf("index.html missing the chip or the pager: alertsChip=%d pager=%d", alertsChip, pager)
+	}
+	if !(alertsChip < pager) {
+		t.Fatalf("#alertsChip must stay outside the pager, on the status-strip row (alertsChip@%d, pager@%d)", alertsChip, pager)
 	}
 }
 
@@ -735,10 +782,20 @@ func TestDashboardSettingsFailuresShowTransientAndIssue(t *testing.T) {
 	appJS := string(app)
 	for _, needle := range []string{
 		`transientStatusTimer: null,`,
-		`renderSettingsError("settings update failed", error);`,
-		`function renderSettingsError(prefix, error) {`,
+		`renderSettingsError("settings update failed", error, "update");`,
+		`renderSettingsError("settings unavailable", error, "fetch");`,
+		`function renderSettingsError(prefix, error, kind) {`,
+		`state.settingsIssueKind = kind;`,
 		"state.settingsIssueMessages = [`${prefix}: ${message || \"request failed\"}`];",
 		`function clearSettingsIssue() {`,
+		`state.settingsIssueKind = "";`,
+		// A settings READ failure must retire itself once the status poll proves the
+		// settings path is reachable -- fetchSettings runs only at load, so without
+		// this a load-time race pinned "settings unavailable" for the whole session.
+		// An update failure is NOT cleared this way; see CLAUDE.md.
+		`function clearSettingsFetchIssue() {`,
+		`if (state.settingsIssueKind !== "fetch") {`,
+		`settingsIssueKind: "",`,
 		`showTransientStatus(error.message ? ` + "`Settings failed: ${error.message}`" + ` : "Settings failed");`,
 		`function showTransientStatus(text) {`,
 		`$("statusText").textContent = state.connectionText || "Updating";`,

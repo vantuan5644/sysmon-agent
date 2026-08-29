@@ -28,6 +28,10 @@ const state = {
   displayIssueMessages: [],
   metricIssueMessages: [],
   settingsIssueMessages: [],
+  // "fetch" (a GET lost a race and told us nothing) or "update" (a POST the
+  // user made did not save). Only the first is safe for the status poll to
+  // clear -- see clearSettingsFetchIssue.
+  settingsIssueKind: "",
   statusIssueMessages: [],
   alertsExpanded: false,
   alertMessages: [],
@@ -90,7 +94,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v127";
+const dashboardBuild = "sysmon-static-v129";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -133,7 +137,15 @@ const controlActionLabels = {
 // re-appears, by design, so the user hears about each new release once).
 const updateDismissedKeyPrefix = "sysmon:update-dismissed-";
 const metricsTimeoutMS = 4500;
-const auxiliaryTimeoutMS = 3000;
+// Auxiliary (status/settings/quota/client-check) budget. Deliberately LONGER
+// than metricsTimeoutMS: at load these fire as a burst alongside the service
+// worker's cache.addAll, so on HTTP/1.1 (plain http://host:9099, six sockets)
+// an auxiliary request can sit queued behind /api/metrics. A budget shorter
+// than the metrics fetch ahead of it in the queue times out on queueing alone,
+// which is what pinned a false "settings unavailable: Request timed out" in
+// the issues panel. Also covers a phone resuming the PWA while Tailscale
+// re-establishes the tunnel.
+const auxiliaryTimeoutMS = 5000;
 // Number of consecutive EventSource failures (with no recovery in between)
 // before we abandon the live /api/stream and fall back to polling /api/metrics
 // for the rest of the session. A successful open/message resets the counter, so
@@ -155,6 +167,10 @@ const clientCheckDebounceMS = 500;
 // not linger but long enough to land the confirming second tap.
 const controlArmWindowMS = 3000;
 const collapsedIssueLimit = 5;
+// Index of the "More status" page, which owns the Alerts + Storage + Issues
+// panels. Never conditional (only the Claude quota page is), so a static index
+// is safe here -- pagerGoTo still resolves it through the VISIBLE dot set.
+const statusPageIndex = 1;
 const sparklineSampleLimit = 24;
 const wakePreferenceKey = "sysmon:wake-wanted";
 
@@ -168,6 +184,10 @@ let pagerSyncHeight = null;
 // dots, and re-measure. Reads derive from `hidden`; only activePage and the
 // scroll offset need the imperative re-clamp.
 let pagerRefresh = null;
+
+// Set by setupPager so a control outside the pager (the alerts chip) can swipe
+// to a page without duplicating the dot handler's visible-index resolution.
+let pagerGoTo = null;
 
 // Per-process "App details" page UI state. Client-only -- not persisted
 // server-side -- so a reload returns to the Apps view sorted by CPU. appsView
@@ -189,6 +209,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   $("alertsPanel").addEventListener("click", toggleAlertsPanel);
   $("alertsPanel").addEventListener("keydown", handleAlertsPanelKeydown);
+  $("alertsChip").addEventListener("click", showAlertDetails);
   $("updateApplyBtn").addEventListener("click", sendUpdate);
   $("updateDismissBtn").addEventListener("click", dismissUpdate);
   $("issuesPanel").addEventListener("click", toggleIssuesPanel);
@@ -361,25 +382,34 @@ function setupPager() {
     settleTimer = setTimeout(syncHeight, 90);
   });
 
+  // Extracted from the dot click handler so the alerts chip navigates through
+  // the exact same path: resolve by position in the VISIBLE list (hidden pages
+  // take no layout space), smooth-scroll, restyle the dots, re-measure.
+  const goToDot = (dot) => {
+    const visibleIndex = shownDots().indexOf(dot);
+    if (visibleIndex === -1) {
+      return;
+    }
+    const width = pager.clientWidth || 0;
+    if (typeof pager.scrollTo === "function") {
+      pager.scrollTo({ left: width * visibleIndex, behavior: "smooth" });
+    } else {
+      pager.scrollLeft = width * visibleIndex;
+    }
+    setActive(visibleIndex);
+    syncHeight();
+  };
+
   dots.forEach((dot) => {
-    dot.addEventListener("click", () => {
-      // Resolve the target by position in the VISIBLE list, not by its static
-      // array index -- hidden pages take no layout space, so dot 3's page sits
-      // at visible offset 3 only while every page is shown.
-      const visibleIndex = shownDots().indexOf(dot);
-      if (visibleIndex === -1) {
-        return;
-      }
-      const width = pager.clientWidth || 0;
-      if (typeof pager.scrollTo === "function") {
-        pager.scrollTo({ left: width * visibleIndex, behavior: "smooth" });
-      } else {
-        pager.scrollLeft = width * visibleIndex;
-      }
-      setActive(visibleIndex);
-      syncHeight();
-    });
+    dot.addEventListener("click", () => goToDot(dot));
   });
+
+  pagerGoTo = (index) => {
+    const dot = dots[index];
+    if (dot && !dot.hidden) {
+      goToDot(dot);
+    }
+  };
 
   if (landscapeQuery) {
     const onModeChange = () => syncHeight();
@@ -974,6 +1004,7 @@ async function fetchStatus() {
 function renderStatus(status) {
   if (status?.settings && !state.settingsInFlight) {
     applySettings(status.settings);
+    clearSettingsFetchIssue();
   }
   applyControlCapabilities(status?.controls);
   renderAgentVersion(status);
@@ -1431,7 +1462,7 @@ async function fetchSettings(options = {}) {
     }
   } catch (error) {
     if (requestSeq === state.settingsRequestSeq) {
-      renderSettingsError("settings unavailable", error);
+      renderSettingsError("settings unavailable", error, "fetch");
       applySettings(state.settings);
     }
   }
@@ -1462,7 +1493,7 @@ async function updateSettings(update, interaction = "") {
   } catch (error) {
     if (requestSeq === state.settingsRequestSeq) {
       applySettings(previousSettings);
-      renderSettingsError("settings update failed", error);
+      renderSettingsError("settings update failed", error, "update");
       showTransientStatus(error.message ? `Settings failed: ${error.message}` : "Settings failed");
       fetchSettings({ clearIssueOnSuccess: false });
     }
@@ -1724,9 +1755,10 @@ function renderMetricError(error) {
   renderIssuesPanel();
 }
 
-function renderSettingsError(prefix, error) {
+function renderSettingsError(prefix, error, kind) {
   const message = String(error?.message || "").trim();
   state.settingsIssueMessages = [`${prefix}: ${message || "request failed"}`];
+  state.settingsIssueKind = kind;
   renderIssuesPanel();
 }
 
@@ -1749,7 +1781,23 @@ function clearSettingsIssue() {
     return;
   }
   state.settingsIssueMessages = [];
+  state.settingsIssueKind = "";
   renderIssuesPanel();
+}
+
+// clearSettingsFetchIssue retires a *read* failure once some other route has
+// proved the settings path is reachable. fetchSettings runs exactly once, at
+// load, and nothing re-runs it on a timer (a fifth interval would break the
+// verifier's interval inventory), so without this a single load-time race
+// pinned "settings unavailable" for the whole session -- even though
+// /api/status carries the same settings block and renderStatus has been
+// applying it every 60 s since. An "update" failure is NOT cleared here: a POST
+// that did not save is real news, and the status poll says nothing about it.
+function clearSettingsFetchIssue() {
+  if (state.settingsIssueKind !== "fetch") {
+    return;
+  }
+  clearSettingsIssue();
 }
 
 function renderIssuesPanel() {
@@ -1770,10 +1818,7 @@ function renderIssuesPanel() {
   panel.hidden = messages.length === 0;
   // The "more status" page always shows something: the issue list, or an "all
   // clear" placeholder when there is nothing to report.
-  const empty = $("issuesEmpty");
-  if (empty) {
-    empty.hidden = messages.length !== 0;
-  }
+  syncStatusPageEmpty();
   panel.classList.toggle("expanded", state.issuesExpanded);
   panel.setAttribute("aria-expanded", state.issuesExpanded ? "true" : "false");
   panel.setAttribute("aria-label", state.issuesExpanded ? "Collapse issue details" : "Expand issue details");
@@ -1831,6 +1876,9 @@ function renderMetricAlerts(metrics) {
   list.textContent = "";
   if (messages.length === 0) {
     summary.textContent = "--";
+    syncAlertsChip(messages);
+    syncStatusPageEmpty();
+    syncPagerAfterRender();
     return;
   }
 
@@ -1842,6 +1890,9 @@ function renderMetricAlerts(metrics) {
   if (!state.alertsExpanded && messages.length > collapsedIssueLimit) {
     list.append(alertRow(`${messages.length - collapsedIssueLimit} more`));
   }
+  syncAlertsChip(messages);
+  syncStatusPageEmpty();
+  syncPagerAfterRender();
 }
 
 // metricAlertMessages collects the threshold breaches the alerts panel surfaces.
@@ -1979,6 +2030,51 @@ function renderMetricAlertsFromMessages(messages) {
   }
   if (!state.alertsExpanded && messages.length > collapsedIssueLimit) {
     list.append(alertRow(`${messages.length - collapsedIssueLimit} more`));
+  }
+  syncAlertsChip(messages);
+  syncStatusPageEmpty();
+  syncPagerAfterRender();
+}
+
+// showAlertDetails swipes to the page that owns the Alerts panel. No
+// stopPropagation needed: the chip is a sibling of the status strip inside
+// .status-row, not a child of it, so the strip's refresh handler never sees
+// this tap.
+function showAlertDetails() {
+  goToPage(statusPageIndex);
+}
+
+// syncAlertsChip keeps the one globally-visible trace of an alert in sync. The
+// count is the whole point: the panel it links to is a swipe away, so the chip
+// has to say how much is over there.
+function syncAlertsChip(messages) {
+  const chip = $("alertsChip");
+  chip.hidden = messages.length === 0;
+  $("alertsChipCount").textContent = String(messages.length);
+  chip.setAttribute(
+    "aria-label",
+    `${messages.length} alert${messages.length === 1 ? "" : "s"}; show details`,
+  );
+}
+
+// syncStatusPageEmpty shows the "All clear" placeholder only when BOTH lists on
+// the "More status" page are empty. The empty state used to key off the issue
+// list alone, which was correct while alerts lived on the shell chrome; left
+// that way, a host with a hot drive and no collector issues would render
+// "All clear" directly beneath a red alert list.
+function syncStatusPageEmpty() {
+  const empty = $("issuesEmpty");
+  if (empty) {
+    empty.hidden = state.issueMessages.length !== 0 || state.alertMessages.length !== 0;
+  }
+}
+
+// goToPage swipes the pager to a page from outside it (the alerts chip). No-op
+// until setupPager has run / in the layout-less verifier, where pagerGoTo stays
+// null -- so a chip click there must resolve without throwing.
+function goToPage(index) {
+  if (typeof pagerGoTo === "function") {
+    pagerGoTo(index);
   }
 }
 

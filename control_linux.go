@@ -36,7 +36,24 @@ func linuxControlCommands(action ControlAction) [][]string {
 			{"playerctl", "play-pause"},
 		}
 	case ControlLockScreen:
+		// Order matters here in a way it does not for the other actions.
+		// `loginctl lock-session` only emits logind's Lock signal; it exits 0
+		// whenever a session exists, whether or not anything is listening to
+		// actually put a locker on screen. Since Apply stops at the first
+		// command that exits 0, loginctl placed first would silently swallow
+		// every candidate after it -- which is exactly what happened on the
+		// omarchy host, where no hypridle/hyprlock listens for that signal and
+		// the button reported applied:true with the screen still unlocked.
+		// So session-specific lockers that lock directly go first, and the
+		// signal-only generic path stays last (it is still the right answer on
+		// KDE/GNOME, which do listen).
+		//
+		// Only non-blocking lockers belong on this list. hyprlock/swaylock run
+		// in the foreground until the user unlocks, and Apply uses
+		// exec.CommandContext -- the locker would be killed the moment the HTTP
+		// request's context is cancelled. Adding one means detaching it first.
 		return [][]string{
+			{"omarchy-system-lock"},
 			{"loginctl", "lock-session"},
 			{"loginctl", "lock-sessions"},
 		}
