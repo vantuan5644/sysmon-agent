@@ -58,19 +58,30 @@ var (
 	errLhmDaemonEOF            = errors.New("LibreHardwareMonitor daemon process exited")
 )
 
-// Daemon read deadlines and recycling policy. The cold read reuses the one-shot
-// lhmBridgeTimeout (12 s) so the very first read after a (re)start - which still
-// pays Computer.Open() (~2-4 s cold) inside the daemon's startup - has the same
-// headroom as the one-shot fallback. Warm reads drop to a sub-second-ish budget;
-// a single Update() + sensor walk is well under that. Recycling re-Opens after a
-// generous count / age so hot-plugged hardware (USB PSU) is picked up and to
-// shed any long-lived driver/handle drift, without churning cold re-Opens.
+// Daemon read deadlines and recycling policy. The cold read gets its own budget
+// rather than reusing the one-shot lhmBridgeTimeout, because Computer.Open()
+// scales with the hardware present: it is ~2-4 s on a simple host but was
+// measured at 8.6 s on a 4-NVMe box, where enumerating the drives dominates.
+// The cold read pays that Open() plus the daemon's prime pass before it can
+// answer, so it needs headroom the warm path does not.
+//
+// Warm reads are ~0.4 s for the whole sensor walk. The budget is well above
+// that because the daemon also refreshes one drive's SMART temperature on a
+// slow rotation (0.7-2.7 s per drive, see lhm-bridge-daemon.ps1), so the read
+// that carries a drive refresh is legitimately the slowest one. Sizing this to
+// the median walk instead is exactly the bug this replaced: at 3 s every read
+// on that host timed out, the agent killed and respawned the daemon on every
+// sample, and CPU power and temperatures were never reported at all.
+//
+// Recycling re-Opens after a generous count / age so hot-plugged hardware (USB
+// PSU) is picked up and to shed any long-lived driver/handle drift, without
+// churning cold re-Opens.
 //
 // These are package vars (not consts) so unit tests can shorten the deadlines
 // and backoff to run in milliseconds without waiting on real timers.
 var (
-	lhmDaemonColdReadTimeout = lhmBridgeTimeout
-	lhmDaemonWarmReadTimeout = 3 * time.Second
+	lhmDaemonColdReadTimeout = 25 * time.Second
+	lhmDaemonWarmReadTimeout = 6 * time.Second
 	lhmDaemonRestartBackoff  = 2 * time.Second
 	lhmDaemonDisableFailures = 6
 	lhmDaemonRecycleReads    = 240
@@ -199,8 +210,9 @@ func (d *lhmDaemon) read(ctx context.Context) (lhmBridgeResult, error) {
 
 	deadline := lhmDaemonWarmReadTimeout
 	if d.coldRead {
-		// The first read after a (re)start still pays Computer.Open(), which the
-		// daemon performs at its own startup before it reads the request line.
+		// The first read after a (re)start still pays Computer.Open() plus the
+		// prime pass, which the daemon performs at its own startup before it
+		// reads the request line.
 		deadline = lhmDaemonColdReadTimeout
 	}
 	result, err := d.requestLocked(ctx, deadline)
