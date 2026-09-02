@@ -1332,11 +1332,24 @@ func linuxWholeDiskForName(name, classBlockRoot string) string {
 // tree rooted at sysRoot. NVMe drives expose their Composite sensor under
 // <sysRoot>/class/nvme/<controller>/hwmon; other devices (SATA SSD/HDD) may
 // expose one under <sysRoot>/block/<dev>/device/hwmon.
+//
+// A drive in a USB enclosure has neither: the bridge presents it over UAS as a
+// SCSI disk (so it is sdX, not nvmeX) and does not answer the generic SMART
+// query the kernel issues, so no hwmon node appears. That miss gets its own
+// message rather than the generic "no sensor exposed" - it is a property of the
+// bridge, not of the drive, and the same drive reads fine on a direct port.
 func linuxStorageTemperature(diskName, sysRoot string) NumberMetric {
+	blockRoot := filepath.Join(sysRoot, "block")
+	var temperature NumberMetric
 	if controller, ok := nvmeControllerForDisk(diskName); ok {
-		return nvmeStorageTemperature(controller, filepath.Join(sysRoot, "class", "nvme"))
+		temperature = nvmeStorageTemperature(controller, filepath.Join(sysRoot, "class", "nvme"))
+	} else {
+		temperature = blockDeviceStorageTemperature(diskName, blockRoot)
 	}
-	return blockDeviceStorageTemperature(diskName, filepath.Join(sysRoot, "block"))
+	if temperature.Available || !linuxBlockDeviceIsUSB(diskName, blockRoot) {
+		return temperature
+	}
+	return unavailableNumber("C", usbEnclosureTemperatureReason)
 }
 
 // nvmeControllerForDisk maps an NVMe whole-disk name to its controller: nvme0n1
