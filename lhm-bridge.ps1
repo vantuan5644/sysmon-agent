@@ -47,10 +47,33 @@ function New-LhmComputer([bool]$EnablePsu) {
     $computer.IsGpuEnabled = $true
     $computer.IsMotherboardEnabled = $true
     $computer.IsMemoryEnabled = $true
-    # Storage enables NVMe/SATA SMART temperature reads so per-drive storage temps
-    # surface with no Go change (the temperature harvest loop is already generic).
+    # Storage is deliberately DISABLED in the one-shot bridge, and enabled only in
+    # the daemon (lhm-bridge-daemon.ps1).
+    #
+    # The two scripts pay startup very differently. The daemon Opens once and
+    # amortizes it over thousands of reads, so it can afford drive telemetry and
+    # rotates one drive's SMART read per sample. The one-shot pays the ENTIRE
+    # startup on every single call, and storage is the most expensive part of it
+    # twice over: enumerating the drives in Computer.Open() and then a per-drive
+    # SMART health-log ioctl to actually read them.
+    #
+    # Measured on a 4-NVMe host (7950X, ASUS X670E, LHM 0.9.6): Open() was 8.6 s
+    # with storage against 2.3 s without, and the SMART pass a further ~5 s. Whole
+    # one-shot runs, end to end: 28 s originally, 20 s once the drive reads were
+    # taken out of the retry loop, and ~9 s with storage off altogether. Both of
+    # the first two exceed lhmBridgeTimeout, and all three exceed the 8 s
+    # metricsCollectTimeout that bounds a direct collect - so paying for drive
+    # temperatures here does not buy slower drive temperatures, it loses CPU
+    # power, CPU temperature and PSU power entirely, which is what -self-check was
+    # already failing on before this was tracked down.
+    #
+    # This costs per-drive temperatures only while the daemon is unavailable (an
+    # explicit SYSMON_LHM_DAEMON=0, or a daemon that could never start). They
+    # degrade to available:false like any other missing sensor, which is the right
+    # trade for a path whose job is to still answer inside a deadline. The storage
+    # handling below is left intact so flipping this back is a one-line change.
     if ($computer.PSObject.Properties['IsStorageEnabled']) {
-        $computer.IsStorageEnabled = $true
+        $computer.IsStorageEnabled = $false
     }
     $computer.IsPowerMonitorEnabled = $true
     if ($EnablePsu -and $computer.PSObject.Properties['IsPsuEnabled']) {
@@ -69,11 +92,24 @@ function Emit-Error([string]$message) {
 # (thermal trip limits, sensor resolution) rather than a live reading. They are
 # not useful as dashboard temperatures, so filter them out and keep only live
 # temperature channels.
+#
+# 'warning' / 'critical' are the NVMe SMART composite thresholds every drive
+# reports next to its live Composite Temperature (measured: 79-88 C against real
+# drive temps of 29-49 C). They are constants, not readings, and dropping them
+# is not cosmetic: windowsStorageTemperatureForModel takes the FIRST matching
+# sensor for a drive, so on a drive whose Composite reads 0 the next match is
+# the 79 C warning threshold, which would publish a static limit as that drive's
+# live temperature. A latent hazard, not something observed in the field - see
+# lhm-bridge-daemon.ps1 for why the one 0-Composite drive here is spared. Kept
+# identical to lhm-bridge-daemon.ps1.
 function Test-LiveTemperature([string]$sensorName) {
     if (-not $sensorName) { return $true }
     $n = $sensorName.ToLower()
     if ($n -match 'limit') { return $false }
     if ($n -match 'resolution') { return $false }
+    if ($n -match 'warning') { return $false }
+    if ($n -match 'critical') { return $false }
+    if ($n -match 'threshold') { return $false }
     return $true
 }
 
@@ -123,6 +159,13 @@ function Select-PsuOutputPower($sensors) {
 # which exposes its own Power and 'Core' Clock sensors and would otherwise be
 # mistaken for the CPU when it enumerates first. The regex stays as the fallback
 # for any build that does not surface HardwareType.
+# True for a storage hardware node. Its Update() is the only one in the walk
+# that costs seconds rather than milliseconds (a per-drive SMART health-log
+# ioctl), so it is read out of band. Kept identical to lhm-bridge-daemon.ps1.
+function Test-StorageNode($hw) {
+    return ($hw.HardwareType -and $hw.HardwareType.ToString() -eq 'Storage')
+}
+
 function Test-CpuNode($hw) {
     if ($hw.HardwareType) { return ($hw.HardwareType.ToString() -eq 'Cpu') }
     return ($hw.Name -match 'Ryzen|Intel|AMD|EPYC|Xeon|Core')
@@ -194,13 +237,40 @@ try {
     # Prime the sensors before reading. The first reading after Open()
     # frequently returns stale or zero values while the kernel driver warms
     # up, so poll every hardware (and subhardware) once and let it settle.
+    #
+    # Storage is deliberately excluded from the prime and from the retry loop
+    # below, and read exactly once instead. A storage node's Update() issues a
+    # SMART health-log ioctl costing 0.7-2.7 s per drive, so on a 4-NVMe host
+    # priming plus three settle passes spent ~20 s on drive temperatures alone
+    # and pushed the whole one-shot past the agent's lhmBridgeTimeout, losing
+    # CPU power and every temperature with it. Drive temps do not change between
+    # settle passes anyway - only the CPU sensors the retry exists to settle do.
+    $storageNodes = New-Object System.Collections.Generic.List[object]
     foreach ($hw in $computer.Hardware) {
+        if (Test-StorageNode $hw) {
+            $storageNodes.Add($hw)
+            continue
+        }
         try { $hw.Update() } catch {}
         foreach ($sub in $hw.SubHardware) {
             try { $sub.Update() } catch {}
         }
     }
     Start-Sleep -Milliseconds 400
+
+    # Single SMART pass for drive temperatures, kept out of the retry loop.
+    $storageTemperatures = New-Object System.Collections.Generic.List[object]
+    foreach ($hw in $storageNodes) {
+        try { $hw.Update() } catch {}
+        foreach ($s in @($hw.Sensors)) {
+            if ($s.SensorType -eq 'Temperature' -and $s.Value -ne $null) {
+                $temp = [double]$s.Value
+                if ((Test-PlausibleTemperature $temp) -and (Test-LiveTemperature $s.Name)) {
+                    $storageTemperatures.Add(@{ name = ($hw.Name + ' ' + $s.Name).Trim(); value = [math]::Round($temp, 2) })
+                }
+            }
+        }
+    }
 
     $cpuPackagePower = $null
     $cpuCorePower = $null
@@ -227,6 +297,7 @@ try {
         $psuOutputPower = $null
         $temperatures.Clear()
         foreach ($hw in $computer.Hardware) {
+            if (Test-StorageNode $hw) { continue }
             try { $hw.Update() } catch {}
             $sensors = @($hw.Sensors)
             # First CPU node that reports package power wins. The per-rail
@@ -328,11 +399,12 @@ try {
         }
         # Accept the reading once CPU package power is live and the sensor
         # population looks complete; otherwise settle briefly and retry.
-        if ($cpuPackagePower -and $cpuPackagePower -gt 0 -and $temperatures.Count -ge 8) {
+        if ($cpuPackagePower -and $cpuPackagePower -gt 0 -and ($temperatures.Count + $storageTemperatures.Count) -ge 8) {
             break
         }
         if ($attempt -lt 3) { Start-Sleep -Milliseconds 300 }
     }
+    foreach ($entry in $storageTemperatures) { $temperatures.Add($entry) }
     $computer.Close()
 
     $result = @{

@@ -524,3 +524,22 @@ func waitUntilBackoffElapsed(t *testing.T) {
 	t.Helper()
 	time.Sleep(lhmDaemonRestartBackoff + 5*time.Millisecond)
 }
+
+// TestLhmDaemonDeadlinesCoverTheMeasuredReadCost keeps the Go-side budgets above
+// what the daemon actually costs on a many-drive host. The warm read must clear
+// a read that carries a drive refresh (~0.5 s walk + up to 2.7 s for one drive),
+// and the cold read must clear Computer.Open() (measured 8.6 s with four NVMe
+// drives) plus the prime pass and first read (measured ~11 s end to end).
+//
+// Sizing the warm budget to the median walk instead is the bug this replaced.
+func TestLhmDaemonDeadlinesCoverTheMeasuredReadCost(t *testing.T) {
+	if lhmDaemonWarmReadTimeout < 5*time.Second {
+		t.Errorf("lhmDaemonWarmReadTimeout = %s, too tight for a read carrying a drive refresh (~0.5 s walk + up to 2.7 s for one drive)", lhmDaemonWarmReadTimeout)
+	}
+	if lhmDaemonColdReadTimeout < 20*time.Second {
+		t.Errorf("lhmDaemonColdReadTimeout = %s, too tight for Computer.Open() on a many-drive host (measured ~11 s to the first response)", lhmDaemonColdReadTimeout)
+	}
+	if lhmBridgeTimeout < 15*time.Second {
+		t.Errorf("lhmBridgeTimeout = %s, too tight for a one-shot run on a many-drive host (Open() alone measured 8.6 s)", lhmBridgeTimeout)
+	}
+}
