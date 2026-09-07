@@ -571,3 +571,47 @@ func TestWindowsClockMHz(t *testing.T) {
 		}
 	}
 }
+
+// TestWindowsStorageTemperatureExplainsAUSBEnclosure covers the drive that
+// prompted this: PhysicalDrive3 on BBLWIN is a WD SN550 inside a ROG ESD-S1CL
+// USB enclosure. Windows names it after the enclosure and LHM after the drive
+// inside, so the model match never connects them - and matching by index would
+// not help either, because LHM reports that drive's Composite Temperature as 0.
+// The reading stays unavailable; it just has to say why.
+func TestWindowsStorageTemperatureExplainsAUSBEnclosure(t *testing.T) {
+	bridge := lhmBridgeResult{
+		Available: true,
+		Temperatures: []lhmBridgeTemp{
+			{Name: "WDC WDS100T2B0C-00PXH0 Temperature", Value: 0},
+			{Name: "Samsung SSD 990 PRO 2TB Temperature", Value: 42},
+		},
+	}
+
+	got := windowsStorageTemperatureForModel("ROG ESD-S1CL", storageBusTypeUSB, bridge, nil)
+	if got.Available {
+		t.Fatalf("USB enclosure reported a temperature: %+v", got)
+	}
+	if got.Error != usbEnclosureTemperatureReason {
+		t.Fatalf("error = %q, want %q", got.Error, usbEnclosureTemperatureReason)
+	}
+
+	// An internal drive that misses is genuinely unexplained - do not blame a
+	// bridge it does not have. 17 is the NVMe BusType.
+	internal := windowsStorageTemperatureForModel("Crucial T705 4TB", 17, bridge, nil)
+	if internal.Error == usbEnclosureTemperatureReason {
+		t.Fatalf("internal NVMe blamed on a USB enclosure: %+v", internal)
+	}
+
+	// A USB drive LHM *can* read still reports the reading, not the excuse.
+	matched := windowsStorageTemperatureForModel("Samsung SSD 990 PRO 2TB", storageBusTypeUSB, bridge, nil)
+	if !matched.Available || matched.Value != 42 {
+		t.Fatalf("matched USB drive = %+v, want 42C", matched)
+	}
+
+	// A dead bridge keeps its own message: that is a transport failure, not a
+	// diagnosis of the enclosure.
+	down := windowsStorageTemperatureForModel("ROG ESD-S1CL", storageBusTypeUSB, lhmBridgeResult{}, nil)
+	if down.Error == usbEnclosureTemperatureReason {
+		t.Fatalf("bridge-down miss reported as a USB enclosure limit: %+v", down)
+	}
+}

@@ -784,3 +784,86 @@ func TestNvmeStorageTemperatureFallsBackToFirstSensor(t *testing.T) {
 		t.Fatalf("fallback temperature = %+v, want 52C", got)
 	}
 }
+
+// TestLinuxStorageTemperatureExplainsAUSBEnclosure covers the drive that
+// prompted this: an NVMe SSD in a USB enclosure enumerates over UAS as sdX with
+// no hwmon node, because the bridge does not answer the generic SMART query. The
+// reading stays unavailable - we cannot read it without a vendor passthrough -
+// but it must say why, rather than looking like a broken sensor.
+func TestLinuxStorageTemperatureExplainsAUSBEnclosure(t *testing.T) {
+	root := t.TempDir()
+	blockRoot := filepath.Join(root, "block")
+	if err := os.MkdirAll(blockRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	usbPath := "../devices/pci0000:00/0000:00:14.0/usb2/2-4/2-4:1.0/host6/target6:0:0/6:0:0:0/block/sdb"
+	if err := os.Symlink(usbPath, filepath.Join(blockRoot, "sdb")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := linuxStorageTemperature("sdb", root)
+	if got.Available {
+		t.Fatalf("USB enclosure reported a temperature: %+v", got)
+	}
+	if got.Error != usbEnclosureTemperatureReason {
+		t.Fatalf("error = %q, want %q", got.Error, usbEnclosureTemperatureReason)
+	}
+	if got.Unit != "C" {
+		t.Fatalf("unit = %q, want C", got.Unit)
+	}
+}
+
+// TestLinuxStorageTemperatureKeepsGenericMissForInternalDrives is the other half:
+// a directly attached drive with no sensor must NOT be blamed on a bridge it
+// does not have.
+func TestLinuxStorageTemperatureKeepsGenericMissForInternalDrives(t *testing.T) {
+	root := t.TempDir()
+	blockRoot := filepath.Join(root, "block")
+	if err := os.MkdirAll(blockRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sataPath := "../devices/pci0000:00/0000:00:17.0/ata3/host2/target2:0:0/2:0:0:0/block/sda"
+	if err := os.Symlink(sataPath, filepath.Join(blockRoot, "sda")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := linuxStorageTemperature("sda", root)
+	if got.Available {
+		t.Fatalf("empty sysfs reported a temperature: %+v", got)
+	}
+	if got.Error == usbEnclosureTemperatureReason {
+		t.Fatalf("SATA drive blamed on a USB enclosure: %+v", got)
+	}
+	if got.Error == "" {
+		t.Fatalf("missing sensor reported without an explanation: %+v", got)
+	}
+}
+
+// TestLinuxStorageTemperaturePrefersARealReadingOverTheUSBExplanation: an
+// enclosure that DOES publish an hwmon node (some SATA bridges do) must report
+// the temperature, not the excuse.
+func TestLinuxStorageTemperaturePrefersARealReadingOverTheUSBExplanation(t *testing.T) {
+	// Faithful to real sysfs: /sys/block/<dev> IS the symlink into the device
+	// tree, so the hwmon glob has to resolve through it.
+	root := t.TempDir()
+	blockRoot := filepath.Join(root, "block")
+	usbPath := "../devices/pci0000:00/0000:00:14.0/usb2/2-4/2-4:1.0/host6/target6:0:0/6:0:0:0/block/sdc"
+	hwmon := filepath.Join(blockRoot, filepath.FromSlash(usbPath), "device", "hwmon", "hwmon5")
+	if err := writeTestFile(filepath.Join(hwmon, "temp1_input"), "38000\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(blockRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(usbPath, filepath.Join(blockRoot, "sdc")); err != nil {
+		t.Fatal(err)
+	}
+	if !linuxBlockDeviceIsUSB("sdc", blockRoot) {
+		t.Fatal("fixture is not recognized as USB-attached; the test would prove nothing")
+	}
+
+	got := linuxStorageTemperature("sdc", root)
+	if !got.Available || got.Value != 38 {
+		t.Fatalf("hwmon reading = %+v, want 38C", got)
+	}
+}

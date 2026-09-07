@@ -457,6 +457,10 @@ type windowsPhysicalDisk struct {
 	UsedBytes   uint64   `json:"used_bytes"`
 	TotalBytes  uint64   `json:"total_bytes"`
 	Mountpoints []string `json:"mountpoints"`
+	// BusType is the MSFT_PhysicalDisk BusType enumeration. It is carried only
+	// to explain a missing temperature (see storageTemperatureUnavailableReason)
+	// - a USB-attached drive has no readable one through the generic path.
+	BusType uint16 `json:"bus_type"`
 }
 
 // windowsStorage builds the per-physical-drive storage set on Windows. Capacity
@@ -482,7 +486,7 @@ func windowsStorage(ctx context.Context, bridge lhmBridgeResult, bridgeErr error
 		`if($l){ $v=Get-Volume -DriveLetter $l -ErrorAction SilentlyContinue; ` +
 		`if($v -and $v.Size -gt 0){ $u+=[uint64]$v.Size-[uint64]$v.SizeRemaining; $t+=[uint64]$v.Size; $m+=($l.ToString()+':') } } ` +
 		`} ` +
-		`[ordered]@{name=('PhysicalDrive'+$d.DeviceId);model=($d.FriendlyName);size_bytes=([uint64]$d.Size);used_bytes=$u;total_bytes=$t;mountpoints=$m} ` +
+		`[ordered]@{name=('PhysicalDrive'+$d.DeviceId);model=($d.FriendlyName);size_bytes=([uint64]$d.Size);used_bytes=$u;total_bytes=$t;mountpoints=$m;bus_type=([uint16]$d.BusType)} ` +
 		`}`
 	var rows []windowsPhysicalDisk
 	if err := runPowerShellJSONArray(ctx, script, &rows); err != nil {
@@ -505,7 +509,7 @@ func windowsStorage(ctx context.Context, bridge lhmBridgeResult, bridgeErr error
 			SizeBytes:   row.SizeBytes,
 			Mountpoints: row.Mountpoints,
 			Capacity:    capacity,
-			Temperature: windowsStorageTemperatureForModel(row.Model, bridge, bridgeErr),
+			Temperature: windowsStorageTemperatureForModel(row.Model, row.BusType, bridge, bridgeErr),
 		})
 	}
 	sort.Slice(devices, func(i, j int) bool { return devices[i].Name < devices[j].Name })
@@ -517,13 +521,23 @@ func windowsStorage(ctx context.Context, bridge lhmBridgeResult, bridgeErr error
 // sensors "<FriendlyName> Temperature", so a case-insensitive substring match
 // on the model is specific enough (no CPU/GPU/board temp carries a drive model).
 // Returns unavailable (never an error) when the bridge is down or no match.
-func windowsStorageTemperatureForModel(model string, bridge lhmBridgeResult, bridgeErr error) NumberMetric {
+//
+// busType only selects the explanation for a miss. A USB-attached drive misses
+// for a reason we have diagnosed and cannot fix from here, and it misses twice
+// over: Windows names it after the enclosure while LHM names the drive inside
+// (measured on BBLWIN: "ROG ESD-S1CL" vs "WDC WDS100T2B0C-00PXH0"), so the model
+// match cannot connect them - and even matched by index there is nothing to
+// read, because LHM reports that drive's Composite Temperature as 0. Matching by
+// index instead would therefore buy no reading and cost a hazard: the next
+// name-matched sensor on a 0-Composite drive is its static 79 C warning
+// threshold. See usbEnclosureTemperatureReason.
+func windowsStorageTemperatureForModel(model string, busType uint16, bridge lhmBridgeResult, bridgeErr error) NumberMetric {
 	if bridgeErr != nil || !bridge.Available {
 		return unavailableNumber("C", "storage temperature unavailable")
 	}
 	needle := strings.ToLower(strings.TrimSpace(model))
 	if needle == "" {
-		return unavailableNumber("C", "no storage temperature sensor reported")
+		return unavailableNumber("C", storageTemperatureUnavailableReason(busType))
 	}
 	for _, temp := range bridge.Temperatures {
 		name := strings.ToLower(temp.Name)
@@ -535,7 +549,7 @@ func windowsStorageTemperatureForModel(model string, bridge lhmBridgeResult, bri
 		}
 		return availableNumber(temp.Value, "C")
 	}
-	return unavailableNumber("C", "no storage temperature sensor reported")
+	return unavailableNumber("C", storageTemperatureUnavailableReason(busType))
 }
 
 // windowsNetwork builds the per-interface throughput set and attaches the
@@ -1060,23 +1074,26 @@ func lhmTemperatureMetrics(temps []lhmBridgeTemp, existing []TemperatureMetric) 
 // driver is never opened twice at once.
 const lhmBridgeCacheTTL = 500 * time.Millisecond
 
-// lhmBridgeTimeout bounds the one-shot bridge invocation (runLhmBridge) and the
-// daemon's cold first read after a (re)start - both still pay Computer.Open()
-// up front, which loads the ring0 driver and enumerates the SuperIO/SMBus/PSU/
-// CPU/GPU/memory sensors. One one-shot run is intrinsically slow: spawn pwsh,
-// load LibreHardwareMonitorLib.dll, Open(), then a 400 ms sensor-prime settle.
-// Measured warm cost is ~4-5 s and the very first call after boot (cold driver
-// load) is slower still, which is why the rest of the agent already budgets 8 s
-// for a cold sample (metricsCollectTimeout). The previous 5 s ceiling sat right
-// on top of the warm cost, so under the LocalSystem service it was routinely
-// exceeded; Go's CommandContext kills a timed-out child with
-// TerminateProcess(handle, 1), so the kill surfaced as a bare "exit status 1"
-// with no stdout/stderr and took CPU power, CPU/board temperatures and PSU
-// output power down together. 12 s gives the warm (~5 s) and cold (~8 s) cases
-// comfortable headroom. Steady-state daemon reads use the much shorter
-// lhmDaemonWarmReadTimeout instead; this constant only bounds the cold first
-// read / one-shot fallback path.
-const lhmBridgeTimeout = 12 * time.Second
+// lhmBridgeTimeout bounds the one-shot bridge invocation (runLhmBridge). One
+// one-shot run is intrinsically slow: spawn pwsh, load
+// LibreHardwareMonitorLib.dll, Computer.Open() (which loads the ring0 driver and
+// enumerates the SuperIO/SMBus/PSU/CPU/GPU/memory/storage sensors), a 400 ms
+// sensor-prime settle, one SMART pass for drive temperatures, then up to three
+// settle passes. Measured warm cost is ~4-5 s on a simple host, but Open() alone
+// was 8.6 s on a 4-NVMe box where drive enumeration dominates, and the first
+// call after boot pays a cold driver load on top.
+//
+// The previous 5 s ceiling sat right on top of the warm cost, so under the
+// LocalSystem service it was routinely exceeded; Go's CommandContext kills a
+// timed-out child with TerminateProcess(handle, 1), so the kill surfaced as a
+// bare "exit status 1" with no stdout/stderr and took CPU power, CPU/board
+// temperatures and PSU output power down together. 12 s then covered the simple
+// host but not the many-drive one, where the same symptom returned. 20 s clears
+// the measured worst case with headroom.
+//
+// Steady-state daemon reads use lhmDaemonWarmReadTimeout and its cold first read
+// uses lhmDaemonColdReadTimeout; this constant bounds only the one-shot path.
+const lhmBridgeTimeout = 20 * time.Second
 
 // fetchLhmBridge returns the shared LibreHardwareMonitor payload for a metrics
 // refresh, at most once per cache window. When the persistent daemon is enabled
