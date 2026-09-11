@@ -155,15 +155,46 @@
           <div id="processesBody" class="processes-body" role="rowgroup"></div>
         </section>
       </section>
-      <section class="page" id="quotaPage" aria-label="Claude quota" hidden>
+      <section class="page" id="quotaPage" aria-label="AI usage" hidden>
         <section id="quotaPanel" class="panel quota-panel">
           <div class="section-head">
-            <h2>Claude quota</h2>
-            <span id="quotaSummary" class="muted">--</span>
+            <h2>AI usage</h2>
+            <span id="aiUsageSummary" class="muted">--</span>
           </div>
-          <div id="quotaList" class="rows"></div>
-          <p id="quotaEmpty" class="quota-empty muted" aria-live="polite" hidden>No quota data yet -- run a Claude Code session</p>
-          <div id="quotaFooter" class="quota-footer muted">--</div>
+          <div class="usage-providers">
+            <section id="claudeUsage" class="usage-provider" aria-label="Claude usage" hidden>
+              <div class="usage-provider-head">
+                <h3>Claude</h3>
+                <span id="quotaSummary" class="muted">--</span>
+              </div>
+              <div id="quotaList" class="rows"></div>
+              <p id="quotaEmpty" class="quota-empty muted" aria-live="polite" hidden>No quota data yet -- run a Claude Code session</p>
+              <div id="quotaFooter" class="quota-footer muted">--</div>
+              <div class="token-chart-block">
+                <div class="token-chart-head">
+                  <span>Tokens · 7 days</span>
+                  <span id="claudeTokenTotal" class="muted">--</span>
+                </div>
+                <div id="claudeTokenChart" class="token-chart" role="group" aria-label="Claude token usage for the last seven days"></div>
+              </div>
+            </section>
+            <section id="codexUsage" class="usage-provider" aria-label="Codex usage" hidden>
+              <div class="usage-provider-head">
+                <h3>Codex</h3>
+                <span id="codexQuotaSummary" class="muted">--</span>
+              </div>
+              <div id="codexQuotaList" class="rows"></div>
+              <p id="codexQuotaEmpty" class="quota-empty muted" aria-live="polite" hidden>No quota window reported</p>
+              <div id="codexQuotaFooter" class="quota-footer muted">--</div>
+              <div class="token-chart-block">
+                <div class="token-chart-head">
+                  <span>Tokens · 7 days</span>
+                  <span id="codexTokenTotal" class="muted">--</span>
+                </div>
+                <div id="codexTokenChart" class="token-chart" role="group" aria-label="Codex token usage for the last seven days"></div>
+              </div>
+            </section>
+          </div>
         </section>
       </section>
     </div>
@@ -172,7 +203,7 @@
       <button id="pageDot0" class="page-dot active" type="button" aria-label="Live metrics" aria-current="true"></button>
       <button id="pageDot1" class="page-dot" type="button" aria-label="More status" aria-current="false"></button>
       <button id="pageDot2" class="page-dot" type="button" aria-label="App details" aria-current="false"></button>
-      <button id="pageDot3" class="page-dot" type="button" aria-label="Claude quota" aria-current="false" hidden></button>
+      <button id="pageDot3" class="page-dot" type="button" aria-label="AI usage" aria-current="false" hidden></button>
     </nav>
 
     <footer class="bottom-controls" aria-label="Host controls">

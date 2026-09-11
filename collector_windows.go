@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -53,6 +52,7 @@ type systemCollector struct {
 	gpuFallbackMu     sync.Mutex
 	gpuFallback       GPUSet
 	gpuFallbackCached bool
+	nvidiaMu          sync.Mutex
 	lhmMu             sync.Mutex
 	lhmBridgeCached   bool
 	lhmBridgeResult   lhmBridgeResult
@@ -82,6 +82,27 @@ type systemCollector struct {
 	hardwareOnce sync.Once
 	cpuName      string
 	memoryName   string
+	// clockBase is static firmware identity. Resolving it once keeps the
+	// Win32_Processor CIM query off every active slow pass.
+	clockBaseOnce sync.Once
+	clockBase     NumberMetric
+	clockBaseMHz  float64
+	clockBaseOK   bool
+	// Slow-changing CIM/CLI values have independent refresh times so live
+	// counters can remain responsive without starting interpreters each pass.
+	swapCached         CapacityMetric
+	swapCachedAt       time.Time
+	storageRows        []windowsPhysicalDisk
+	storageRowsErr     error
+	storageRowsAt      time.Time
+	tailscaleCached    TailscaleStatus
+	tailscaleAt        time.Time
+	gpuCached          GPUSet
+	gpuCachedAt        time.Time
+	processGPUMemory   map[int]int64
+	processGPUMemoryAt time.Time
+	acpiSensors        []TemperatureMetric
+	acpiSensorsAt      time.Time
 	// uplink caches the active default-route identity (Wi-Fi SSID / wired link)
 	// behind uplinkCacheTTL so the slow lane does not spawn Get-NetRoute/netsh
 	// every pass. Guarded by mu.
@@ -100,13 +121,16 @@ type netCounter struct {
 	txBytes uint64
 }
 
-// procSample holds the previous cumulative TotalProcessorTime (seconds) for one
-// PID so the slow lane can derive per-process CPU% as a delta between passes.
-// Disk I/O on Windows comes straight from the Get-Counter rate counter (no
-// delta needed), so no disk counters are stored here.
+// procSample holds the previous native cumulative counters for one PID. The
+// creation timestamp distinguishes a reused PID from the process sampled on the
+// preceding pass.
 type procSample struct {
 	cpuSeconds float64
 	ts         time.Time
+	created    uint64
+	diskRead   uint64
+	diskWrite  uint64
+	diskAvail  bool
 }
 
 func NewSystemCollector() MetricsCollector {
@@ -181,7 +205,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	var processes ProcessSet
 
 	collectMetricAsync(&wg, &cpu, func() NumberMetric {
-		return windowsCPU(ctx)
+		return c.windowsCPUFast(ctx)
 	}, func(recovered any) NumberMetric {
 		return unavailableNumber("%", fmt.Sprintf("Windows CPU collector panicked: %v", recovered))
 	})
@@ -216,12 +240,12 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return degradedCPUClockSet(fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &memory, func() CapacityMetric {
-		return windowsMemory(ctx)
+		return windowsMemoryFast()
 	}, func(recovered any) CapacityMetric {
 		return unavailableCapacity(fmt.Sprintf("Windows memory collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &swap, func() CapacityMetric {
-		return windowsSwap(ctx)
+		return c.cachedWindowsSwap(ctx)
 	}, func(recovered any) CapacityMetric {
 		return unavailableCapacity(fmt.Sprintf("Windows swap collector panicked: %v", recovered))
 	})
@@ -231,7 +255,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return unavailableDisk(fmt.Sprintf("Windows disk collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &storage, func() StorageSet {
-		return windowsStorage(ctx, bridgeResult, bridgeErr)
+		return c.cachedWindowsStorage(ctx, bridgeResult, bridgeErr)
 	}, func(recovered any) StorageSet {
 		return unavailableStorage(fmt.Sprintf("Windows storage collector panicked: %v", recovered))
 	})
@@ -241,17 +265,17 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return NetworkSet{Available: false, Error: fmt.Sprintf("Windows network collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &temperatures, func() TemperatureSet {
-		return windowsTemperaturesFromBridge(ctx, bridgeResult, bridgeErr)
+		return c.windowsTemperaturesFromBridge(ctx, bridgeResult, bridgeErr)
 	}, func(recovered any) TemperatureSet {
 		return TemperatureSet{Available: false, Error: fmt.Sprintf("Windows temperature collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &gpu, func() GPUSet {
-		return c.windowsGPU(ctx)
+		return c.cachedWindowsGPU(ctx)
 	}, func(recovered any) GPUSet {
 		return GPUSet{Available: false, Error: fmt.Sprintf("Windows GPU collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &tailscale, func() TailscaleStatus {
-		return readTailscaleStatus(ctx)
+		return c.cachedTailscaleStatus(ctx)
 	}, func(recovered any) TailscaleStatus {
 		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Windows Tailscale collector panicked: %v", recovered)}
 	})
@@ -295,24 +319,13 @@ func windowsPlatform(ctx context.Context) string {
 	return strings.TrimSpace(result.Caption + " " + result.Version)
 }
 
-func windowsCPU(ctx context.Context) NumberMetric {
-	var result struct {
-		Average *float64
-	}
-	err := runPowerShellJSON(ctx, `Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object Average`, &result)
-	if err != nil {
-		return unavailableNumber("%", err.Error())
-	}
-	return windowsCPULoadMetric(result.Average)
-}
-
 // windowsCPUClockSet resolves the full clock set. The live clocks come from the
 // LibreHardwareMonitor bridge when available, because
 // Win32_Processor.CurrentClockSpeed is NOT a live frequency: Windows refreshes
 // it rarely (often only at boot) and many systems just echo the rated speed, so
 // it pins at a constant value and never reflects idle/boost. LHM reads the
-// per-core MSRs each sample, so it tracks the real frequency, and WMI
-// CurrentClockSpeed is the fallback on hosts without it.
+// per-core MSRs each sample, so it tracks the real frequency. Without LHM the
+// live fields degrade rather than presenting the static WMI value as live.
 //
 // Win32_Processor.MaxClockSpeed is the rated BASE clock on modern CPUs (4500 on
 // a 7950X), not the turbo ceiling, so it is reported as Base. Windows exposes no
@@ -320,27 +333,12 @@ func windowsCPU(ctx context.Context) NumberMetric {
 // unlike Linux, which has cpufreq's (over-optimistic) cpuinfo_max_freq. Max is
 // the peak-hold ceiling, ratcheted from the per-core peak.
 func (c *systemCollector) windowsCPUClockSet(ctx context.Context, bridge lhmBridgeResult, bridgeErr error) cpuClockSet {
-	var result struct {
-		CurrentClockSpeed *float64
-		MaxClockSpeed     *float64
-	}
-	err := runPowerShellJSON(ctx, `Get-CimInstance Win32_Processor | Select-Object -First 1 CurrentClockSpeed,MaxClockSpeed`, &result)
+	base, baseMHz, baseOK := c.resolveWindowsClockBase(ctx)
 
-	var base NumberMetric
-	var baseMHz float64
-	var baseOK bool
-	if err != nil {
-		base = unavailableNumber("MHz", err.Error())
-	} else if value, ok := windowsClockMHz(result.MaxClockSpeed); ok {
-		baseMHz, baseOK = value, true
-		base = availableNumber(value, "MHz")
-	} else {
-		base = unavailableNumber("MHz", "Win32_Processor did not report MaxClockSpeed")
-	}
-
-	// Resolve the live current clock: prefer the LibreHardwareMonitor core clock,
-	// fall back to the (static) WMI CurrentClockSpeed.
-	var current NumberMetric
+	// Win32_Processor.CurrentClockSpeed is static on modern systems and is not a
+	// truthful live fallback. Keep the field explicitly unavailable when LHM is
+	// absent instead of launching CIM repeatedly for that constant value.
+	current := unavailableNumber("MHz", "install LibreHardwareMonitor for live CPU clock")
 	peakCore := unavailableNumber("MHz", "LibreHardwareMonitor did not report per-core CPU clocks")
 	if bridgeErr == nil && bridge.Available {
 		if metric := lhmClockMetric(bridge.CPUClock); metric.Available {
@@ -350,16 +348,6 @@ func (c *systemCollector) windowsCPUClockSet(ctx context.Context, bridge lhmBrid
 			peakCore = metric
 		}
 	}
-	if !current.Available {
-		if err != nil {
-			current = unavailableNumber("MHz", err.Error())
-		} else if value, ok := windowsClockMHz(result.CurrentClockSpeed); ok {
-			current = availableNumber(value, "MHz")
-		} else {
-			current = unavailableNumber("MHz", "Win32_Processor CurrentClockSpeed is not a live frequency; install LibreHardwareMonitor for live CPU clock")
-		}
-	}
-
 	return cpuClockSet{
 		Current:  current,
 		PeakCore: peakCore,
@@ -376,23 +364,11 @@ func windowsClockMHz(value *float64) (float64, bool) {
 	return *value, true
 }
 
-func windowsMemory(ctx context.Context) CapacityMetric {
-	var result struct {
-		TotalVisibleMemorySize uint64
-		FreePhysicalMemory     uint64
-	}
-	err := runPowerShellJSON(ctx, `Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory`, &result)
-	if err != nil {
-		return unavailableCapacity(err.Error())
-	}
-	return windowsMemoryCapacity(result.TotalVisibleMemorySize, result.FreePhysicalMemory)
-}
-
 // windowsSwap reports pagefile (the Windows analog of swap) usage from
 // Win32_PageFileUsage, summing AllocatedBaseSize/CurrentUsage (MiB) across all
 // page files. A host with no page file reports unavailable so the dashboard
-// shows a graceful "no swap". It runs on the slow lane because it spawns a
-// PowerShell/CIM query.
+// shows a graceful "no swap". cachedWindowsSwap bounds its PowerShell/CIM
+// refresh because this value does not need the slow lane's full cadence.
 func windowsSwap(ctx context.Context) CapacityMetric {
 	var rows []struct {
 		AllocatedBaseSize uint64
@@ -417,35 +393,6 @@ func windowsSwap(ctx context.Context) CapacityMetric {
 	return availableCapacity(current*mib, allocated*mib)
 }
 
-func windowsDisks(ctx context.Context) []DiskMetric {
-	var rows []struct {
-		DeviceID   string
-		VolumeName string
-		FileSystem string
-		Size       uint64
-		FreeSpace  uint64
-	}
-	err := runPowerShellJSONArray(ctx, `Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | Select-Object DeviceID,VolumeName,FileSystem,Size,FreeSpace`, &rows)
-	if err != nil {
-		return unavailableDisk(err.Error())
-	}
-	disks := make([]DiskMetric, 0, len(rows))
-	for _, row := range rows {
-		name := row.DeviceID
-		if row.VolumeName != "" {
-			name = fmt.Sprintf("%s %s", row.DeviceID, row.VolumeName)
-		}
-		disks = append(disks, DiskMetric{
-			Name:       name,
-			Mountpoint: row.DeviceID,
-			FSType:     strings.ToLower(row.FileSystem),
-			Capacity:   availableCapacityFromTotalFree(row.Size, row.FreeSpace, "invalid Windows disk capacity counters"),
-		})
-	}
-	sort.Slice(disks, func(i, j int) bool { return disks[i].Mountpoint < disks[j].Mountpoint })
-	return ensureDiskMetrics(disks, "no fixed disks found")
-}
-
 // windowsPhysicalDisk is the JSON shape emitted by the MSFT_PhysicalDisk +
 // MSFT_Partition/MSFT_Volume join below: one entry per physical drive with its
 // model, physical size, and aggregated used/total over the drive-lettered
@@ -463,35 +410,66 @@ type windowsPhysicalDisk struct {
 	BusType uint16 `json:"bus_type"`
 }
 
+// windowsStorageScript joins physical disks to their drive-lettered volumes and
+// aggregates capacity. -ErrorAction Stop on the CIM queries makes a missing
+// namespace / cmdlet surface as a non-zero exit, which runPowerShellJSONArray
+// turns into a Go error so the whole set degrades cleanly.
+//
+// BusType is read through $d.CimInstanceProperties, never as $d.BusType, and
+// that is load-bearing rather than stylistic. The first Get-Volume in the loop
+// autoloads the Storage module, whose types.ps1xml re-projects BusType on every
+// already-materialized MSFT_PhysicalDisk as a friendly *string* ("NVMe", "File
+// Backed Virtual"). [uint16] on that string throws, and because it throws while
+// evaluating the hashtable the statement emits nothing - so the disk vanishes
+// from the array while PowerShell still exits 0 with valid JSON for the
+// survivors, which runPowerShell reads as success. Measured on BBLWIN: only the
+// one drive iterated before the module loaded (the offline one, with no drive
+// letters to make Get-Volume run) survived; the second NVMe and the virtual disk
+// were silently dropped and the dashboard showed a single SSD.
+// CimInstanceProperties reads the raw CIM property bag, which the type adapter
+// cannot reach, so the value is UInt16 whether or not the module is loaded. The
+// try/catch is the second belt: an unreadable bus type degrades to 0 (Unknown)
+// per the per-field degradation invariant, and can never again delete a whole
+// drive. TestWindowsStorageScriptEmitsEveryPhysicalDisk guards both halves.
+const windowsStorageScript = `$ns='root/Microsoft/Windows/Storage'; ` +
+	`$disks=@(Get-CimInstance -Namespace $ns -ClassName MSFT_PhysicalDisk -ErrorAction Stop); ` +
+	`$parts=@(Get-CimInstance -Namespace $ns -ClassName MSFT_Partition -ErrorAction Stop); ` +
+	`foreach ($d in $disks) { ` +
+	`$dp=@($parts | Where-Object { [uint32]$_.DiskNumber -eq [uint32]$d.DeviceId }); ` +
+	`$u=[uint64]0; $t=[uint64]0; $m=@(); ` +
+	`foreach ($p in $dp) { ` +
+	`$l=$p.DriveLetter; ` +
+	`if($l){ $v=Get-Volume -DriveLetter $l -ErrorAction SilentlyContinue; ` +
+	`if($v -and $v.Size -gt 0){ $u+=[uint64]$v.Size-[uint64]$v.SizeRemaining; $t+=[uint64]$v.Size; $m+=($l.ToString()+':') } } ` +
+	`} ` +
+	`$bt=[uint16]0; try { $bt=[uint16]$d.CimInstanceProperties['BusType'].Value } catch { $bt=[uint16]0 } ` +
+	`[ordered]@{name=('PhysicalDrive'+$d.DeviceId);model=($d.FriendlyName);size_bytes=([uint64]$d.Size);used_bytes=$u;total_bytes=$t;mountpoints=$m;bus_type=$bt} ` +
+	`}`
+
 // windowsStorage builds the per-physical-drive storage set on Windows. Capacity
 // comes from a Get-CimInstance MSFT_PhysicalDisk query joined to volumes via
 // MSFT_Partition (root/Microsoft/Windows/Storage); temperature is matched from
 // the LibreHardwareMonitor bridge by FriendlyName (the bridge harvest loop is
 // generic over whatever IsStorageEnabled emits). Any failure degrades the whole
-// set to unavailable rather than failing the response. Mirrors the Linux
-// collectStorage shape so the dashboard panel is identical.
-func windowsStorage(ctx context.Context, bridge lhmBridgeResult, bridgeErr error) StorageSet {
-	// Join physical disks to their drive-lettered volumes and aggregate capacity.
-	// -ErrorAction Stop on the CIM queries makes a missing namespace / cmdlet
-	// surface as a non-zero exit, which runPowerShellJSONArray turns into a Go
-	// error so the whole set degrades cleanly.
-	const script = `$ns='root/Microsoft/Windows/Storage'; ` +
-		`$disks=@(Get-CimInstance -Namespace $ns -ClassName MSFT_PhysicalDisk -ErrorAction Stop); ` +
-		`$parts=@(Get-CimInstance -Namespace $ns -ClassName MSFT_Partition -ErrorAction Stop); ` +
-		`foreach ($d in $disks) { ` +
-		`$dp=@($parts | Where-Object { [uint32]$_.DiskNumber -eq [uint32]$d.DeviceId }); ` +
-		`$u=[uint64]0; $t=[uint64]0; $m=@(); ` +
-		`foreach ($p in $dp) { ` +
-		`$l=$p.DriveLetter; ` +
-		`if($l){ $v=Get-Volume -DriveLetter $l -ErrorAction SilentlyContinue; ` +
-		`if($v -and $v.Size -gt 0){ $u+=[uint64]$v.Size-[uint64]$v.SizeRemaining; $t+=[uint64]$v.Size; $m+=($l.ToString()+':') } } ` +
-		`} ` +
-		`[ordered]@{name=('PhysicalDrive'+$d.DeviceId);model=($d.FriendlyName);size_bytes=([uint64]$d.Size);used_bytes=$u;total_bytes=$t;mountpoints=$m;bus_type=([uint16]$d.BusType)} ` +
-		`}`
-	var rows []windowsPhysicalDisk
-	if err := runPowerShellJSONArray(ctx, script, &rows); err != nil {
+// set to unavailable rather than failing the response. The serving path caches
+// discovery rows while still applying fresh LHM temperatures on every pass.
+func (c *systemCollector) cachedWindowsStorage(ctx context.Context, bridge lhmBridgeResult, bridgeErr error) StorageSet {
+	rows, err := c.cachedWindowsStorageRows(ctx)
+	if err != nil {
 		return unavailableStorage(err.Error())
 	}
+	return windowsStorageFromRows(rows, bridge, bridgeErr)
+}
+
+func windowsStorage(ctx context.Context, bridge lhmBridgeResult, bridgeErr error) StorageSet {
+	var rows []windowsPhysicalDisk
+	if err := runPowerShellJSONArray(ctx, windowsStorageScript, &rows); err != nil {
+		return unavailableStorage(err.Error())
+	}
+	return windowsStorageFromRows(rows, bridge, bridgeErr)
+}
+
+func windowsStorageFromRows(rows []windowsPhysicalDisk, bridge lhmBridgeResult, bridgeErr error) StorageSet {
 	if len(rows) == 0 {
 		return unavailableStorage("no physical disks found")
 	}
@@ -636,221 +614,6 @@ func buildWindowsNetworkSet(prevCounters, nowCounters map[string]netCounter, ela
 	}
 	sortNetworkInterfacesByActivity(interfaces)
 	return NetworkSet{Available: true, Interfaces: interfaces}
-}
-
-func windowsNetCounters(ctx context.Context) (map[string]netCounter, error) {
-	var rows []struct {
-		Name          string
-		ReceivedBytes uint64
-		SentBytes     uint64
-	}
-	err := runPowerShellJSONArray(ctx, `Get-NetAdapterStatistics | Select-Object Name,ReceivedBytes,SentBytes`, &rows)
-	if err != nil {
-		return nil, err
-	}
-	counters := map[string]netCounter{}
-	for _, row := range rows {
-		if row.Name == "" {
-			continue
-		}
-		counters[row.Name] = netCounter{rxBytes: row.ReceivedBytes, txBytes: row.SentBytes}
-	}
-	return counters, nil
-}
-
-// collectProcesses builds the per-process set from a single Get-Process call
-// (Id, ProcessName, WorkingSet64, and a computed CpuSeconds) plus a Get-Counter
-// call for per-process disk I/O rates, and joins NVIDIA per-process GPU memory
-// by PID. Per-process CPU% is derived as a delta of cumulative processor time
-// against the previous slow pass, whole-host normalized by the core count so
-// values are comparable to the aggregated CPU gauge. Each field degrades
-// independently: a row whose disk instance could not be resolved reports disk
-// unavailable rather than failing the response. Dead PIDs are pruned
-// automatically because prevProc is rebuilt each pass.
-func (c *systemCollector) collectProcesses(ctx context.Context) ProcessSet {
-	numCPU := runtime.NumCPU()
-	if numCPU < 1 {
-		numCPU = 1
-	}
-	now := time.Now()
-	gpuMem := nvidiaProcessGPUMemory(ctx)
-
-	var rows []windowsProcessRow
-	if err := runPowerShellJSONArray(ctx, `Get-Process | Select-Object Id,ProcessName,WorkingSet64,@{Name='CpuSeconds';Expression={[double]$_.TotalProcessorTime.TotalSeconds}}`, &rows); err != nil {
-		return unavailableProcessSet("Get-Process failed: " + err.Error())
-	}
-	diskReadByPID, diskWriteByPID := windowsProcessDiskRates(ctx)
-
-	current := make(map[int]procSample, len(rows))
-	raw := make([]ProcessMetric, 0, len(rows))
-	for _, row := range rows {
-		if row.ID <= 0 {
-			continue
-		}
-		pm := ProcessMetric{PID: row.ID, Name: windowsProcessName(row)}
-		pm.Memory = availableNumber(float64(row.WorkingSet64), "B")
-		cpuSeconds := windowsProcessorTimeSeconds(row.CpuSeconds)
-
-		c.mu.Lock()
-		prev, hadPrev := c.prevProc[row.ID]
-		c.mu.Unlock()
-		if hadPrev {
-			elapsed := now.Sub(prev.ts).Seconds()
-			pm.CPU = processCPUPercent(cpuSeconds, prev.cpuSeconds, elapsed, numCPU)
-		}
-		if !pm.CPU.Available {
-			pm.CPU = unavailableNumber("%", "process sampler is warming up")
-		}
-
-		pm.DiskRead = windowsProcessRate(diskReadByPID, row.ID)
-		pm.DiskWrite = windowsProcessRate(diskWriteByPID, row.ID)
-
-		if bytes, onGPU := gpuMem[row.ID]; onGPU {
-			pm.GPUMemory = availableNumber(float64(bytes), "B")
-		} else {
-			pm.GPUMemory = unavailableNumber("B", "not a CUDA/compute process")
-		}
-
-		current[row.ID] = procSample{cpuSeconds: cpuSeconds, ts: now}
-		raw = append(raw, pm)
-	}
-
-	c.mu.Lock()
-	c.prevProc = current
-	c.mu.Unlock()
-	return buildProcessSet(raw, len(raw))
-}
-
-// windowsProcessRow models one Get-Process result. CpuSeconds is computed in
-// PowerShell ([double]$_.TotalProcessorTime.TotalSeconds) so the JSON carries a
-// plain number rather than a TimeSpan object/string, which ConvertTo-Json does
-// not serialize predictably. WorkingSet64 is the resident set in bytes.
-type windowsProcessRow struct {
-	ID           int     `json:"Id"`
-	ProcessName  string  `json:"ProcessName"`
-	WorkingSet64 uint64  `json:"WorkingSet64"`
-	CpuSeconds   float64 `json:"CpuSeconds"`
-}
-
-func windowsProcessName(row windowsProcessRow) string {
-	name := strings.TrimSpace(row.ProcessName)
-	if name == "" {
-		return fmt.Sprintf("pid %d", row.ID)
-	}
-	return name
-}
-
-// windowsProcessorTimeSeconds returns the cumulative processor time for a PID
-// as seconds, guarded against non-finite/negative garbage. The value is
-// computed in PowerShell from TotalProcessorTime.TotalSeconds.
-func windowsProcessorTimeSeconds(seconds float64) float64 {
-	if !isFinite(seconds) || seconds < 0 {
-		return 0
-	}
-	return seconds
-}
-
-// windowsProcessDiskRates queries the per-process IO Read/Write Bytes/sec rate
-// counters and resolves each instance back to a PID via the ID Process counter
-// (Get-Counter names instances like "chrome#1"; the ID Process counter is the
-// authoritative PID mapping). Returns pid -> bytes/sec maps; PIDs without a
-// resolved counter are absent and degrade to unavailable per row. The counter
-// is combined disk+file+device I/O (an approximation of "disk"), since a
-// pure-disk per-process number is ETW-only.
-func windowsProcessDiskRates(ctx context.Context) (readByPID, writeByPID map[int]float64) {
-	readByPID = map[int]float64{}
-	writeByPID = map[int]float64{}
-	var rows []windowsProcessIOCounter
-	script := `Get-Counter '\Process(*)\IO Read Bytes/sec','\Process(*)\IO Write Bytes/sec','\Process(*)\ID Process' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty CounterSamples | Select-Object Path,CookedValue`
-	if err := runPowerShellJSONArray(ctx, script, &rows); err != nil {
-		return readByPID, writeByPID
-	}
-	pidsByInstance := map[string]int{}
-	readByInstance := map[string]float64{}
-	writeByInstance := map[string]float64{}
-	for _, row := range rows {
-		value, ok := windowsProcessIOValue(row.CookedValue)
-		if !ok {
-			continue
-		}
-		switch windowsProcessIOKind(row.Path) {
-		case "id":
-			pidsByInstance[windowsProcessIOInstance(row.Path)] = int(value)
-		case "read":
-			readByInstance[windowsProcessIOInstance(row.Path)] = value
-		case "write":
-			writeByInstance[windowsProcessIOInstance(row.Path)] = value
-		}
-	}
-	for instance, pid := range pidsByInstance {
-		if pid <= 0 {
-			continue
-		}
-		if v, ok := readByInstance[instance]; ok {
-			readByPID[pid] = v
-		}
-		if v, ok := writeByInstance[instance]; ok {
-			writeByPID[pid] = v
-		}
-	}
-	return readByPID, writeByPID
-}
-
-type windowsProcessIOCounter struct {
-	Path        string   `json:"Path"`
-	CookedValue *float64 `json:"CookedValue"`
-}
-
-func windowsProcessIOValue(value *float64) (float64, bool) {
-	if value == nil || math.IsNaN(*value) || math.IsInf(*value, 0) || *value < 0 {
-		return 0, false
-	}
-	return *value, true
-}
-
-// windowsProcessIOKind classifies a Get-Counter sample path as the read, write,
-// or ID Process counter, so the three queries can be resolved back to per-PID
-// rates. Counter paths look like "\\\\computer\\process(...)\\io read bytes/sec".
-func windowsProcessIOKind(path string) string {
-	p := strings.ToLower(path)
-	switch {
-	case strings.Contains(p, "id process"):
-		return "id"
-	case strings.Contains(p, "io read bytes"):
-		return "read"
-	case strings.Contains(p, "io write bytes"):
-		return "write"
-	}
-	return ""
-}
-
-// windowsProcessIOInstance extracts the bare instance name (the parenthesised
-// token) from a Get-Counter sample path, lowercased so read/write/id samples
-// for the same instance match. The instance is everything between the last
-// "process(" and the following ")".
-func windowsProcessIOInstance(path string) string {
-	p := strings.ToLower(path)
-	start := strings.LastIndex(p, "process(")
-	if start < 0 {
-		return ""
-	}
-	rest := p[start+len("process("):]
-	end := strings.IndexByte(rest, ')')
-	if end < 0 {
-		return rest
-	}
-	return rest[:end]
-}
-
-// windowsProcessRate turns a per-PID bytes/sec map entry into a NumberMetric,
-// degrading to unavailable when the PID had no resolved counter (the _Total
-// instance and idle processes have none).
-func windowsProcessRate(rates map[int]float64, pid int) NumberMetric {
-	value, ok := rates[pid]
-	if !ok || !isFinite(value) {
-		return unavailableNumber("B/s", "no disk I/O counter for this process")
-	}
-	return availableNumber(value, "B/s")
 }
 
 // windowsCPUPower reads CPU package power from the LibreHardwareMonitor WMI
@@ -1176,8 +939,8 @@ func windowsPSUOutputPowerFromBridge(result lhmBridgeResult, err error) NumberMe
 	return lhmPSUOutputPowerMetric(result.PSUOutputPower)
 }
 
-func windowsTemperaturesFromBridge(ctx context.Context, result lhmBridgeResult, err error) TemperatureSet {
-	sensors := windowsACPITemperatureSensors(ctx)
+func (c *systemCollector) windowsTemperaturesFromBridge(ctx context.Context, result lhmBridgeResult, err error) TemperatureSet {
+	sensors := c.cachedWindowsACPITemperatures(ctx)
 	if err == nil && result.Available {
 		sensors = lhmTemperatureMetrics(result.Temperatures, sensors)
 	}

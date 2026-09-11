@@ -78,6 +78,12 @@ const state = {
   // that installs Claude Code mid-session needs a reload to see the page.
   quotaSupported: true,
   quotaInFlight: false,
+  quotaPayload: null,
+  // Codex usage has its own capability latch because mixed-version agents may
+  // support Claude quota but not the newer local Codex transcript route.
+  codexUsageSupported: true,
+  codexUsageInFlight: false,
+  codexUsagePayload: null,
   settings: {
     dim: false,
     shift: true,
@@ -94,7 +100,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v129";
+const dashboardBuild = "sysmon-static-v131";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -168,7 +174,7 @@ const clientCheckDebounceMS = 500;
 const controlArmWindowMS = 3000;
 const collapsedIssueLimit = 5;
 // Index of the "More status" page, which owns the Alerts + Storage + Issues
-// panels. Never conditional (only the Claude quota page is), so a static index
+// panels. Never conditional (only the AI usage page is), so a static index
 // is safe here -- pagerGoTo still resolves it through the VISIBLE dot set.
 const statusPageIndex = 1;
 const sparklineSampleLimit = 24;
@@ -179,7 +185,7 @@ const wakePreferenceKey = "sysmon:wake-wanted";
 let pagerSyncHeight = null;
 
 // Set by setupPager so a render that flips a conditional page's `hidden` (the
-// Claude quota page appears/disappears with /api/quota) can ask the pager to
+// AI usage page appears/disappears with its provider data) can ask the pager to
 // re-derive the visible page set: re-clamp activePage into range, restyle the
 // dots, and re-measure. Reads derive from `hidden`; only activePage and the
 // scroll offset need the imperative re-clamp.
@@ -251,6 +257,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // existing 60 s status tick refreshes it. No interval of its own -- quota
   // moves on a minutes cadence and the verifier pins the interval inventory.
   fetchQuota();
+  fetchCodexUsage();
   syncVisibleTimers();
   fetchMetrics();
   sendClientCheck();
@@ -261,8 +268,9 @@ document.addEventListener("DOMContentLoaded", () => {
 // to its page. Every scroll API is feature-guarded so the headless verifier (whose
 // mock DOM has no scroll geometry) is a no-op rather than a crash.
 //
-// The page set is CONDITIONAL: the fourth page (Claude quota) and its dot carry
-// `hidden` until /api/quota reports a usable source, so every read here derives
+// The page set is CONDITIONAL: the fourth page (AI usage) and its dot carry
+// `hidden` until either usage endpoint reports a configured provider, so every
+// read here derives
 // from the currently-visible dots/pages rather than a cached count. Two reasons
 // this is not optional: when a page disappears while the user is standing on it,
 // activePage would stay out of range and a hidden dot would keep
@@ -547,6 +555,7 @@ function scheduleStatusPolling() {
       // data is minutes-cadence, and fetchQuota itself stops asking once the
       // host has reported itself unconfigured.
       fetchQuota();
+      fetchCodexUsage();
     }
   }, 60000);
 }
@@ -1850,7 +1859,7 @@ function syncPagerAfterRender() {
 }
 
 // refreshPagerPages re-derives the pager's visible page set after a render
-// flips a conditional page's `hidden` (the Claude quota page). Reads derive
+// flips a conditional page's `hidden` (the AI usage page). Reads derive
 // from `hidden`; only activePage and the scroll offset are imperatively
 // re-clamped, inside the hook setupPager installs. No-op until setupPager has
 // run / in the layout-less verifier.
@@ -2403,7 +2412,7 @@ function storageFootLeft(device, cap) {
   return "";
 }
 
-// fetchQuota refreshes the Claude quota page (the fourth swipe page) from
+// fetchQuota refreshes the Claude provider on the fourth swipe page from
 // /api/quota. It deliberately owns NO timer of its own: one fetch at load, then
 // the existing 60 s status tick. A definitive "not configured" (configured:false
 // or 404 from an older agent) latches quotaSupported off so an unconfigured
@@ -2442,32 +2451,70 @@ async function fetchQuota() {
   }
 }
 
-// renderQuota drives the fourth pager page: one row per usage window (label +
-// percent, a fill bar, reset/credits note) plus a source+age footer. The page
-// and its dot are revealed only while /api/quota reports a configured host, so
-// a public-release user sees exactly the three pages they had before. The page
-// is STATIC markup toggled via `hidden` -- never created and appended at
-// runtime -- because `pages` is captured once in setupPager and the verifier's
-// DOM mock cannot re-query. The `hidden` flip happens before
-// refreshPagerPages() so the pager re-derives the visible set afterwards.
+// fetchCodexUsage reads the local-session summary endpoint on the same cadence
+// as Claude quota. It owns no timer and latches independently, so an older agent
+// can keep serving Claude's half of the page without polling a missing route.
+async function fetchCodexUsage() {
+  if (!state.codexUsageSupported || state.codexUsageInFlight) {
+    return;
+  }
+  state.codexUsageInFlight = true;
+  try {
+    const response = await fetchWithTimeout("/api/codex-usage", { cache: "no-store" }, auxiliaryTimeoutMS);
+    if (!response.ok) {
+      if (response.status === 404) {
+        state.codexUsageSupported = false;
+        renderCodexUsage({ configured: false, source: "none", rows: [], token_days: [] });
+      }
+      return;
+    }
+    const payload = await response.json();
+    if (!payload || payload.configured !== true) {
+      state.codexUsageSupported = false;
+    }
+    renderCodexUsage(payload || {});
+  } catch {
+    // Preserve the last good rendering and retry on the next status tick.
+  } finally {
+    state.codexUsageInFlight = false;
+  }
+}
+
+// renderQuota and renderCodexUsage update one provider at a time, then derive
+// page visibility from both provider sections. The static page remains visible
+// whenever either local tool is configured.
 function renderQuota(payload) {
-  const page = $("quotaPage");
-  const dot = $("pageDot3");
-  const list = $("quotaList");
-  const summary = $("quotaSummary");
-  const footer = $("quotaFooter");
-  const empty = $("quotaEmpty");
-  if (!page || !dot || !list || !summary || !footer || !empty) {
+  state.quotaPayload = payload || {};
+  renderUsageProvider("claude", state.quotaPayload);
+  refreshUsagePageVisibility();
+}
+
+function renderCodexUsage(payload) {
+  state.codexUsagePayload = payload || {};
+  renderUsageProvider("codex", state.codexUsagePayload);
+  refreshUsagePageVisibility();
+}
+
+function renderUsageProvider(provider, payload) {
+  const claude = provider === "claude";
+  const section = $(claude ? "claudeUsage" : "codexUsage");
+  const list = $(claude ? "quotaList" : "codexQuotaList");
+  const summary = $(claude ? "quotaSummary" : "codexQuotaSummary");
+  const footer = $(claude ? "quotaFooter" : "codexQuotaFooter");
+  const empty = $(claude ? "quotaEmpty" : "codexQuotaEmpty");
+  const chart = $(claude ? "claudeTokenChart" : "codexTokenChart");
+  const tokenTotal = $(claude ? "claudeTokenTotal" : "codexTokenTotal");
+  if (!section || !list || !summary || !footer || !empty || !chart || !tokenTotal) {
     return;
   }
   list.textContent = "";
+  chart.textContent = "";
   if (!payload || payload.configured !== true) {
-    page.hidden = true;
-    dot.hidden = true;
+    section.hidden = true;
     empty.hidden = true;
     summary.textContent = "--";
     footer.textContent = "--";
-    refreshPagerPages();
+    tokenTotal.textContent = "--";
     return;
   }
   const rows = Array.isArray(payload.rows) ? payload.rows : [];
@@ -2475,15 +2522,98 @@ function renderQuota(payload) {
   for (const row of rows) {
     list.append(quotaRowElement(row));
   }
-  // A configured host with nothing to show yet (no quota.json, or a widget
-  // cache that failed to parse) keeps the page -- the footer carries the
-  // diagnostic -- but says so in the body rather than rendering a bare header
-  // over an empty list. Mirrors #issuesEmpty on the "More status" page.
   empty.hidden = rows.length > 0;
   footer.textContent = quotaFooterLabel(payload);
-  page.hidden = false;
-  dot.hidden = false;
+  renderTokenChart(chart, tokenTotal, payload.token_days, claude ? "Claude" : "Codex");
+  section.hidden = false;
+}
+
+function refreshUsagePageVisibility() {
+  const page = $("quotaPage");
+  const dot = $("pageDot3");
+  const summary = $("aiUsageSummary");
+  const claude = $("claudeUsage");
+  const codex = $("codexUsage");
+  if (!page || !dot || !summary || !claude || !codex) {
+    return;
+  }
+  const count = Number(!claude.hidden) + Number(!codex.hidden);
+  summary.textContent = count > 0 ? `${count} provider${count === 1 ? "" : "s"}` : "--";
+  page.hidden = count === 0;
+  dot.hidden = count === 0;
   refreshPagerPages();
+}
+
+function renderTokenChart(chart, totalEl, rawDays, provider) {
+  const days = Array.isArray(rawDays) ? rawDays.slice(-7) : [];
+  const normalized = days.map((day) => ({
+    date: nonEmptyText(day?.date),
+    tokens: Math.max(0, safeIntegerNumber(day?.tokens) ?? 0),
+  }));
+  const max = normalized.reduce((value, day) => Math.max(value, day.tokens), 0);
+  const total = normalized.reduce((value, day) => value + day.tokens, 0);
+  totalEl.textContent = normalized.length > 0 ? `${formatTokenCount(total)} total` : "--";
+  chart.setAttribute(
+    "aria-label",
+    normalized.length > 0
+      ? `${provider} token usage for the last seven days, ${formatTokenCount(total)} total`
+      : `${provider} token usage unavailable`,
+  );
+  for (const day of normalized) {
+    const column = document.createElement("div");
+    column.className = "token-day";
+    column.setAttribute("role", "img");
+    const detail = `${tokenDateLabel(day.date, true)}: ${day.tokens.toLocaleString()} tokens`;
+    column.setAttribute("aria-label", detail);
+    column.setAttribute("title", detail);
+
+    const value = document.createElement("span");
+    value.className = "token-day-value";
+    value.textContent = formatTokenCount(day.tokens);
+
+    const track = document.createElement("span");
+    track.className = "token-day-track";
+    const bar = document.createElement("span");
+    bar.className = "token-day-bar";
+    bar.style.setProperty("--h", max > 0 ? `${(day.tokens / max) * 100}%` : "0%");
+    bar.style.setProperty("--min-h", day.tokens > 0 ? "3px" : "0");
+    track.append(bar);
+
+    const label = document.createElement("span");
+    label.className = "token-day-label";
+    label.textContent = tokenDateLabel(day.date, false);
+    column.append(value, track, label);
+    chart.append(column);
+  }
+}
+
+function formatTokenCount(value) {
+  const numeric = Math.max(0, safeIntegerNumber(value) ?? 0);
+  if (numeric < 1000) {
+    return String(numeric);
+  }
+  if (numeric < 1000000) {
+    return `${(numeric / 1000).toFixed(numeric < 100000 ? 1 : 0)}k`;
+  }
+  if (numeric < 1000000000) {
+    return `${(numeric / 1000000).toFixed(numeric < 100000000 ? 1 : 0)}M`;
+  }
+  return `${(numeric / 1000000000).toFixed(numeric < 10000000000 ? 1 : 0)}B`;
+}
+
+function tokenDateLabel(value, long) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ""));
+  if (!match) {
+    return long ? "unknown date" : "--";
+  }
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  if (!Number.isFinite(date.getTime())) {
+    return long ? value : value.slice(5);
+  }
+  if (long) {
+    return date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+  }
+  return `${Number(match[2])}/${Number(match[3])}`;
 }
 
 // quotaRowElement builds one usage-window row: label + percent (warn/critical
@@ -2578,8 +2708,9 @@ function quotaResetLabel(resetsAt) {
   return `resets in ${Math.round(hours / 24)}d`;
 }
 
-// quotaFooterLabel composes the page footer: source + sample age ("snapshot ·
-// 2m ago"), a stale marker, and any error the agent reported alongside rows.
+// quotaFooterLabel composes the page footer: source + successful-check age
+// ("snapshot · 2m ago"), a stale marker, the optional quota-event age, and any
+// error the agent reported alongside rows.
 function quotaFooterLabel(payload) {
   const parts = [];
   const source = nonEmptyText(payload?.source);
@@ -2588,6 +2719,10 @@ function quotaFooterLabel(payload) {
     parts.push(age ? `${source} \u00b7 ${age}` : source);
     if (payload?.stale === true) {
       parts.push("stale");
+    }
+    const quotaAgeSeconds = finiteNumber(payload?.quota_age_seconds);
+    if (quotaAgeSeconds !== null && quotaAgeSeconds >= 60) {
+      parts.push(`quota as of ${quotaAgeLabel(quotaAgeSeconds)}`);
     }
   }
   const error = nonEmptyText(payload?.error);
