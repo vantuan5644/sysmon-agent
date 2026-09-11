@@ -7,7 +7,7 @@ const settingsRoundTrip = args.includes("--settings-roundtrip");
 const clientCheckRoundTrip = args.includes("--client-check-roundtrip");
 const baseURL = normalizeBaseURL(args.find((arg) => !arg.startsWith("--")) || defaultBaseURL);
 const timeoutMS = 5000;
-const dashboardBuild = "sysmon-static-v129";
+const dashboardBuild = "sysmon-static-v131";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,
@@ -48,6 +48,8 @@ if (sampleMode) {
   validateClientCheckHistory(sampleClientCheckHistory(false));
   validateQuota(sampleQuotaUnconfigured());
   validateQuota(sampleQuotaConfigured());
+  validateCodexUsage(sampleCodexUsageUnconfigured());
+  validateCodexUsage(sampleCodexUsageConfigured());
   if (settingsRoundTrip) {
     validateSettings(roundTripSampleSettings(), roundTripSettings);
     validateStatus(sampleStatus(roundTripSampleSettings()), roundTripSettings);
@@ -82,6 +84,9 @@ if (sampleMode) {
 
   const quota = await fetchJSON("/api/quota");
   validateQuota(quota);
+
+  const codexUsage = await fetchJSON("/api/codex-usage");
+  validateCodexUsage(codexUsage);
 
   if (settingsRoundTrip) {
     await assertSettingsRejectsMissingOrigin();
@@ -427,6 +432,9 @@ function validateQuota(quota) {
     `quota.source = ${quota.source}, want live|cache|snapshot|none`,
   );
   assert(Array.isArray(quota.rows), "quota.rows must be an array");
+  if ("token_days" in quota) {
+    validateTokenDays(quota.token_days, "quota.token_days");
+  }
   if (quota.rows.length > 0) {
     assert(quota.configured, "quota.rows must be empty while unconfigured");
     assert(quota.source !== "none", "quota.source must not be none while rows exist");
@@ -458,6 +466,47 @@ function validateQuota(quota) {
   if ("error" in quota && quota.error !== undefined && quota.error !== null) {
     assert(typeof quota.error === "string", "quota.error must be a string");
   }
+}
+
+function validateCodexUsage(usage) {
+  assertObject(usage, "codexUsage");
+  assert(typeof usage.configured === "boolean", "codexUsage.configured must be a boolean");
+  assert(["sessions", "none"].includes(usage.source), `codexUsage.source = ${usage.source}, want sessions|none`);
+  assert(Array.isArray(usage.rows), "codexUsage.rows must be an array");
+  validateTokenDays(usage.token_days, "codexUsage.token_days", usage.configured ? 7 : 0);
+  usage.rows.forEach((row, index) => {
+    assertObject(row, `codexUsage.rows[${index}]`);
+    assertNonEmptyString(row.id, `codexUsage.rows[${index}].id`);
+    assertNonEmptyString(row.label, `codexUsage.rows[${index}].label`);
+    assertFiniteNumber(row.percent, `codexUsage.rows[${index}].percent`);
+    assert(row.percent >= 0 && row.percent <= 100, `codexUsage.rows[${index}].percent out of range`);
+    if (row.resets_at) {
+      assert(Number.isFinite(Date.parse(row.resets_at)), `codexUsage.rows[${index}].resets_at is not RFC3339`);
+    }
+  });
+  if (usage.fetched_at) {
+    assertTimestamp(usage.fetched_at, "codexUsage.fetched_at", { allowStale: true });
+  }
+  if ("age_seconds" in usage) {
+    assertInteger(usage.age_seconds, "codexUsage.age_seconds", { min: 0 });
+  }
+  assert(typeof usage.stale === "boolean", "codexUsage.stale must be a boolean");
+  if ("error" in usage) {
+    assert(typeof usage.error === "string", "codexUsage.error must be a string");
+  }
+}
+
+function validateTokenDays(days, label, expectedLength = 7) {
+  assert(Array.isArray(days), `${label} must be an array`);
+  assert(days.length === expectedLength, `${label} must contain ${expectedLength} days`);
+  let previous = "";
+  days.forEach((day, index) => {
+    assertObject(day, `${label}[${index}]`);
+    assert(/^\d{4}-\d{2}-\d{2}$/.test(day.date), `${label}[${index}].date must be YYYY-MM-DD`);
+    assertInteger(day.tokens, `${label}[${index}].tokens`, { min: 0 });
+    assert(previous === "" || day.date > previous, `${label} must be oldest first`);
+    previous = day.date;
+  });
 }
 
 function validateNetwork(network) {
@@ -935,8 +984,37 @@ function sampleQuotaConfigured() {
       { id: "weekly_fable", label: "Weekly (Fable)", percent: 29, resets_at: "2026-08-22T16:00:00Z", note: "as of 5m ago" },
       { id: "credits", label: "Usage credits", percent: 10, note: "$5.00 of $50.00 used · as of 5m ago" },
     ],
+    token_days: sampleTokenDays(),
     fetched_at: new Date(Date.now() - 10_000).toISOString(),
     age_seconds: 10,
     stale: false,
   };
+}
+
+function sampleCodexUsageUnconfigured() {
+  return { configured: false, source: "none", rows: [], token_days: [], stale: false };
+}
+
+function sampleCodexUsageConfigured() {
+  return {
+    configured: true,
+    source: "sessions",
+    rows: [{ id: "primary", label: "Weekly", percent: 18, resets_at: "2026-08-22T16:00:00Z" }],
+    token_days: sampleTokenDays(),
+    fetched_at: new Date(Date.now() - 10_000).toISOString(),
+    age_seconds: 10,
+    stale: false,
+  };
+}
+
+function sampleTokenDays() {
+  return [
+    { date: "2026-08-13", tokens: 0 },
+    { date: "2026-08-14", tokens: 1200 },
+    { date: "2026-08-15", tokens: 2500 },
+    { date: "2026-08-16", tokens: 0 },
+    { date: "2026-08-17", tokens: 4200 },
+    { date: "2026-08-18", tokens: 1800 },
+    { date: "2026-08-19", tokens: 700 },
+  ];
 }

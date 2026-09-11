@@ -129,6 +129,7 @@ type RuntimeState struct {
 	settingsPath  string
 	updateChecker *UpdateChecker
 	quotaChecker  *QuotaChecker
+	codexChecker  *CodexUsageChecker
 }
 
 func NewRuntimeState(settingsPath string) (*RuntimeState, error) {
@@ -212,6 +213,20 @@ func (s *RuntimeState) QuotaChecker() *QuotaChecker {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.quotaChecker
+}
+
+// SetCodexUsageChecker wires the local Codex session reader into the API.
+func (s *RuntimeState) SetCodexUsageChecker(checker *CodexUsageChecker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.codexChecker = checker
+}
+
+// CodexUsageChecker returns the wired checker, or nil in bare test states.
+func (s *RuntimeState) CodexUsageChecker() *CodexUsageChecker {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.codexChecker
 }
 
 func (s *RuntimeState) GetClientCheck() ClientCheck {

@@ -23,6 +23,9 @@ func runSelfCheck(handler http.Handler) error {
 	if err := checkStatus(handler); err != nil {
 		return err
 	}
+	if err := checkUsageAPIs(handler); err != nil {
+		return err
+	}
 	if err := checkSecurityHeaders(handler); err != nil {
 		return err
 	}
@@ -117,6 +120,33 @@ func checkStatus(handler http.Handler) error {
 	}
 	if err := validateDashboardSettings(status.Settings); err != nil {
 		return fmt.Errorf("GET /api/status settings: %w", err)
+	}
+	return nil
+}
+
+func checkUsageAPIs(handler http.Handler) error {
+	quotaRec := serveSelfCheckRequest(handler, http.MethodGet, "/api/quota", "")
+	if quotaRec.Code != http.StatusOK {
+		return fmt.Errorf("GET /api/quota returned %d", quotaRec.Code)
+	}
+	var quota QuotaStatus
+	if err := json.Unmarshal(quotaRec.Body.Bytes(), &quota); err != nil {
+		return fmt.Errorf("GET /api/quota JSON: %w", err)
+	}
+	if quota.Configured && len(quota.TokenDays) != tokenUsageDays {
+		return fmt.Errorf("GET /api/quota token_days = %d, want %d", len(quota.TokenDays), tokenUsageDays)
+	}
+
+	codexRec := serveSelfCheckRequest(handler, http.MethodGet, "/api/codex-usage", "")
+	if codexRec.Code != http.StatusOK {
+		return fmt.Errorf("GET /api/codex-usage returned %d", codexRec.Code)
+	}
+	var codex CodexUsageStatus
+	if err := json.Unmarshal(codexRec.Body.Bytes(), &codex); err != nil {
+		return fmt.Errorf("GET /api/codex-usage JSON: %w", err)
+	}
+	if codex.Configured && len(codex.TokenDays) != tokenUsageDays {
+		return fmt.Errorf("GET /api/codex-usage token_days = %d, want %d", len(codex.TokenDays), tokenUsageDays)
 	}
 	return nil
 }
@@ -474,7 +504,7 @@ func validateCapacityMetric(name string, metric CapacityMetric, allowUnavailable
 }
 
 func checkSecurityHeaders(handler http.Handler) error {
-	for _, path := range []string{"/readyz", "/api/status", "/api/client-check", "/api/client-checks", "/"} {
+	for _, path := range []string{"/readyz", "/api/status", "/api/quota", "/api/codex-usage", "/api/client-check", "/api/client-checks", "/"} {
 		rec := serveSelfCheckRequest(handler, http.MethodGet, path, "")
 		if rec.Code != http.StatusOK {
 			return fmt.Errorf("GET %s returned %d while checking security headers", path, rec.Code)
@@ -581,7 +611,7 @@ func checkClientCheck(handler http.Handler) error {
 		return fmt.Errorf("GET /api/client-checks was not empty before dashboard POST")
 	}
 
-	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v129","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
+	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v131","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
 	if post.Code != http.StatusOK {
 		return fmt.Errorf("POST /api/client-check returned %d: %s", post.Code, strings.TrimSpace(post.Body.String()))
 	}
