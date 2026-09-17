@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"math"
 	"os"
@@ -275,14 +276,19 @@ func TestCacheableWindowsGPUFallback(t *testing.T) {
 }
 
 func TestWindowsCollectorCachesStaticGPUFallback(t *testing.T) {
-	data, err := os.ReadFile("collector_windows.go")
+	collectorData, err := os.ReadFile("collector_windows.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := string(data)
+	cacheData, err := os.ReadFile("collector_windows_cache.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(collectorData) + string(cacheData)
 	for _, needle := range []string{
 		`gpuFallbackCached bool`,
-		`return c.windowsGPU(ctx)`,
+		`return c.cachedWindowsGPU(ctx)`,
+		`value = c.windowsGPU(ctx)`,
 		`func (c *systemCollector) windowsGPU(ctx context.Context) GPUSet`,
 		`windowsGPUEngineUsage(ctx)`,
 		`Get-Counter '\GPU Engine(*)\Utilization Percentage'`,
@@ -292,7 +298,7 @@ func TestWindowsCollectorCachesStaticGPUFallback(t *testing.T) {
 		`windowsVideoControllerGPU(ctx, nvidia.Error)`,
 	} {
 		if !strings.Contains(source, needle) {
-			t.Fatalf("collector_windows.go missing GPU fallback cache behavior %q", needle)
+			t.Fatalf("Windows collector missing GPU cache behavior %q", needle)
 		}
 	}
 }
@@ -613,5 +619,64 @@ func TestWindowsStorageTemperatureExplainsAUSBEnclosure(t *testing.T) {
 	down := windowsStorageTemperatureForModel("ROG ESD-S1CL", storageBusTypeUSB, lhmBridgeResult{}, nil)
 	if down.Error == usbEnclosureTemperatureReason {
 		t.Fatalf("bridge-down miss reported as a USB enclosure limit: %+v", down)
+	}
+}
+
+// TestWindowsStorageScriptEmitsEveryPhysicalDisk pins the defect that made the
+// dashboard report one SSD on a two-SSD host.
+//
+// The per-disk hashtable used to cast [uint16]$d.BusType. That is safe only
+// until the first Get-Volume in the loop autoloads the Storage module, whose
+// types.ps1xml re-projects BusType on every already-materialized
+// MSFT_PhysicalDisk as a friendly string ("NVMe"). The cast then throws, and a
+// non-terminating error while evaluating the hashtable emits nothing at all - so
+// the disk disappears from the array. PowerShell still exits 0 with valid JSON
+// for the survivors, so runPowerShell reports success and the whole set looks
+// healthy while silently short a drive. It is the same silent-truncation shape
+// as the 8 KB bash argument limit: no error anywhere, just less data.
+//
+// Counting is therefore the assertion. Any non-terminating error introduced into
+// that loop fails this, not just a BusType regression.
+func TestWindowsStorageScriptEmitsEveryPhysicalDisk(t *testing.T) {
+	ctx := context.Background()
+
+	// Ground truth, taken with a query that cannot itself drop a row.
+	var ids []string
+	const countScript = `@(Get-CimInstance -Namespace root/Microsoft/Windows/Storage ` +
+		`-ClassName MSFT_PhysicalDisk -ErrorAction Stop | ForEach-Object { [string]$_.DeviceId })`
+	if err := runPowerShellJSONArray(ctx, countScript, &ids); err != nil {
+		t.Skipf("MSFT_PhysicalDisk unavailable on this host: %v", err)
+	}
+	if len(ids) == 0 {
+		t.Skip("host reports no physical disks")
+	}
+
+	// A deliberately absent bridge: temperatures degrade per-field, which is
+	// irrelevant here - this test is about the device list, not the sensors.
+	set := windowsStorage(ctx, lhmBridgeResult{}, errors.New("bridge not used by this test"))
+	if !set.Available {
+		t.Fatalf("storage set unavailable: %s", set.Error)
+	}
+	if len(set.Devices) != len(ids) {
+		t.Fatalf("windowsStorage returned %d devices, want %d (%v) - a non-terminating "+
+			"PowerShell error inside the per-disk loop drops a drive while still exiting 0",
+			len(set.Devices), len(ids), ids)
+	}
+}
+
+// TestWindowsStorageScriptReadsBusTypeFromTheRawPropertyBag keeps the fix above
+// from being "simplified" back. $d.BusType is the type-adapted view and is a
+// string once the Storage module loads; $d.CimInstanceProperties reaches the raw
+// CIM property bag, which the adapter cannot touch. This runs on every host,
+// including one with a single disk where the counting test above would pass
+// either way.
+func TestWindowsStorageScriptReadsBusTypeFromTheRawPropertyBag(t *testing.T) {
+	if !strings.Contains(windowsStorageScript, "$d.CimInstanceProperties['BusType'].Value") {
+		t.Fatal("storage script no longer reads BusType from the raw CIM property bag; " +
+			"the type-adapted $d.BusType is a string once Get-Volume autoloads the Storage module")
+	}
+	if strings.Contains(windowsStorageScript, "[uint16]$d.BusType") {
+		t.Fatal("storage script casts the type-adapted $d.BusType; that throws on a " +
+			"friendly-string BusType and silently drops the disk from the emitted array")
 	}
 }

@@ -53,6 +53,9 @@ func main() {
 	// quota files the claude-quota-monitor skill maintains.
 	claudeConfigDir := flag.String("claude-config-dir", envString("SYSMON_CLAUDE_CONFIG_DIR", ""), "Claude Code config directory holding quota.json (defaults to $CLAUDE_CONFIG_DIR then $HOME/.claude; missing = quota page hidden)")
 	claudeQuotaPoll := flag.Bool("claude-quota-poll", envBool("SYSMON_CLAUDE_QUOTA_POLL", false), "poll api.anthropic.com/api/oauth/usage for Claude quota instead of only reading the local quota files (5-minute cadence)")
+	codexConfigDir := flag.String("codex-config-dir", envString("SYSMON_CODEX_CONFIG_DIR", ""), "Codex config directory holding local sessions (defaults to $CODEX_HOME then $HOME/.codex; missing = Codex usage hidden)")
+	codexQuotaPoll := flag.Bool("codex-quota-poll", envBool("SYSMON_CODEX_QUOTA_POLL", false), "poll Codex account quota through the installed CLI every 5 minutes")
+	codexBinary := flag.String("codex-binary", envString("SYSMON_CODEX_BINARY", ""), "Codex CLI executable for quota polling (default: codex on PATH)")
 	showVersion := flag.Bool("version", false, "print the build version and exit")
 	flag.Parse()
 
@@ -164,8 +167,17 @@ func main() {
 		Logf:      log.Printf,
 	})
 	state.SetQuotaChecker(quotaChecker)
+	// Token history and default quota come from local transcripts. Optional
+	// Codex quota polling runs independently of these file-only scans.
+	codexChecker := newCodexUsageCheckerWithOptions(resolveCodexConfigDir(*codexConfigDir), CodexQuotaPollOptions{
+		Enabled: *codexQuotaPoll,
+		Binary:  *codexBinary,
+	})
+	state.SetCodexUsageChecker(codexChecker)
+	usageSampler := newTokenUsageSampler(quotaChecker, codexChecker)
+	usageSampler.Refresh(time.Now())
 	if *selfCheck {
-		// The sampler is intentionally left unstarted here: its Collect() falls
+		// The metrics sampler is intentionally left unstarted here: its Collect() falls
 		// back to a direct platform collection when there is no warm snapshot yet,
 		// so the in-process checks exercise the real collector without background
 		// goroutines. The update checker is likewise left unstarted so -self-check
@@ -196,6 +208,10 @@ func main() {
 
 	quotaChecker.Start()
 	defer quotaChecker.Stop()
+	codexChecker.Start()
+	defer codexChecker.Stop()
+	usageSampler.Start()
+	defer usageSampler.Stop()
 
 	serve := func(stop <-chan struct{}, ready func()) error {
 		return serveAgent(listen, handler, stop, ready)
