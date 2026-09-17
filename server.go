@@ -151,6 +151,22 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 		}
 		writeJSON(w, http.StatusOK, checker.Status(time.Now().UTC()))
 	})
+	// Codex writes both cumulative token counters and the account's current
+	// quota windows into local session JSONL. Serve a cached, read-only summary;
+	// the checker never reads auth.json and never contacts OpenAI.
+	mux.HandleFunc("GET /api/codex-usage", func(w http.ResponseWriter, r *http.Request) {
+		checker := state.CodexUsageChecker()
+		if checker == nil {
+			writeJSON(w, http.StatusOK, CodexUsageStatus{
+				Configured: false,
+				Source:     "none",
+				Rows:       []QuotaRow{},
+				TokenDays:  []TokenUsageDay{},
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, checker.Status(time.Now().UTC()))
+	})
 	mux.HandleFunc("GET /api/settings", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, state.GetSettings())
 	})
