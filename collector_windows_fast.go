@@ -284,7 +284,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		return unavailableDisk(fmt.Sprintf("Windows disk collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &storage, func() StorageSet {
-		return windowsStorage(ctx, bridgeResult, bridgeErr)
+		return c.cachedWindowsStorage(ctx, bridgeResult, bridgeErr)
 	}, func(recovered any) StorageSet {
 		return unavailableStorage(fmt.Sprintf("Windows storage collector panicked: %v", recovered))
 	})
@@ -294,22 +294,22 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		return NetworkSet{Available: false, Error: fmt.Sprintf("Windows network collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &temperatures, func() TemperatureSet {
-		return windowsTemperaturesFromBridge(ctx, bridgeResult, bridgeErr)
+		return c.windowsTemperaturesFromBridge(ctx, bridgeResult, bridgeErr)
 	}, func(recovered any) TemperatureSet {
 		return TemperatureSet{Available: false, Error: fmt.Sprintf("Windows temperature collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &gpu, func() GPUSet {
-		return c.windowsGPU(ctx)
+		return c.cachedWindowsGPU(ctx)
 	}, func(recovered any) GPUSet {
 		return GPUSet{Available: false, Error: fmt.Sprintf("Windows GPU collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &tailscale, func() TailscaleStatus {
-		return readTailscaleStatus(ctx)
+		return c.cachedTailscaleStatus(ctx)
 	}, func(recovered any) TailscaleStatus {
 		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Windows Tailscale collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &swap, func() CapacityMetric {
-		return windowsSwap(ctx)
+		return c.cachedWindowsSwap(ctx)
 	}, func(recovered any) CapacityMetric {
 		return unavailableCapacity(fmt.Sprintf("Windows swap collector panicked: %v", recovered))
 	})
