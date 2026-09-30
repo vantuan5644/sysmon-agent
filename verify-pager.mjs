@@ -140,14 +140,16 @@ window.addEventListener("load", function () {
   if (alertsChip) {
     alertsChip.hidden = false;
   }
-  // Page 4 (Claude quota) is conditional: renderQuota() un-hides it only on a
-  // configured host. The fixture must un-hide and FILL it like the real render
-  // path does, or it measures 0px and trips the every-page-fills-the-pager
-  // assert below -- a failure that reads as a layout bug but is only a fixture
-  // artefact.
+  // Page 4 is conditional and each provider is conditional within it. Un-hide
+  // both providers and populate quota rows plus seven-day charts so this probes
+  // the real worst-case AI usage layout.
   var quotaPage = document.getElementById("quotaPage");
   if (quotaPage) {
     quotaPage.hidden = false;
+    var claudeUsage = document.getElementById("claudeUsage");
+    var codexUsage = document.getElementById("codexUsage");
+    claudeUsage.hidden = false;
+    codexUsage.hidden = false;
     var quotaList = document.getElementById("quotaList");
     for (var q = 0; q < 4; q++) {
       var quotaRow = document.createElement("div");
@@ -158,6 +160,27 @@ window.addEventListener("load", function () {
         '<div class="quota-bar"><span class="quota-bar-fill"></span></div>' +
         '<div class="quota-note">resets in 3d</div>';
       quotaList.appendChild(quotaRow);
+    }
+    var codexList = document.getElementById("codexQuotaList");
+    var codexRow = document.createElement("div");
+    codexRow.className = "quota-row";
+    codexRow.innerHTML =
+      '<div class="quota-row-head"><span class="quota-label">Weekly</span>' +
+      '<span class="quota-pct">18%</span></div>' +
+      '<div class="quota-bar"><span class="quota-bar-fill"></span></div>' +
+      '<div class="quota-note">resets in 6d</div>';
+    codexList.appendChild(codexRow);
+    for (var chartId of ["claudeTokenChart", "codexTokenChart"]) {
+      var chart = document.getElementById(chartId);
+      for (var d = 0; d < 7; d++) {
+        var day = document.createElement("div");
+        day.className = "token-day";
+        day.innerHTML =
+          '<span class="token-day-value">' + (d + 1) + '.2M</span>' +
+          '<span class="token-day-track"><span class="token-day-bar"></span></span>' +
+          '<span class="token-day-label">Mon</span>';
+        chart.appendChild(day);
+      }
     }
   }
   var quotaDot = document.getElementById("pageDot3");

@@ -503,3 +503,30 @@ func parseGitHubReleaseBody(data []byte) (ReleaseInfo, error) {
 // gets introduced for follow-up asset-disk tests; today it is a compile-time
 // anchor only.
 var _ = fs.ErrNotExist
+
+// TestUpdateCheckerAppliesDefaultStartupDelay guards the same zero-value trap
+// TestQuotaCheckerAppliesDefaultStartupDelay describes: main.go leaves
+// StartupDelay unset, so a `< 0` guard dropped the delay to 0 and fired the
+// first outbound GitHub call during startup instead of after it.
+func TestUpdateCheckerAppliesDefaultStartupDelay(t *testing.T) {
+	checker := newUpdateChecker(UpdateCheckerOptions{CurrentVersion: "v1.0.0", Enabled: true})
+	if checker.startupDelay != updateCheckStartupDelay {
+		t.Errorf("startupDelay = %v, want the %v default", checker.startupDelay, updateCheckStartupDelay)
+	}
+	if checker.interval != updateCheckInterval {
+		t.Errorf("interval = %v, want the %v default", checker.interval, updateCheckInterval)
+	}
+
+	custom := newUpdateChecker(UpdateCheckerOptions{
+		CurrentVersion: "v1.0.0",
+		Enabled:        true,
+		StartupDelay:   time.Hour,
+		Interval:       2 * time.Hour,
+	})
+	if custom.startupDelay != time.Hour {
+		t.Errorf("explicit startupDelay = %v, want 1h", custom.startupDelay)
+	}
+	if custom.interval != 2*time.Hour {
+		t.Errorf("explicit interval = %v, want 2h", custom.interval)
+	}
+}

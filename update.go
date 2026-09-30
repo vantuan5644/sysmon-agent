@@ -158,7 +158,7 @@ func newUpdateChecker(opts UpdateCheckerOptions) *UpdateChecker {
 	if opts.Interval <= 0 {
 		opts.Interval = updateCheckInterval
 	}
-	if opts.StartupDelay < 0 {
+	if opts.StartupDelay <= 0 {
 		opts.StartupDelay = updateCheckStartupDelay
 	}
 	if opts.HTTPClient == nil {

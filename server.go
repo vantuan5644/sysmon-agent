@@ -68,6 +68,14 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 		}
 		writeJSON(w, http.StatusOK, metrics)
 	})
+	// OSD reads never call Collect or Subscribe, so they do not wake the full
+	// dashboard slow lane. Sampling remains owned by the resident sampler.
+	if osd, ok := collector.(interface{ OSDSnapshot() osdMetrics }); ok {
+		mux.HandleFunc("GET /api/osd", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "no-store")
+			writeJSON(w, http.StatusOK, osd.OSDSnapshot())
+		})
+	}
 	// Server-Sent Events stream of warm snapshots, registered only when the
 	// underlying collector is a resident sampler (metricsStreamer). The detection
 	// uses the original collector, before the caching/coalescing wrappers, because
@@ -147,6 +155,22 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 		checker := state.QuotaChecker()
 		if checker == nil {
 			writeJSON(w, http.StatusOK, QuotaStatus{Configured: false, Source: "none", Rows: []QuotaRow{}})
+			return
+		}
+		writeJSON(w, http.StatusOK, checker.Status(time.Now().UTC()))
+	})
+	// Codex writes both cumulative token counters and the account's current
+	// quota windows into local session JSONL. Serve a cached, read-only summary;
+	// the checker never reads auth.json and never contacts OpenAI.
+	mux.HandleFunc("GET /api/codex-usage", func(w http.ResponseWriter, r *http.Request) {
+		checker := state.CodexUsageChecker()
+		if checker == nil {
+			writeJSON(w, http.StatusOK, CodexUsageStatus{
+				Configured: false,
+				Source:     "none",
+				Rows:       []QuotaRow{},
+				TokenDays:  []TokenUsageDay{},
+			})
 			return
 		}
 		writeJSON(w, http.StatusOK, checker.Status(time.Now().UTC()))

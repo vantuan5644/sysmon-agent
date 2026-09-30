@@ -55,6 +55,21 @@ const (
 	// immediate retry.
 	quotaPollBackoffOn429 = 15 * time.Minute
 
+	// quotaPollRetryOnCredential is the retry delay after a credential-stage
+	// failure — an unreadable .credentials.json, no OAuth token, or an expired
+	// one. These are deliberately NOT held to quotaPollInterval. That cadence
+	// exists to keep us off a stingy rate-limited endpoint, and a credential
+	// failure never reaches the network: the cost of retrying is one local file
+	// read. They are also the only failures fixed externally within seconds,
+	// because Claude Code rewrites the file when it refreshes. Measured on
+	// omarchy: the poll failed at 18:02:30, Claude Code refreshed the token at
+	// 18:03:00, and the page went on telling the user to "run any Claude Code
+	// session" until the next interval poll at 18:07:30 — while they were
+	// running one. A 401 keeps the normal cadence on purpose: that one did
+	// reach the network, so retrying it hard would hammer the endpoint with a
+	// credential the server has already rejected.
+	quotaPollRetryOnCredential = 30 * time.Second
+
 	// quotaPollStartupDelay spaces the first poll away from agent start so a
 	// boot-time network blip does not immediately flag the live path failed.
 	quotaPollStartupDelay = 30 * time.Second
@@ -151,6 +166,9 @@ type QuotaStatus struct {
 	Configured bool       `json:"configured"`
 	Source     string     `json:"source"` // "live" | "cache" | "snapshot" | "none"
 	Rows       []QuotaRow `json:"rows"`
+	// TokenDays is a rolling seven-day total derived from Claude's local
+	// transcripts. omitempty preserves the existing feature-off wire shape.
+	TokenDays []TokenUsageDay `json:"token_days,omitempty"`
 	// FetchedAt / AgeSeconds describe the FRESHEST contributor (the snapshot
 	// once the status line has written it; otherwise the live cache or the
 	// agent's own last successful poll). Per-model and credit rows keep the
@@ -577,6 +595,11 @@ type QuotaChecker struct {
 	statusCache   QuotaStatus
 	statusCacheAt time.Time
 
+	// Transcript aggregation is costlier than the small quota-file merge, so
+	// the resident usage sampler keeps it warm outside request handling.
+	tokenDays []TokenUsageDay
+	tokenErr  error
+
 	stop    chan struct{}
 	stopped chan struct{}
 	started bool
@@ -605,7 +628,7 @@ func newQuotaChecker(opts QuotaCheckerOptions) *QuotaChecker {
 	if opts.Interval <= 0 {
 		opts.Interval = quotaPollInterval
 	}
-	if opts.StartupDelay < 0 {
+	if opts.StartupDelay <= 0 {
 		opts.StartupDelay = quotaPollStartupDelay
 	}
 	if opts.HTTPClient == nil {
@@ -614,7 +637,7 @@ func newQuotaChecker(opts QuotaCheckerOptions) *QuotaChecker {
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
 	}
-	return &QuotaChecker{
+	checker := &QuotaChecker{
 		configDir:    opts.ConfigDir,
 		poll:         opts.Poll,
 		interval:     opts.Interval,
@@ -623,6 +646,10 @@ func newQuotaChecker(opts QuotaCheckerOptions) *QuotaChecker {
 		httpClient:   opts.HTTPClient,
 		logf:         opts.Logf,
 	}
+	if opts.ConfigDir != "" {
+		checker.tokenDays, _, _ = emptyTokenUsageDays(time.Now())
+	}
+	return checker
 }
 
 // Start launches the optional live poll loop. It is safe to call when polling
@@ -776,8 +803,36 @@ func (c *QuotaChecker) computeStatus(now time.Time) QuotaStatus {
 	if len(status.Rows) == 0 && len(problems) == 0 {
 		problems = append(problems, "no quota data yet; run a Claude Code session so the status line writes quota.json")
 	}
+	tokenDays, tokenErr := c.claudeTokenUsage()
+	status.TokenDays = tokenDays
+	if tokenErr != nil {
+		problems = append(problems, tokenErr.Error())
+	}
 	status.Error = strings.Join(problems, "; ")
 	return status
+}
+
+func (c *QuotaChecker) claudeTokenUsage() ([]TokenUsageDay, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.tokenDays, c.tokenErr
+}
+
+// refreshTokenUsage performs the transcript scan for the resident usage
+// sampler. HTTP handlers only read the completed snapshot above.
+func (c *QuotaChecker) refreshTokenUsage(now time.Time) {
+	if c == nil || c.configDir == "" {
+		return
+	}
+	days, _, err := scanClaudeTokenUsage(c.configDir, now)
+	c.mu.Lock()
+	if err == nil || len(c.tokenDays) == 0 {
+		c.tokenDays = days
+	}
+	c.tokenErr = err
+	// An already-cached /api/quota response must observe this new snapshot.
+	c.statusCacheAt = time.Time{}
+	c.mu.Unlock()
 }
 
 // orderQuotaRows renders the map in the canonical order all four surfaces use:
@@ -843,10 +898,13 @@ func (c *QuotaChecker) loop() {
 		return
 	case <-time.After(c.startupDelay):
 	}
+	var lastFailure string
 	for {
 		backoff, err := c.pollOnce()
-		if err != nil {
-			c.logf("claude quota poll failed: %v", err)
+		var line string
+		line, lastFailure = quotaPollLogLine(lastFailure, err)
+		if line != "" {
+			c.logf("%s", line)
 		}
 		wait := c.interval
 		if backoff > 0 {
@@ -860,15 +918,42 @@ func (c *QuotaChecker) loop() {
 	}
 }
 
+// quotaPollLogLine decides what one poll outcome should write to the journal,
+// given the previously logged failure reason. It returns the line ("" for
+// silence) and the reason to carry into the next call.
+//
+// Credential failures now retry every quotaPollRetryOnCredential rather than
+// every interval, so logging each attempt would write ~120 lines an hour for a
+// host that is simply an API-key user with no OAuth token. A repeated reason is
+// therefore logged once; a changed reason and the recovery are always logged,
+// so the journal still shows when the live path broke and when it came back.
+// Pure so the policy is testable without driving the loop's timers; the state
+// it threads lives in loop(), which is the only goroutine that calls it.
+func quotaPollLogLine(previousFailure string, err error) (line string, nextFailure string) {
+	if err != nil {
+		reason := err.Error()
+		if reason == previousFailure {
+			return "", reason
+		}
+		return "claude quota poll failed: " + reason, reason
+	}
+	if previousFailure != "" {
+		return "claude quota poll recovered", ""
+	}
+	return "", ""
+}
+
 // pollOnce performs one usage-endpoint poll. It returns a backoff duration to
-// honour (non-zero only after a 429) and the failure, if any. The access token
+// honour — quotaPollBackoffOn429 after a 429, quotaPollRetryOnCredential after
+// a pre-network credential failure, 0 to keep the normal cadence — and the
+// failure, if any. The access token
 // is read per-poll, sent only to the usage host, and never logged, persisted,
 // or included in any HTTP response the agent itself serves.
 func (c *QuotaChecker) pollOnce() (time.Duration, error) {
 	token, err := readQuotaAccessToken(c.configDir)
 	if err != nil {
 		c.cacheLiveError(err.Error())
-		return 0, err
+		return quotaPollRetryOnCredential, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), quotaRequestTimeout)
