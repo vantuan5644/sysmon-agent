@@ -198,6 +198,10 @@ type lhmDaemon struct {
 // transient failure for which the caller should degrade the current sample and
 // let the next pass heal.
 func (d *lhmDaemon) read(ctx context.Context) (lhmBridgeResult, error) {
+	return d.readRequest(ctx, "read")
+}
+
+func (d *lhmDaemon) readRequest(ctx context.Context, request string) (lhmBridgeResult, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -215,12 +219,12 @@ func (d *lhmDaemon) read(ctx context.Context) (lhmBridgeResult, error) {
 		// reads the request line.
 		deadline = lhmDaemonColdReadTimeout
 	}
-	result, err := d.requestLocked(ctx, deadline)
+	result, err := d.requestLocked(ctx, deadline, request)
 	if err != nil {
 		d.handleFailureLocked()
 		return lhmBridgeResult{}, err
 	}
-	d.handleSuccessLocked()
+	d.handleSuccessLocked(request != "osd")
 	return result, nil
 }
 
@@ -267,8 +271,8 @@ func (d *lhmDaemon) ensureAliveLocked(ctx context.Context) error {
 	return nil
 }
 
-func (d *lhmDaemon) requestLocked(ctx context.Context, deadline time.Duration) (lhmBridgeResult, error) {
-	if _, err := d.stdin.Write([]byte("read\n")); err != nil {
+func (d *lhmDaemon) requestLocked(ctx context.Context, deadline time.Duration, request string) (lhmBridgeResult, error) {
+	if _, err := d.stdin.Write([]byte(request + "\n")); err != nil {
 		return lhmBridgeResult{}, fmt.Errorf("write LibreHardwareMonitor daemon request: %w", err)
 	}
 	line, err := d.readLineLocked(deadline, ctx)
@@ -339,11 +343,14 @@ func (d *lhmDaemon) recordFailureLocked() {
 	}
 }
 
-func (d *lhmDaemon) handleSuccessLocked() {
+func (d *lhmDaemon) handleSuccessLocked(fullRead bool) {
 	d.everSucceeded = true
 	d.consecFailures = 0
 	d.coldRead = false
-	d.reads++
+	// Lightweight OSD reads should not accelerate full-snapshot recycling.
+	if fullRead {
+		d.reads++
+	}
 	if d.reads >= lhmDaemonRecycleReads || time.Since(d.startedAt) >= lhmDaemonRecycleAge {
 		// Recycle: tear down so the next read re-spawns with a fresh Open(),
 		// re-enumerating any hot-plugged hardware and shedding driver drift.

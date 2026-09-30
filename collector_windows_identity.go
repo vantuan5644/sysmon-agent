@@ -96,7 +96,7 @@ func (c *systemCollector) collectNetworkUplink(ctx context.Context) NetworkUplin
 	c.mu.Lock()
 	cached, at := c.uplink, c.uplinkAt
 	c.mu.Unlock()
-	if !at.IsZero() && time.Since(at) < uplinkCacheTTL {
+	if !at.IsZero() && time.Since(at) < windowsUplinkCacheTTL {
 		return cached
 	}
 

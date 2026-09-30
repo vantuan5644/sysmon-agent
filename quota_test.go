@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -166,6 +167,9 @@ func TestQuotaStatusSnapshotOnly(t *testing.T) {
 	status := checker.Status(now)
 	if !status.Configured || status.Source != "snapshot" {
 		t.Fatalf("configured/source = %v/%q, want true/snapshot", status.Configured, status.Source)
+	}
+	if len(status.TokenDays) != tokenUsageDays {
+		t.Fatalf("token_days = %d, want %d", len(status.TokenDays), tokenUsageDays)
 	}
 	if row, ok := quotaRowByID(status, "five_hour"); !ok || row.Percent != 7 {
 		t.Fatalf("five_hour row = %+v ok=%v", row, ok)
@@ -570,6 +574,97 @@ func TestQuotaPollerExpiredTokenNeverCallsOut(t *testing.T) {
 	}
 }
 
+// A credential-stage failure is resolved externally, by Claude Code rewriting
+// .credentials.json, and it never reaches the network - so the rate-limit
+// reasoning behind the 5-minute cadence does not apply to it. Measured on
+// omarchy: the poll failed at 18:02:30, Claude Code refreshed the token at
+// 18:03:00, and the page kept telling the user to "run any Claude Code session"
+// until the next interval poll at 18:07:30 while they were running one.
+func TestQuotaPollerRetriesCredentialFailuresQuickly(t *testing.T) {
+	if quotaPollRetryOnCredential >= quotaPollInterval {
+		t.Fatalf("credential retry %v must be shorter than the poll interval %v", quotaPollRetryOnCredential, quotaPollInterval)
+	}
+
+	dir := t.TempDir()
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		fmt.Fprint(w, sampleLivePayload())
+	}))
+	defer server.Close()
+
+	checker := newQuotaChecker(QuotaCheckerOptions{
+		ConfigDir:  dir,
+		Poll:       true,
+		UsageURL:   server.URL,
+		HTTPClient: server.Client(),
+	})
+
+	// No credentials file at all.
+	backoff, err := checker.pollOnce()
+	if err == nil || backoff != quotaPollRetryOnCredential {
+		t.Fatalf("missing credentials backoff = %v (err %v), want %v", backoff, err, quotaPollRetryOnCredential)
+	}
+
+	quotaTestCredentials(t, dir, "tok", time.Now().Add(-time.Hour))
+	backoff, err = checker.pollOnce()
+	if err == nil || !strings.Contains(err.Error(), "expired") || backoff != quotaPollRetryOnCredential {
+		t.Fatalf("expired token backoff = %v (err %v), want %v", backoff, err, quotaPollRetryOnCredential)
+	}
+
+	quotaTestCredentials(t, dir, "", time.Now().Add(time.Hour))
+	backoff, err = checker.pollOnce()
+	if err == nil || !strings.Contains(err.Error(), "no OAuth token") || backoff != quotaPollRetryOnCredential {
+		t.Fatalf("absent token backoff = %v (err %v), want %v", backoff, err, quotaPollRetryOnCredential)
+	}
+
+	if called {
+		t.Fatal("a credential-stage failure must not reach the network")
+	}
+
+	// Recovery must be immediate once the credential is usable again, and a
+	// success returns to the normal cadence.
+	quotaTestCredentials(t, dir, "tok", time.Now().Add(time.Hour))
+	if backoff, err := checker.pollOnce(); err != nil || backoff != 0 {
+		t.Fatalf("recovered poll = (%v, %v), want (0, nil)", backoff, err)
+	}
+	if status := checker.Status(time.Now()); status.Error != "" {
+		t.Fatalf("recovered status error = %q, want cleared", status.Error)
+	}
+}
+
+// The faster retry must not turn a permanent condition (an API-key user with no
+// OAuth token) into ~120 journal lines an hour, so a repeated reason is logged
+// once and the recovery is logged once.
+func TestQuotaPollLogLineDedupesRepeatsAndReportsRecovery(t *testing.T) {
+	boom := errors.New("token expired — run any Claude Code session")
+	other := errors.New("rate limited")
+
+	line, state := quotaPollLogLine("", boom)
+	if line == "" || !strings.Contains(line, "token expired") {
+		t.Fatalf("first failure line = %q, want the reason", line)
+	}
+	if repeat, next := quotaPollLogLine(state, boom); repeat != "" || next != state {
+		t.Fatalf("repeated failure logged %q (state %q), want silence", repeat, next)
+	}
+
+	changed, state := quotaPollLogLine(state, other)
+	if changed == "" || !strings.Contains(changed, "rate limited") {
+		t.Fatalf("changed failure line = %q, want the new reason", changed)
+	}
+
+	recovered, state := quotaPollLogLine(state, nil)
+	if recovered == "" || !strings.Contains(recovered, "recovered") {
+		t.Fatalf("recovery line = %q, want a recovery note", recovered)
+	}
+	if state != "" {
+		t.Fatalf("recovery left state %q, want cleared", state)
+	}
+	if quiet, next := quotaPollLogLine("", nil); quiet != "" || next != "" {
+		t.Fatalf("steady success logged %q (state %q), want silence", quiet, next)
+	}
+}
+
 func TestQuotaCheckerStartStopIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	quotaTestCredentials(t, dir, "tok", time.Now().Add(time.Hour))
@@ -647,5 +742,35 @@ func TestQuotaHandlerServesWiredChecker(t *testing.T) {
 	}
 	if !status.Configured || status.Source != "snapshot" {
 		t.Fatalf("wired quota body = %+v", status)
+	}
+}
+
+// TestQuotaCheckerAppliesDefaultStartupDelay pins the zero value to the
+// documented default. main.go leaves StartupDelay unset, so a `< 0` guard here
+// silently made the first poll fire in the same instant the agent started --
+// the exact window in which Claude Code has not yet refreshed an expired token,
+// so the poll failed and the page sat on "no quota data yet" for a full
+// interval. Interval is checked alongside it because they share the guard.
+func TestQuotaCheckerAppliesDefaultStartupDelay(t *testing.T) {
+	checker := newQuotaChecker(QuotaCheckerOptions{ConfigDir: t.TempDir(), Poll: true})
+	if checker.startupDelay != quotaPollStartupDelay {
+		t.Errorf("startupDelay = %v, want the %v default", checker.startupDelay, quotaPollStartupDelay)
+	}
+	if checker.interval != quotaPollInterval {
+		t.Errorf("interval = %v, want the %v default", checker.interval, quotaPollInterval)
+	}
+
+	// An explicit override still wins.
+	custom := newQuotaChecker(QuotaCheckerOptions{
+		ConfigDir:    t.TempDir(),
+		Poll:         true,
+		StartupDelay: time.Hour,
+		Interval:     2 * time.Hour,
+	})
+	if custom.startupDelay != time.Hour {
+		t.Errorf("explicit startupDelay = %v, want 1h", custom.startupDelay)
+	}
+	if custom.interval != 2*time.Hour {
+		t.Errorf("explicit interval = %v, want 2h", custom.interval)
 	}
 }

@@ -67,13 +67,15 @@ type sampler struct {
 	slowEvery time.Duration
 	idleAfter time.Duration
 
-	mu           sync.Mutex
-	working      Metrics
-	snapshot     Metrics
-	snapshotJSON []byte
-	haveSnapshot bool
-	lastDemandAt time.Time
-	subs         map[*subscriber]struct{}
+	mu              sync.Mutex
+	working         Metrics
+	snapshot        Metrics
+	snapshotJSON    []byte
+	haveSnapshot    bool
+	lastDemandAt    time.Time
+	lastOSDDemandAt time.Time
+	osdHardware     osdHardware
+	subs            map[*subscriber]struct{}
 
 	started bool
 	cancel  context.CancelFunc
@@ -169,6 +171,10 @@ func (s *sampler) Start() {
 	// and spawn nothing long-lived.
 	if br, ok := s.inner.(interface{ EnablePersistentBridge() }); ok {
 		br.EnablePersistentBridge()
+	}
+	if collector, ok := s.inner.(osdHardwareCollector); ok {
+		s.wg.Add(1)
+		go s.runOSDLoop(ctx, collector)
 	}
 
 	if s.lanes == nil {

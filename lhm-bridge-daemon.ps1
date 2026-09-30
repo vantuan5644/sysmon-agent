@@ -19,9 +19,8 @@
 #     the per-read loop below keeps emitting a single unavailable error object
 #     for every request, so the agent degrades identically to the one-shot
 #     bridge instead of churning process restarts.
-#   - For each non-empty line read from stdin (content is ignored; any line is a
-#     "read" request): Update all hardware + subhardware, build the result
-#     object, write exactly one compact JSON line, flush.
+#   - "osd" updates CPU/GPU hardware only; other lines request the full sensor
+#     snapshot. Both modes write one compact JSON line and flush.
 #   - On a per-read exception: write one unavailable error object, flush, keep
 #     looping. The agent decides whether to recycle.
 #   - On stdin EOF (ReadLine returns $null, i.e. the agent closed stdin for a
@@ -413,6 +412,49 @@ function Read-LhmSnapshot($computer) {
     return $result | ConvertTo-Json -Compress -Depth 6
 }
 
+# OSD requests update only CPU/GPU nodes. They use the same already-open
+# Computer and skip storage, motherboard, PSU, and the full result traversal.
+function Read-LhmOsdSnapshot($computer) {
+    $temperatures = New-Object System.Collections.Generic.List[object]
+    $devices = New-Object System.Collections.Generic.List[object]
+    foreach ($hw in $computer.Hardware) {
+        $cpu = Test-CpuNode $hw
+        $gpu = $hw.HardwareType.ToString() -match '^Gpu(Nvidia|Amd|Intel)$'
+        if (-not $cpu -and -not $gpu) { continue }
+        $updated = $true
+        try { $hw.Update() } catch { $updated = $false }
+        $sensors = @()
+        if ($updated) {
+            $sensors = @($hw.Sensors)
+            foreach ($sub in $hw.SubHardware) {
+                try { $sub.Update(); $sensors += @($sub.Sensors) } catch {}
+            }
+        }
+        if ($cpu) {
+            foreach ($sensor in $sensors) {
+                if ($sensor.SensorType -eq 'Temperature' -and $null -ne $sensor.Value -and
+                    (Test-PlausibleTemperature ([double]$sensor.Value)) -and (Test-LiveTemperature $sensor.Name)) {
+                    $temperatures.Add(@{name=($hw.Name + ' ' + $sensor.Name).Trim();value=[math]::Round([double]$sensor.Value,2)})
+                }
+            }
+        }
+        if ($gpu) {
+            $load = $sensors | Where-Object { $_.SensorType -eq 'Load' -and $_.Name -eq 'GPU Core' -and $null -ne $_.Value } | Select-Object -First 1
+            $temp = $sensors | Where-Object { $_.SensorType -eq 'Temperature' -and $_.Name -eq 'GPU Core' -and $null -ne $_.Value } | Select-Object -First 1
+            $usage = @{available=$false;value=0;unit='%';error='GPU core load unavailable'}
+            $temperature = @{available=$false;value=0;unit='C';error='GPU core temperature unavailable'}
+            if ($load -and [double]$load.Value -ge 0 -and [double]$load.Value -le 100) {
+                $usage = @{available=$true;value=[math]::Round([double]$load.Value,2);unit='%'}
+            }
+            if ($temp -and (Test-PlausibleTemperature ([double]$temp.Value))) {
+                $temperature = @{available=$true;value=[math]::Round([double]$temp.Value,2);unit='C'}
+            }
+            $devices.Add(@{name=$hw.Name;usage_percent=$usage;temperature_celsius=$temperature})
+        }
+    }
+    return @{available=$true;temperatures=$temperatures;gpu=$devices} | ConvertTo-Json -Compress -Depth 6
+}
+
 # --- Startup: Open() the Computer once and prime it. ---
 $dll = Find-LhmLibrary
 $computer = $null
@@ -474,6 +516,8 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     try {
         if ($startupError) {
             $json = New-ErrorObject $startupError | ConvertTo-Json -Compress -Depth 6
+        } elseif ($line -eq 'osd') {
+            $json = Read-LhmOsdSnapshot $computer
         } else {
             $json = Read-LhmSnapshot $computer
         }

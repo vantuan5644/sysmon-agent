@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,62 @@ import (
 // available:false forever on the real host, which per-field graceful degradation
 // makes invisible. Keep every key the daemon emits represented here.
 const goodBridgeJSON = `{"available":true,"power":{"available":true,"value":88.08},"cpu_clock":{"available":true,"value":4500},"cpu_clock_peak_core":{"available":true,"value":5504},"psu_output_power":{"available":true,"value":312.4},"temperatures":[{"name":"CPU Package","value":55.5}]}`
+
+func TestLhmDaemonOSDRequestUsesExistingTransport(t *testing.T) {
+	process := &fakeDaemonProcess{behaviors: []func(string) (string, fakeAction){func(line string) (string, fakeAction) {
+		if line != "osd" {
+			return `{"available":false,"error":"wrong request mode"}`, fakeRespond
+		}
+		return `{"available":true,"temperatures":[{"name":"CPU Package","value":63}],"gpu":[{"name":"fixture GPU","usage_percent":{"available":true,"value":84},"temperature_celsius":{"available":true,"value":59}}]}`, fakeRespond
+	}}}
+	installFakeDaemon(t, process)
+	d := &lhmDaemon{}
+	defer d.Close()
+	result, err := d.readRequest(context.Background(), "osd")
+	if err != nil || !result.Available || len(result.GPU) != 1 || result.GPU[0].Usage.Value != 84 || result.GPU[0].Temperature.Value != 59 {
+		t.Fatalf("OSD bridge result: %+v, %v", result, err)
+	}
+	if d.reads != 0 {
+		t.Fatal("OSD requests accelerated full-read recycling")
+	}
+}
+
+func TestLhmOSDScriptUpdatesOnlyCPUAndGPU(t *testing.T) {
+	shell, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("pwsh unavailable")
+	}
+	script := `
+$ErrorActionPreference = 'Stop'
+$tokens=$null; $errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'lhm-bridge-daemon.ps1'),[ref]$tokens,[ref]$errors)
+foreach ($name in @('Test-CpuNode','Test-PlausibleTemperature','Test-LiveTemperature','Read-LhmOsdSnapshot')) {
+    $function=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)
+    . ([scriptblock]::Create($function.Extent.Text))
+}
+$script:updates=New-Object System.Collections.Generic.List[string]
+function New-TestHardware($name,$type,$sensors) {
+    $hardware=[pscustomobject]@{Name=$name;HardwareType=$type;Sensors=$sensors;SubHardware=@()}
+    $hardware | Add-Member ScriptMethod Update { $script:updates.Add($this.Name); if ($this.Name -eq 'broken GPU') { throw 'fixture update failure' } }
+    return $hardware
+}
+$cpu=New-TestHardware 'CPU' 'Cpu' @([pscustomobject]@{Name='Package';SensorType='Temperature';Value=61})
+$gpu=New-TestHardware 'GPU' 'GpuNvidia' @([pscustomobject]@{Name='GPU Core';SensorType='Load';Value=79},[pscustomobject]@{Name='GPU Core';SensorType='Temperature';Value=54})
+$broken=New-TestHardware 'broken GPU' 'GpuNvidia' @([pscustomobject]@{Name='GPU Core';SensorType='Load';Value=99})
+$storage=New-TestHardware 'disk' 'Storage' @()
+$board=New-TestHardware 'board' 'Motherboard' @()
+$psu=New-TestHardware 'psu' 'Psu' @()
+$result=Read-LhmOsdSnapshot ([pscustomobject]@{Hardware=@($cpu,$storage,$gpu,$board,$broken,$psu)}) | ConvertFrom-Json
+if (($script:updates -join ',') -ne 'CPU,GPU,broken GPU') { throw 'OSD updated unrelated hardware' }
+if ($result.temperatures[0].value -ne 61 -or $result.gpu.Count -ne 2 -or $result.gpu[0].usage_percent.value -ne 79 -or $result.gpu[0].temperature_celsius.value -ne 54) { throw 'Incorrect OSD sensor selection' }
+if ($result.gpu[1].usage_percent.available) { throw 'Failed GPU update emitted an old reading' }
+Write-Output 'PASS: CPU/GPU-only sensor updates and partial failure'
+`
+	output, err := exec.Command(shell, "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("OSD sensor fixture: %v\n%s", err, output)
+	}
+}
 
 // fakeAction controls what a fake daemon instance does for a given request.
 type fakeAction int
