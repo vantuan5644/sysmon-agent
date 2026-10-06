@@ -11,6 +11,14 @@ param(
     [ValidateRange(1, 300)]
     [int]$ReadinessTimeoutSeconds = 45,
     [string]$SettingsPath = "$env:ProgramData\SysmonAgent\settings.json",
+    # Warn threshold for cpu_temperature, in Celsius (50-90; 0 keeps whatever
+    # is already saved). The 70 default suits a package or die reading, but on
+    # AMD the canonical sensor is Tctl, a control temperature that short
+    # single-core boost bursts keep high even at idle. A Ryzen 7950X idles near
+    # 62 C on Tctl, so 70 fires constantly there; with Tjmax at 95, 85 still
+    # warns well before throttling.
+    [ValidateScript({ $_ -eq 0 -or ($_ -ge 50 -and $_ -le 90) })]
+    [int]$TempWarn = 0,
     # Claude Code config directory for the dashboard quota page. Defaults to the
     # installing user profile when it exists. The service runs as LocalSystem,
     # whose HOME is the systemprofile directory, so without this the service can
@@ -33,7 +41,18 @@ param(
     [switch]$Force,
     # Update-only: report what would happen (resolve, compare, list the asset)
     # without downloading, verifying, or swapping.
-    [switch]$DryRun
+    [switch]$DryRun,
+    # Codex config directory for the AI usage page (quota and token history).
+    # As with -ClaudeConfigDir, the LocalSystem service cannot find the
+    # interactive user profile on its own, so it defaults to the installing
+    # user .codex folder when it exists. Pass an empty string to skip it.
+    [string]$CodexConfigDir = "$(if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.codex')) { Join-Path $env:USERPROFILE '.codex' } else { '' })",
+    # Refresh Codex quota through the Codex app server every five minutes.
+    # Token history stays file-only. LocalSystem does not share your PATH, so
+    # the CLI is resolved to an absolute path at install time; pass
+    # -CodexBinary when codex is not on the installing user PATH.
+    [switch]$CodexQuotaPoll,
+    [string]$CodexBinary = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,6 +90,24 @@ function Get-BinaryPath {
         if ($ClaudeQuotaPoll) {
             $binPath += ' -claude-quota-poll'
         }
+    }
+    if ($CodexConfigDir) {
+        $binPath += " -codex-config-dir $(Quote-Arg $CodexConfigDir)"
+        if ($CodexQuotaPoll) {
+            $quotaBinary = $CodexBinary
+            if (-not $quotaBinary) {
+                $quotaCommand = Get-Command codex -CommandType Application -ErrorAction SilentlyContinue
+                if ($quotaCommand) { $quotaBinary = $quotaCommand.Source }
+            }
+            if (-not $quotaBinary -or -not (Test-Path -LiteralPath $quotaBinary -PathType Leaf)) {
+                throw 'Codex quota polling requires an installed CLI. Pass -CodexBinary with its executable path.'
+            }
+            $quotaBinary = (Resolve-Path -LiteralPath $quotaBinary).Path
+            $binPath += " -codex-quota-poll -codex-binary $(Quote-Arg $quotaBinary)"
+        }
+    }
+    if ($TempWarn -ne 0) {
+        $binPath += " -temp-warn $TempWarn"
     }
     return $binPath
 }
@@ -258,6 +295,10 @@ function Get-QuotaCheckUrl {
     return "$(Get-AgentBaseUrl)/api/quota"
 }
 
+function Get-CodexUsageCheckUrl {
+    return "$(Get-AgentBaseUrl)/api/codex-usage"
+}
+
 function Wait-AgentReady {
     $readyUrl = Get-ReadinessCheckUrl
     $deadline = (Get-Date).AddSeconds($ReadinessTimeoutSeconds)
@@ -396,6 +437,34 @@ function Show-QuotaStatus {
     }
     if ($quota.error) {
         Write-Warning "Claude quota: $($quota.error)"
+    }
+}
+
+function Show-CodexUsageStatus {
+    $usageUrl = Get-CodexUsageCheckUrl
+    try {
+        $usage = Invoke-RestMethod -Method Get -Uri $usageUrl -TimeoutSec 4
+    } catch {
+        Write-Warning "Codex usage check failed at ${usageUrl}: $($_.Exception.Message)"
+        return
+    }
+    if (-not $usage.configured) {
+        Write-Host 'Codex usage page: not configured (no -codex-config-dir, or the directory is missing).'
+        return
+    }
+    # Same omitempty rule as the Claude quota readout above.
+    $age = if ($null -ne $usage.age_seconds) {
+        "$([int]$usage.age_seconds)s"
+    } elseif ($usage.fetched_at) {
+        '0s'
+    } else {
+        'unknown'
+    }
+    $tokens = (@($usage.token_days) | Measure-Object -Property tokens -Sum).Sum
+    $flag = if ($usage.stale) { ' STALE' } else { '' }
+    Write-Host "Codex usage page: source=$($usage.source), age=$age, rows=$(@($usage.rows).Count), 7d_tokens=$tokens$flag"
+    if ($usage.error) {
+        Write-Warning "Codex usage: $($usage.error)"
     }
 }
 
@@ -1006,6 +1075,7 @@ function Show-Status {
         Show-PwshStatus
         Show-DashboardSettings
         Show-QuotaStatus
+        Show-CodexUsageStatus
         Show-ClientCheckStatus
     } else {
         Write-Host "Service $ServiceName is not installed."
