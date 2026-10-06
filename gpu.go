@@ -23,7 +23,7 @@ func collectNVIDIAGPU(ctx context.Context) GPUSet {
 	cmd := exec.CommandContext(
 		queryCtx,
 		"nvidia-smi",
-		"--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+		"--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,pci.bus_id",
 		"--format=csv,noheader,nounits",
 	)
 	out, err := cmd.Output()
@@ -58,12 +58,18 @@ func parseNVIDIAGPUCSV(out string) GPUSet {
 			memory = nvidiaMemoryCapacity(memUsedMiB, memTotalMiB)
 		}
 
+		pciBusID := ""
+		if len(row) > 6 {
+			pciBusID = strings.TrimSpace(row[6])
+		}
 		devices = append(devices, GPUMetric{
-			Name:        name,
-			Usage:       usage,
-			Power:       power,
-			Memory:      memory,
-			Temperature: temp,
+			PCIBusID:           pciBusID,
+			HotspotTemperature: unavailableNumber("C", "NVIDIA hotspot sensor not reported"),
+			Name:               name,
+			Usage:              usage,
+			Power:              power,
+			Memory:             memory,
+			Temperature:        temp,
 		})
 	}
 

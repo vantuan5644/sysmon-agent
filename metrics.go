@@ -84,11 +84,13 @@ type TemperatureSet struct {
 }
 
 type GPUMetric struct {
-	Name        string         `json:"name"`
-	Usage       NumberMetric   `json:"usage_percent"`
-	Power       NumberMetric   `json:"power_watts"`
-	Memory      CapacityMetric `json:"memory"`
-	Temperature NumberMetric   `json:"temperature_celsius"`
+	HotspotTemperature NumberMetric   `json:"hotspot_temperature_celsius"`
+	PCIBusID           string         `json:"-"` // Internal identity for joining Linux helper readings.
+	Name               string         `json:"name"`
+	Usage              NumberMetric   `json:"usage_percent"`
+	Power              NumberMetric   `json:"power_watts"`
+	Memory             CapacityMetric `json:"memory"`
+	Temperature        NumberMetric   `json:"temperature_celsius"`
 }
 
 type GPUSet struct {

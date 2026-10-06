@@ -535,7 +535,7 @@ func TestSecurityHeadersApplyToAPIAndDashboard(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, path := range []string{"/api/status", "/api/quota", "/api/client-check", "/api/client-checks", "/"} {
+	for _, path := range []string{"/api/status", "/api/quota", "/api/codex-usage", "/api/client-check", "/api/client-checks", "/"} {
 		t.Run(path, func(t *testing.T) {
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -581,7 +581,7 @@ func TestClientCheckHandlerRecordsDashboardVisit(t *testing.T) {
 	}
 
 	post := httptest.NewRecorder()
-	postReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v129","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
+	postReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v140","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
 	postReq.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
 	postReq.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile Safari")
 	handler.ServeHTTP(post, postReq)
@@ -686,7 +686,7 @@ func TestStatusKeepsDeviceClientCheckAfterHistoryRotates(t *testing.T) {
 	}
 
 	device := httptest.NewRecorder()
-	deviceReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v129","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
+	deviceReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v140","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
 	deviceReq.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
 	deviceReq.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile Safari")
 	handler.ServeHTTP(device, deviceReq)
@@ -1002,6 +1002,41 @@ func TestEmbeddedServiceWorkerRoute(t *testing.T) {
 	}
 	if body := rec.Body.String(); !strings.Contains(body, "const STATIC_CACHE") || !strings.Contains(body, `url.pathname.startsWith("/api/")`) {
 		t.Fatalf("service worker body missing expected cache/API policy: %q", body)
+	}
+}
+
+// The dashboard font is embedded and precached by the service worker. Go's MIME
+// table has no .woff2, so the handler sets the type itself; without it the
+// response would go out as whatever the host's MIME database or sniffing says.
+func TestEmbeddedDashboardFontRoute(t *testing.T) {
+	handler, err := newHTTPHandler(fakeCollector{}, staticFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/fonts/jetbrains-mono.woff2", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "font/woff2" {
+		t.Fatalf("Content-Type = %q, want font/woff2", got)
+	}
+	if !strings.HasPrefix(rec.Body.String(), "wOF2") {
+		t.Fatalf("font body does not start with the woff2 signature")
+	}
+
+	sw, err := staticFS.ReadFile("static/sw.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sw), `"/fonts/jetbrains-mono.woff2"`) {
+		t.Fatalf("service worker does not precache the dashboard font")
+	}
+	if _, err := staticFS.ReadFile("static/fonts/OFL.txt"); err != nil {
+		t.Fatalf("font license must ship with the font: %v", err)
 	}
 }
 

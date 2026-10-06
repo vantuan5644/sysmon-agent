@@ -132,7 +132,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v129"`,
+		`const STATIC_CACHE = "sysmon-static-v140"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -408,7 +408,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 5000;`,
-		`const dashboardBuild = "sysmon-static-v129";`,
+		`const dashboardBuild = "sysmon-static-v140";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -1177,9 +1177,9 @@ func TestNarrowDeviceMetricCardsFitFourAcross(t *testing.T) {
 	for _, needle := range []string{
 		`@media (max-width: 360px) {`,
 		`.metric-card {`,
-		`padding: 8px 4px 7px;`,
+		`padding: 6px 4px 5px;`,
 		`.gauge {`,
-		`min-width: 54px;`,
+		`min-width: 0;`,
 		`.control-btn {`,
 		`padding: 0 6px;`,
 	} {
@@ -1217,8 +1217,8 @@ func TestLandscapeDeviceFillsViewportWithGauges(t *testing.T) {
 		`@media (orientation: landscape) and (max-height: 500px) {`,
 		`flex-direction: column;`,
 		`flex: 1 1 auto;`,
-		`width: min(42vh, 21vw);`,
-		`min-width: 92px;`,
+		`width: min(21vw, 172px, max(0px, calc(100cqh - 114px)));`,
+		`min-width: 0;`,
 		`.bottom-controls {`,
 		`display: none;`,
 	} {
@@ -1290,6 +1290,41 @@ func TestHiddenElementsAreActuallyHidden(t *testing.T) {
 			if !overrideRe.MatchString(cssText) {
 				t.Errorf("element with the hidden attribute uses .%s, which sets `display` but has no `.%s[hidden] { display: none }` override; `hidden` will not hide it in a real browser", class, class)
 			}
+		}
+	}
+}
+
+func TestAIUsagePageHasBothProvidersAndTokenCharts(t *testing.T) {
+	index, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{
+		`id="quotaPage" aria-label="AI usage"`,
+		`id="claudeUsage"`,
+		`id="codexUsage"`,
+		`id="claudeTokenChart"`,
+		`id="codexTokenChart"`,
+		`id="pageDot3" class="page-dot" type="button" aria-label="AI usage"`,
+	} {
+		if !strings.Contains(string(index), needle) {
+			t.Fatalf("index.html missing AI usage markup %q", needle)
+		}
+	}
+
+	app, err := staticFS.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{
+		`fetchCodexUsage();`,
+		`fetchWithTimeout("/api/codex-usage"`,
+		`function renderTokenChart(`,
+		`payload.token_days`,
+		`fetchQuota();`,
+	} {
+		if !strings.Contains(string(app), needle) {
+			t.Fatalf("app.js missing AI usage behavior %q", needle)
 		}
 	}
 }
@@ -1440,7 +1475,7 @@ func TestDashboardRendersPrimaryMetricSparklines(t *testing.T) {
 	for _, needle := range []string{
 		`.sparkline {`,
 		`grid-template-columns: repeat(24, minmax(0, 1fr));`,
-		`height: 18px;`,
+		`height: 24px;`,
 		`.sparkline-bar {`,
 		`height: var(--h, 3px);`,
 		`.sparkline-bar.unavailable {`,

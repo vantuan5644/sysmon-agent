@@ -1,10 +1,67 @@
 package main
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestLhmNvidiaHotspotSelection(t *testing.T) {
+	pwsh, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("PowerShell 7 is needed for bridge fixture execution")
+	}
+	for _, name := range lhmBridgeScriptFiles {
+		t.Run(name, func(t *testing.T) {
+			source := readLhmBridgeScript(t, name)
+			functions := sliceFunction(t, source, "Test-PlausibleTemperature") + "\n}\n" + sliceFunction(t, source, "Get-NvidiaHotspot") + "\n}\n"
+			script := `$ErrorActionPreference = 'Stop'
+` + functions + `
+$core = [pscustomobject]@{SensorType='Temperature'; Name='GPU Core'; Value=48}
+$memory = [pscustomobject]@{SensorType='Temperature'; Name='GPU Memory Junction'; Value=96}
+$spot = [pscustomobject]@{SensorType='Temperature'; Name='GPU Hot Spot'; Value=82.5}
+$hw = [pscustomobject]@{HardwareType='GpuNvidia'; Name='NVIDIA GeForce RTX 4090'; Identifier='/gpu-nvidia/0'; Sensors=@($memory,$core,$spot)}
+$r = @(Get-NvidiaHotspot $hw)
+if ($r.Count -ne 1 -or $r[0].value -ne 82.5 -or $r[0].name -ne $hw.Name) { throw 'wrong sensor or identity' }
+$spot.Value = $null
+if (@(Get-NvidiaHotspot $hw).Count -ne 0) { throw 'null sensor accepted' }
+$spot.Value = 0
+if (@(Get-NvidiaHotspot $hw).Count -ne 0) { throw 'zero sensor accepted' }
+$spot.Value = [double]::NaN
+if (@(Get-NvidiaHotspot $hw).Count -ne 0) { throw 'nonfinite sensor accepted' }
+$spot.Value = 82.5
+$spot.Name = 'GPU Hot Spot Limit'
+if (@(Get-NvidiaHotspot $hw).Count -ne 0) { throw 'threshold accepted' }
+$spot.Name = 'GPU Hotspot'
+$hw.HardwareType = 'GpuAmd'
+if (@(Get-NvidiaHotspot $hw).Count -ne 0) { throw 'non-NVIDIA accepted' }
+`
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			out, err := exec.CommandContext(ctx, pwsh, "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
+			if err != nil {
+				t.Fatalf("PowerShell fixtures: %v: %s", err, out)
+			}
+		})
+	}
+}
+
+// Direct self-check collection and the resident dashboard sampler have separate
+// Windows entrypoints. Both must enrich from the same already-fetched bridge.
+func TestWindowsGPUHotspotBothCollectionPaths(t *testing.T) {
+	for _, name := range []string{"collector_windows.go", "collector_windows_fast.go"} {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), "mergeWindowsGPUHotspots(gpu, bridgeResult.GPUHotspots, bridgeResult.Available && bridgeErr == nil)") {
+			t.Fatalf("%s does not attach hotspot readings to GPU metrics", name)
+		}
+	}
+}
 
 // The two LibreHardwareMonitor bridge scripts are independent implementations of
 // one JSON contract: lhm-bridge.ps1 is the one-shot (used by -self-check and as

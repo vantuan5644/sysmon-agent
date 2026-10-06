@@ -112,6 +112,8 @@ function firefoxEnv(root) {
 
 function writeFixture(root) {
   writeFileSync(join(root, "styles.css"), readFileSync(join(scriptDir, "static", "styles.css")));
+  mkdirSync(join(root, "fonts"));
+  writeFileSync(join(root, "fonts", "jetbrains-mono.woff2"), readFileSync(join(scriptDir, "static", "fonts", "jetbrains-mono.woff2")));
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -263,7 +265,7 @@ function verifyStaticLayout(fixturePath) {
     `@media (max-width: 480px)`,
     `grid-template-areas:`,
     `@media (max-width: 360px)`,
-    `min-width: 54px;`,
+    `min-width: 0;`,
     `@media (pointer: coarse)`,
     `grid-template-columns: repeat(4, 40px);`,
     `@media (max-width: 390px)`,
@@ -271,7 +273,7 @@ function verifyStaticLayout(fixturePath) {
     `grid-template-columns: repeat(4, minmax(0, 1fr));`,
     `@media (orientation: landscape) and (max-height: 500px)`,
     `flex: 1 1 auto;`,
-    `width: min(42vh, 21vw);`,
+    `width: min(21vw, 172px, max(0px, calc(100cqh - 114px)));`,
     `flex-direction: row;`,
     `padding-bottom: calc(env(safe-area-inset-bottom) + 4px);`,
     `touch-action: manipulation;`,
