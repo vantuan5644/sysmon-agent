@@ -41,10 +41,18 @@ Optional but recommended for production:
 - **Tailscale** + `tailscale serve` (recommended) to publish the dashboard over HTTPS for the
   device PWA install path.
 
+Optional, NVIDIA RTX 3090 / RTX 4090 only:
+
+- **GPU hotspot temperature**: the `sysmon-gpu-hotspot` root helper, installed with
+  `install-gpu-hotspot.sh` (systemd, x86_64). It reads `/dev/mem`, so kernel lockdown (Secure
+  Boot) must be off, and kernels built with `CONFIG_IO_STRICT_DEVMEM` also need `iomem=relaxed`
+  on the kernel command line. See the README's "NVIDIA GPU hotspot temperature" section.
+
 ## Runtime — Windows
 
-- **PowerShell 5.1** (`powershell.exe`) — ships with Windows. Used for CPU, RAM, disk,
-  network, and ACPI queries.
+- **PowerShell 5.1** (`powershell.exe`) — ships with Windows. Used only for slow-changing
+  data (hardware identity, pagefile, physical-disk discovery) and ACPI fallback queries; live
+  CPU, RAM, process, network, and disk-capacity numbers come from native Win32 APIs.
 - **PowerShell 7+** (`pwsh`) — required only for the LibreHardwareMonitor bridge. Install via
   `winget install Microsoft.PowerShell`. Without pwsh the bridge is skipped and CPU power +
   board/CPU temps stay unavailable. Install it **machine-wide**

@@ -46,13 +46,14 @@ years-old handset with nothing plugged in makes a perfect, near-zero-power desk 
   inner**), a small live trend per card, and amber/red warning thresholds.
 - 🔘 **Quick controls** — mute mic, play/pause media, mute speaker, and lock the screen
   straight from the dashboard footer.
-- 🧮 **Claude Code quota page** — an optional fourth page showing plan usage (5-hour
-  session, weekly, per-model weeklies, usage credits). Reads the local files Claude Code
-  already writes; hidden unless you point the agent at a config directory.
+- 🧮 **AI usage page** — an optional fourth page with Claude Code plan usage (5-hour
+  session, weekly, per-model weeklies, usage credits), Codex quota, and a seven-day token
+  chart for each. Reads the local files both tools already write; hidden unless you point
+  the agent at a config directory.
 - ♻️ **Graceful degradation** — a sensor that can't be read shows `unavailable` with a
   reason; it never breaks the rest of the dashboard.
-- 🐧 🪟 **Cross-platform** — Linux (`/proc` + sysfs + RAPL) and Windows (PowerShell + an
-  embedded LibreHardwareMonitor bridge for CPU power and board temps).
+- 🐧 🪟 **Cross-platform** — Linux (`/proc` + sysfs + RAPL) and Windows (native Win32 APIs +
+  an embedded LibreHardwareMonitor bridge for CPU power, board temps, and the GPU hotspot).
 
 ---
 
@@ -117,6 +118,9 @@ SYSMON_BIND=127.0.0.1 SYSMON_PORT=9099 ./sysmon-agent
 | `/api/status` | agent metadata + active display settings |
 | `/api/metrics` | the live metrics payload |
 | `/api/stream` | Server-Sent Events live metrics push |
+| `/api/osd` | small cached CPU/GPU payload for an on-screen display overlay |
+| `/api/quota` | Claude Code quota + token history (AI usage page) |
+| `/api/codex-usage` | Codex quota + token history (AI usage page) |
 
 When bound to a wildcard like `0.0.0.0`, startup logs print likely dashboard URLs
 (Tailscale addresses first), skipping virtual/container interfaces. Open the port through
@@ -140,8 +144,11 @@ value keeps the saved default.
 | `-cpu-warn` / `-mem-warn` / `-disk-warn` / `-gpu-warn` | 50–90 | utilization warn thresholds (%) |
 | `-temp-warn` / `SYSMON_TEMP_WARN` | 50–90 (°C) | temperature warn threshold |
 | `-settings` / `SYSMON_SETTINGS` | path | optional JSON file for persisted settings |
-| `-claude-config-dir` / `SYSMON_CLAUDE_CONFIG_DIR` | path | Claude Code config dir for the quota page (default `$CLAUDE_CONFIG_DIR`, then `$HOME/.claude`; missing = page hidden) |
+| `-claude-config-dir` / `SYSMON_CLAUDE_CONFIG_DIR` | path | Claude Code config dir for the AI usage page (default `$CLAUDE_CONFIG_DIR`, then `$HOME/.claude`; missing = Claude section hidden) |
 | `-claude-quota-poll` / `SYSMON_CLAUDE_QUOTA_POLL` | bool, off | also poll `api.anthropic.com` for quota instead of only reading local files |
+| `-codex-config-dir` / `SYSMON_CODEX_CONFIG_DIR` | path | Codex config dir for the AI usage page (default `$CODEX_HOME`, then `$HOME/.codex`; missing = Codex section hidden) |
+| `-codex-quota-poll` / `SYSMON_CODEX_QUOTA_POLL` | bool, off | refresh Codex quota every 5 min through the installed Codex CLI |
+| `-codex-binary` / `SYSMON_CODEX_BINARY` | path | Codex CLI used by the poll (default: `codex` on `PATH`) |
 | `-tls` / `SYSMON_TLS` | bool | enable direct TLS (`-cert`/`-key`) |
 | `-self-check` / `-wait-health` / `-wait-ready` | bool | in-process checks / startup gates |
 
@@ -178,7 +185,8 @@ integration — the same binary is both console app and service). From an elevat
 
 ```powershell
 .\install-windows.ps1 -Action Install
-.\install-windows.ps1 -Action Status      # probes /readyz, reports settings
+.\install-windows.ps1 -Action Install -TempWarn 85   # AMD: Tctl idles hot, 70 C warns constantly
+.\install-windows.ps1 -Action Status      # probes /readyz, reports settings + AI usage sources
 .\install-windows.ps1 -Action Update      # download + verify + swap + rollback
 .\install-windows.ps1 -Action Uninstall
 ```
@@ -215,8 +223,8 @@ SYSTEM-privileged process executes it, and both engines refuse to update without
 **Turning the check off.** It is on by default. Toggle `update_check_enabled` via
 `POST /api/settings`, or hard-disable it host-side with `-no-update-check` /
 `SYSMON_UPDATE_CHECK=0` (flag/env wins over the setting). Disabled means no outbound calls
-at all. With the quota page left in its default files-only mode, `api.github.com` is the
-only endpoint the agent ever contacts.
+at all. With the AI usage page left in its default files-only mode (no `-claude-quota-poll`,
+no `-codex-quota-poll`), `api.github.com` is the only endpoint the agent ever contacts.
 </details>
 
 <details>
@@ -225,7 +233,8 @@ only endpoint the agent ever contacts.
 `GET /api/metrics` returns hostname/OS/arch/timestamp plus:
 
 - **CPU** usage %, package power (W) when exposed, current + max/boost clock (MHz), die temp.
-- **GPU** usage/VRAM/temp/power (NVIDIA via `nvidia-smi`; AMD/Intel via DRM sysfs on Linux).
+- **GPU** usage/VRAM/temp/power (NVIDIA via `nvidia-smi`; AMD/Intel via DRM sysfs on Linux),
+  plus the NVIDIA hotspot where it can be read (see below).
 - **RAM** used/total/%, **disk** per mounted local filesystem, **network** RX/TX per interface.
 - **Temperatures** from Linux hwmon/thermal or Windows ACPI/LibreHardwareMonitor, and **PSU**
   total output power when a USB-linked smart PSU is present (Windows LHM bridge).
@@ -237,27 +246,39 @@ A **resident sampler** keeps one warm snapshot refreshed by a fast lane (CPU/RAM
 a slow lane (power/temps/disk/net/GPU, ~0.7 Hz), so `/api/metrics` reads memory instead of
 spawning a collection per request. Concurrent requests share one in-flight collection, and
 `/api/stream` pushes fresh snapshots over SSE with a keepalive every 15 s.
+
+`GET /api/osd` serves a small cached payload (CPU usage and package temperature, GPU usage
+and temperature) for an on-screen display such as a game-streaming overlay, without waking
+the full dashboard collector. On Windows an independent one-second loop asks the resident
+LibreHardwareMonitor bridge for CPU/GPU sensors only, and only while an OSD client is
+active; hardware readings older than 3.5 s are suppressed. Other platforms currently serve
+CPU usage there and report the hardware fields unavailable.
 </details>
 
 <details>
-<summary><b>Claude Code quota page</b></summary>
+<summary><b>AI usage page (Claude Code + Codex)</b></summary>
 
-An optional fourth swipe page showing Claude Code plan usage next to CPU and GPU: the
-5-hour session window, the shared weekly, any per-model weeklies, and usage credits. It is
-**hidden unless configured**, so if you do not use Claude Code the dashboard is exactly the
-three pages it has always been.
-
-Point the agent at your Claude config directory to switch it on:
+An optional fourth swipe page: Claude Code plan usage (the 5-hour session window, the shared
+weekly, any per-model weeklies, usage credits), Codex quota windows, and a rolling seven-day
+token chart for each tool. It is **hidden unless at least one provider is configured**, so if
+you use neither, the dashboard is exactly the three pages it has always been. A missing
+directory disables only that provider.
 
 ```bash
-./sysmon-agent -claude-config-dir ~/.claude
+./sysmon-agent -claude-config-dir ~/.claude -codex-config-dir ~/.codex
 ```
 
-It defaults to `$CLAUDE_CONFIG_DIR`, then `$HOME/.claude`. On the **Windows service** pass it
-explicitly (the installer does this for you): the service runs as LocalSystem, whose home is
-the systemprofile directory, so it can never discover your profile on its own.
+Claude defaults to `$CLAUDE_CONFIG_DIR`, then `$HOME/.claude`; Codex to `$CODEX_HOME`, then
+`$HOME/.codex`. On the **Windows service** pass them explicitly (the installer defaults both
+from the installing user's profile): the service runs as LocalSystem, whose home is the
+systemprofile directory, so it can never discover your profile on its own.
 
-**Where the numbers come from.** By default the agent makes *no network calls for this at
+**Token charts** are file-only for both tools and never read credentials. Claude totals come
+from the response usage records under `projects/**/*.jsonl`, deduplicated per response;
+Codex totals from `sessions/**/*.jsonl`. Each bar is one local calendar day and counts
+input, cache, and output tokens once. Both trees are rescanned every 30 seconds.
+
+**Claude quota.** By default the agent makes *no network calls for this at
 all* — it reads two files Claude Code and its quota widget already maintain, `quota.json`
 and `widgets/quota-live-cache.json`, and merges them: freshest source wins per window, and
 rows only the API knows about (per-model weeklies, credits) are carried over labelled with
@@ -276,6 +297,57 @@ from the parameters on every install, so a manual edit is dropped by the next on
 Polling is what lets the page stay fresh with no Claude Code session open and no desktop
 widget running — bounded by the OAuth token’s lifetime, since only Claude Code itself
 refreshes it. Run one poller per account: the agent or the desktop widget, not both.
+
+**Codex quota.** By default the quota windows come from the newest rate-limit event Codex
+wrote to its session files, so they move only when Codex runs on this host. For current
+numbers between conversations, add `-codex-quota-poll`: at startup and every five minutes
+the agent starts a hidden, temporary `codex app-server --stdio` and calls
+`account/rateLimits/read`. No conversation or model turn is started; Codex itself handles
+authentication and the outbound request, using the configured directory as `CODEX_HOME`, and
+the agent never parses, logs, or serves Codex credentials. Each lookup has a 20-second
+timeout, and a failure keeps the last quota with an error and its real age. On the Windows
+service use `install-windows.ps1 -CodexQuotaPoll` (optionally
+`-CodexBinary C:\path\to\codex.exe`): the installer saves the CLI's absolute path, because
+LocalSystem does not share your `PATH`.
+</details>
+
+<details>
+<summary><b>NVIDIA GPU hotspot temperature</b></summary>
+
+The GPU card adds `Hotspot NN°C` to its detail line when the hotspot sensor can be read
+(`gpu.devices[].hotspot_temperature_celsius` in `/api/metrics`). It has no warning threshold
+yet.
+
+**Windows** needs nothing extra: the LibreHardwareMonitor bridge already reads `GPU Hot Spot`.
+When two GPUs share a model name the reading stays unavailable, rather than risk showing it
+on the wrong card.
+
+**Linux** has no supported interface for it (`nvidia-smi` does not report it), so an optional
+root helper reads it from a GPU register through a read-only `/dev/mem` mapping. Supported:
+**RTX 3090** (`10de:2204`) and **RTX 4090** (`10de:2684`). The helper never writes to the GPU
+and opens no socket; it publishes `/run/sysmon-gpu-hotspot/readings.json` every two seconds,
+and the agent stays unprivileged and ignores readings older than six seconds. NVIDIA does not
+document the register (the offset and decoding follow
+[gddr6-core-junction-vram-temps](https://github.com/ThomasBaruzier/gddr6-core-junction-vram-temps/blob/6d8c5ecf633a8658d205fb2c24531bf87164912f/src/sensor.c)),
+so compare the number against another tool before relying on it.
+
+```bash
+go build -trimpath -o sysmon-gpu-hotspot ./cmd/gpu-hotspot
+./install-gpu-hotspot.sh                  # dry-run: supported GPU? lockdown? iomem=?
+sudo ./install-gpu-hotspot.sh --apply     # installs deploy/sysmon-gpu-hotspot.service, starts it
+cat /run/sysmon-gpu-hotspot/readings.json
+sudo ./install-gpu-hotspot.sh --uninstall --apply
+```
+
+Two kernel settings can stand in the way, and the dry-run reports both:
+
+- Kernels built with `CONFIG_IO_STRICT_DEVMEM` refuse `/dev/mem` reads of memory the nvidia
+  driver has claimed unless `iomem=relaxed` is on the kernel command line. That widens
+  `/dev/mem` access system-wide, so it is opt-in: `--enable-register-access` adds it on
+  Limine (backing up `/etc/default/limine` first); for GRUB, systemd-boot and others the
+  script prints the change to make by hand. Either way, reboot to activate it.
+- Kernel lockdown, usually turned on by Secure Boot, blocks `/dev/mem` outright. The script
+  warns about it and leaves it alone.
 </details>
 
 <details>
@@ -286,7 +358,10 @@ refreshes it. Run one poller per account: the agent or the desktop widget, not b
 and `/sys/class/thermal`. NVIDIA needs `nvidia-smi` in `PATH`; AMD via the `amdgpu` DRM
 sysfs; Intel iGPU is best-effort. Container/bridge and remote-mount interfaces are skipped.
 
-**Windows** — CPU/memory/disk/network via PowerShell/CIM. CPU package power and CPU/board/RAM
+**Windows** — live CPU/memory/process/network/disk-capacity numbers come from native Win32
+APIs, so an open dashboard does not spawn a PowerShell per sample; bounded PowerShell/CIM
+queries remain only for slow-changing data (hardware identity, pagefile, physical-disk
+discovery) and the ACPI fallback. CPU package power and CPU/board/RAM
 temperatures aren't exposed by any native Windows API, so the agent ships an embedded
 **LibreHardwareMonitor bridge** (loads `LibreHardwareMonitorLib.dll` directly — no GUI, no
 WMI). Install it **machine-wide** plus **PowerShell 7+** once, elevated:
@@ -299,6 +374,11 @@ winget install --scope machine Microsoft.PowerShell  # pwsh — required for the
 A per-user install lands in a profile the LocalSystem service can't read, so those sensors
 silently go unavailable. The same bridge also reports PSU output power for USB-linked smart
 PSUs (Corsair HXi/RMi, NZXT, Seasonic, …).
+
+**USB-attached drives** — an NVMe or SATA drive in a USB enclosure usually reports no
+temperature on either OS, because a generic SMART query does not pass through the USB
+bridge chip. The storage panel says so (`USB enclosure: bridge does not expose live SMART
+temperature`) instead of reporting a broken sensor.
 </details>
 
 <details>
