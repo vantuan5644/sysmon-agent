@@ -3,6 +3,7 @@
 /sysmon-agent.exe
 /sysmon-agent.test
 /sysmon-agent.test.exe
+/sysmon-gpu-hotspot
 *.exe
 *.test
 

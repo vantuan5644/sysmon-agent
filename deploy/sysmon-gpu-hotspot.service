@@ -1,0 +1,40 @@
+[Unit]
+# Optional root helper that reads the NVIDIA GPU hotspot (RTX 3090 / RTX 4090) on
+# Linux, where nvidia-smi does not report it. It maps one GPU register read-only
+# through /dev/mem every two seconds and atomically publishes
+# /run/sysmon-gpu-hotspot/readings.json; the unprivileged agent reads that file
+# and shows "Hotspot NN C" on the GPU card. No listener, no GPU writes.
+#
+# Install with ./install-gpu-hotspot.sh (dry-run by default), not by hand: it
+# also checks for a supported GPU, kernel lockdown and the iomem= setting.
+Description=NVIDIA RTX 3090/4090 hotspot sensor reader (sysmon-agent)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/sysmon-gpu-hotspot -interval 2s
+RuntimeDirectory=sysmon-gpu-hotspot
+RuntimeDirectoryMode=0755
+UMask=0022
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+
+# Unlike the agent's unit, this one can be locked down hard: the helper needs
+# only sysfs (PCI BAR0 discovery), read access to /dev/mem, and its own
+# RuntimeDirectory.
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_SYS_RAWIO
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+DevicePolicy=closed
+DeviceAllow=/dev/mem r
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
