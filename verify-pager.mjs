@@ -41,7 +41,7 @@ const tempRoot = mkdtempSync(join(tmpdir(), "sysmon-pager-"));
 // Row count for page 3. processes.go sends up to processTopHardCap (30) rows, so
 // this reproduces the worst case the dashboard actually renders.
 const processRowCount = 30;
-const viewport = { width: 390, height: 844 };
+const viewport = { width: Number(process.env.SYSMON_LAYOUT_WIDTH || 390), height: Number(process.env.SYSMON_LAYOUT_HEIGHT || 667) };
 
 try {
   const fixturePath = writeFixture(tempRoot);
@@ -61,7 +61,7 @@ try {
       assertPagerInvariants(measured);
       console.log(
         `ok: pager layout verified with ${browser.name} ` +
-          `(viewport ${measured.viewport}px, pager ${measured.pagerHeight}px, ` +
+          `(viewport ${measured.viewportWidth}x${measured.viewport}px, pager ${measured.pagerHeight}px, ` +
           `${measured.pages.length} pages, tallest content ${Math.max(...measured.pages.map((p) => p.contentHeight))}px)`,
       );
     }
@@ -82,6 +82,10 @@ try {
 function writeFixture(root) {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   writeFileSync(join(root, "styles.css"), readFileSync(join(scriptDir, "static", "styles.css")));
+  // The stylesheet's @font-face url is relative, so the dashboard font loads
+  // here too and the gauge-text checks measure the real glyphs.
+  mkdirSync(join(root, "fonts"));
+  writeFileSync(join(root, "fonts", "jetbrains-mono.woff2"), readFileSync(join(scriptDir, "static", "fonts", "jetbrains-mono.woff2")));
 
   let html = readFileSync(join(scriptDir, "static", "index.html"), "utf8");
   html = html.replace(/<script[^>]*app\.js[^>]*>\s*<\/script>/g, "");
@@ -140,14 +144,16 @@ window.addEventListener("load", function () {
   if (alertsChip) {
     alertsChip.hidden = false;
   }
-  // Page 4 (Claude quota) is conditional: renderQuota() un-hides it only on a
-  // configured host. The fixture must un-hide and FILL it like the real render
-  // path does, or it measures 0px and trips the every-page-fills-the-pager
-  // assert below -- a failure that reads as a layout bug but is only a fixture
-  // artefact.
+  // Page 4 is conditional and each provider is conditional within it. Un-hide
+  // both providers and populate quota rows plus seven-day charts so this probes
+  // the real worst-case AI usage layout.
   var quotaPage = document.getElementById("quotaPage");
   if (quotaPage) {
     quotaPage.hidden = false;
+    var claudeUsage = document.getElementById("claudeUsage");
+    var codexUsage = document.getElementById("codexUsage");
+    claudeUsage.hidden = false;
+    codexUsage.hidden = false;
     var quotaList = document.getElementById("quotaList");
     for (var q = 0; q < 4; q++) {
       var quotaRow = document.createElement("div");
@@ -159,20 +165,108 @@ window.addEventListener("load", function () {
         '<div class="quota-note">resets in 3d</div>';
       quotaList.appendChild(quotaRow);
     }
+    var codexList = document.getElementById("codexQuotaList");
+    var codexRow = document.createElement("div");
+    codexRow.className = "quota-row";
+    codexRow.innerHTML =
+      '<div class="quota-row-head"><span class="quota-label">Weekly</span>' +
+      '<span class="quota-pct">18%</span></div>' +
+      '<div class="quota-bar"><span class="quota-bar-fill"></span></div>' +
+      '<div class="quota-note">resets in 6d</div>';
+    codexList.appendChild(codexRow);
+    for (var chartId of ["claudeTokenChart", "codexTokenChart"]) {
+      var chart = document.getElementById(chartId);
+      for (var d = 0; d < 7; d++) {
+        var day = document.createElement("div");
+        day.className = "token-day";
+        day.innerHTML =
+          '<span class="token-day-value">' + (d + 1) + '.2M</span>' +
+          '<span class="token-day-track"><span class="token-day-bar"></span></span>' +
+          '<span class="token-day-label">Mon</span>';
+        chart.appendChild(day);
+      }
+    }
   }
   var quotaDot = document.getElementById("pageDot3");
   if (quotaDot) {
     quotaDot.hidden = false;
   }
 
+  // The widest string each gauge center can show (CPU, GPU, RAM, NET order).
+  var gaugeSamples = ["100%", "100%", "100%", "\u219399.9M"];
+  var gaugeSubSamples = ["4.7/5.5GHz", "23.9/24.0G", "1000/1024G", "\u219199.9M"];
+  Array.from(document.querySelectorAll(".gauge")).forEach(function (gauge, index) {
+    gauge.querySelector(".gauge-value").textContent = gaugeSamples[index];
+    gauge.querySelector(".gauge-sub").textContent = gaugeSubSamples[index];
+  });
+  document.getElementById("gpuName").textContent = "NVIDIA GeForce RTX 4090 Founders Edition";
+  var gpuDetail = document.getElementById("gpuDetail");
+  gpuDetail.innerHTML = '49\u00b0C \u00b7 112 W<span class="gpu-hotspot-detail"> \u00b7 Hotspot 82\u00b0C</span>';
+  var trends = ["gpuTrend", "memTrend", "netTrend"].map(function (id) {
+    var trend = document.getElementById(id);
+    for (var i = 0; i < 24; i++) {
+      var bar = document.createElement("span");
+      bar.className = "sparkline-bar";
+      bar.style.setProperty("--h", "6%");
+      trend.appendChild(bar);
+    }
+    return trend;
+  });
+  document.getElementById("cpuDetail").textContent = "58 C / 60 W";
+  var cores = document.getElementById("cpuCores");
+  cores.innerHTML = '<span class="core-grid-label">Busy Threads 0/32</span><span class="core-grid-bars">' +
+    '<span class="core-bar" style="--h:6%"></span>'.repeat(32) + '</span>';
+  var chartRows = [cores].concat(trends);
   var shell = document.querySelector(".shell");
   var pager = document.getElementById("pager");
   var pages = Array.prototype.slice.call(document.querySelectorAll(".page"));
   var alertsPanelEl = document.getElementById("alertsPanel");
   var alertsChipEl = document.getElementById("alertsChip");
+  var cpuReading = document.createRange();
+  cpuReading.selectNodeContents(document.getElementById("cpuDetail"));
   var report = {
+    gauges: Array.from(document.querySelectorAll(".metric-card .gauge")).map(function (gauge) {
+      var rect = gauge.getBoundingClientRect();
+      var center = gauge.querySelector(".gauge-center");
+      var centerRect = center.getBoundingClientRect();
+      var value = gauge.querySelector(".gauge-value");
+      var sub = gauge.querySelector(".gauge-sub");
+      return { top: rect.top, bottom: rect.bottom, diameter: rect.width,
+        centerWidth: centerRect.width, centerHeight: centerRect.height,
+        valueWidth: value.clientWidth, valueContentWidth: value.scrollWidth,
+        subWidth: sub.clientWidth, subContentWidth: sub.scrollWidth,
+        cardTop: gauge.closest(".metric-card").getBoundingClientRect().top,
+        labelTop: gauge.nextElementSibling.getBoundingClientRect().top };
+    }),
+    cpuBusyTop: cores.firstElementChild.getBoundingClientRect().top,
+    cpuBusyBottom: cores.firstElementChild.getBoundingClientRect().bottom,
+    cpuBarsTop: cores.lastElementChild.getBoundingClientRect().top,
+    cpuReadingBottom: cpuReading.getBoundingClientRect().bottom,
+    chartRows: chartRows.map(function (chart) {
+      var rect = chart.getBoundingClientRect();
+      var card = chart.closest(".metric-card").getBoundingClientRect();
+      return { id: chart.id, height: rect.height, top: rect.top, cardTop: card.top,
+        bottom: rect.bottom, cardBottom: card.bottom,
+        pageBottom: chart.closest(".page").getBoundingClientRect().bottom,
+        pageHeight: chart.closest(".page").clientHeight,
+        pageContentHeight: chart.closest(".page").scrollHeight };
+    }),
+    trends: trends.map(function (trend) {
+      var detail = trend.previousElementSibling;
+      var rect = trend.getBoundingClientRect();
+      return { id: trend.id, height: rect.height,
+        top: rect.top, detailBottom: detail.getBoundingClientRect().bottom,
+        bars: Array.from(trend.children).map(function (bar) { return bar.getBoundingClientRect().height; }) };
+    }),
     cssLoaded: getComputedStyle(shell).display === "flex",
+    gpuDetailWidth: gpuDetail.clientWidth,
+    gpuDetailContentWidth: gpuDetail.scrollWidth,
+    gpuDetailHeight: gpuDetail.clientHeight,
+    gpuDetailContentHeight: gpuDetail.scrollHeight,
+    hotspotColor: getComputedStyle(gpuDetail.querySelector(".gpu-hotspot-detail")).color,
+    neutralColor: getComputedStyle(shell).getPropertyValue("--muted").trim(),
     viewport: window.innerHeight,
+    viewportWidth: window.innerWidth,
     documentScrollHeight: document.documentElement.scrollHeight,
     shellHeight: shell.offsetHeight,
     pagerHeight: pager.offsetHeight,
@@ -264,6 +358,36 @@ function decodeEntities(text) {
 }
 
 function assertPagerInvariants(m) {
+  for (const gauge of m.gauges) {
+    if (gauge.valueContentWidth > gauge.valueWidth + 1 || gauge.subContentWidth > gauge.subWidth + 1 ||
+        gauge.centerWidth > gauge.diameter * 0.68 + 1 || gauge.centerHeight > gauge.diameter * 0.5 + 1) {
+      throw new Error("Gauge text exceeds the center: " + JSON.stringify(gauge));
+    }
+  }
+  if (m.gauges.some((gauge) => gauge.top < gauge.cardTop || gauge.bottom > gauge.labelTop)) {
+    throw new Error("Gauge is clipped or overlaps its label: " + JSON.stringify(m.gauges));
+  }
+  if (m.cpuBusyBottom > m.cpuBarsTop || m.cpuBusyTop < m.cpuReadingBottom) {
+    throw new Error("Busy Threads label overlaps CPU readings or bars");
+  }
+  for (const chart of m.chartRows) {
+    if (Math.abs(chart.height - 24) > 0.5 || chart.bottom > chart.cardBottom || chart.bottom > chart.pageBottom || chart.pageContentHeight > chart.pageHeight + 1) {
+      throw new Error(`chart row has incorrect height or exceeds its card: ${JSON.stringify(chart)}`);
+    }
+    for (const other of m.chartRows) {
+      if (Math.abs(chart.cardTop - other.cardTop) < 1 && Math.abs(chart.top - other.top) > 1) {
+        throw new Error(`chart rows are misaligned: ${JSON.stringify(m.chartRows)}`);
+      }
+    }
+  }
+  for (const trend of m.trends) {
+    if (trend.bars.length !== 24 || trend.height < 12 || trend.top < trend.detailBottom || trend.bars.some((height) => height < 3)) {
+      throw new Error(`${trend.id} history is missing, squeezed, or overlaps its details: ${JSON.stringify(trend)}`);
+    }
+  }
+  if (m.gpuDetailContentWidth > m.gpuDetailWidth + 1 || m.gpuDetailContentHeight > m.gpuDetailHeight + 1) {
+    throw new Error("GPU hotspot detail is clipped or overflows its card");
+  }
   const detail =
     `viewport=${m.viewport} document=${m.documentScrollHeight} shell=${m.shellHeight} pager=${m.pagerHeight} ` +
     `pages=${JSON.stringify(m.pages)}`;

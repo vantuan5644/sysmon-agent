@@ -9,10 +9,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func collectLinuxGPU(ctx context.Context) GPUSet {
-	nvidia := collectNVIDIAGPU(ctx)
+	nvidia := mergeLinuxGPUHotspots(collectNVIDIAGPU(ctx), "/run/sysmon-gpu-hotspot/readings.json", time.Now())
 	drm := collectLinuxDRMGPU("/sys")
 
 	var devices []GPUMetric
@@ -65,11 +66,12 @@ func collectLinuxDRMGPU(sysRoot string) GPUSet {
 
 func collectLinuxDRMDevice(cardName, vendorID, devicePath string) GPUMetric {
 	return GPUMetric{
-		Name:        linuxDRMGPUName(cardName, vendorID),
-		Usage:       linuxDRMGPUUsage(devicePath),
-		Power:       linuxDRMGPUPower(devicePath),
-		Memory:      linuxDRMGPUVRAM(devicePath),
-		Temperature: linuxDRMGPUTemperature(devicePath),
+		HotspotTemperature: unavailableNumber("C", "hotspot collection supports NVIDIA RTX 3090/4090"),
+		Name:               linuxDRMGPUName(cardName, vendorID),
+		Usage:              linuxDRMGPUUsage(devicePath),
+		Power:              linuxDRMGPUPower(devicePath),
+		Memory:             linuxDRMGPUVRAM(devicePath),
+		Temperature:        linuxDRMGPUTemperature(devicePath),
 	}
 }
 
