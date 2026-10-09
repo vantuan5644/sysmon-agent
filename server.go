@@ -18,7 +18,12 @@ func newHTTPHandler(collector MetricsCollector, static fs.FS) (http.Handler, err
 }
 
 func newHTTPHandlerWithState(collector MetricsCollector, static fs.FS, state *RuntimeState) (http.Handler, error) {
-	return newHTTPHandlerWithController(collector, static, state, NewSystemController())
+	controller := SystemController(NewSystemController())
+	if s, ok := collector.(*sampler); ok {
+		s.devices = newDeviceManager(state.settingsPath, newDeviceBackend())
+		controller = deviceController{SystemController: controller, devices: s.devices}
+	}
+	return newHTTPHandlerWithController(collector, static, state, controller)
 }
 
 func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, state *RuntimeState, controller SystemController) (http.Handler, error) {
@@ -269,7 +274,7 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 			return
 		}
 		if !isKnownControlAction(request.Action) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "action must be one of mic_mute, media_toggle, volume_mute, lock_screen"})
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "action must be one of mic_mute, camera_toggle, media_toggle, volume_mute, lock_screen"})
 			return
 		}
 

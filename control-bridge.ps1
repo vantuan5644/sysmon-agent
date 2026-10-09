@@ -162,18 +162,8 @@ namespace Sysmon {
         }
 
         // ---- media key + lock (run in the calling session) ----
-        [DllImport("user32.dll")]
-        static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool LockWorkStation();
-        const byte VK_MEDIA_PLAY_PAUSE = 0xB3;
-        const uint KEYEVENTF_EXTENDEDKEY = 0x1;
-        const uint KEYEVENTF_KEYUP = 0x2;
-
-        public static void MediaPlayPause() {
-            keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY, UIntPtr.Zero);
-            keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, UIntPtr.Zero);
-        }
 
         public static void LockScreen() {
             if (!LockWorkStation()) {
@@ -188,7 +178,7 @@ namespace Sysmon {
         // default ANSI marshaling the W function reads lpDesktop as garbage UTF-16,
         // the injected child attaches to a bogus desktop, and user32.dll fails to
         // initialize (ERROR_DLL_INIT_FAILED) the moment the child touches it -- so
-        // keybd_event / LockWorkStation never run and media_toggle / lock_screen
+        // SendInput / LockWorkStation never run and media_toggle / lock_screen
         // silently do nothing even though CreateProcessAsUser reported success.
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         struct STARTUPINFO {
@@ -247,7 +237,9 @@ namespace Sysmon {
                 if (!DuplicateTokenEx(userToken, MAXIMUM_ALLOWED, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out primaryToken)) {
                     throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "DuplicateTokenEx failed");
                 }
-                CreateEnvironmentBlock(out env, primaryToken, false);
+                if (!CreateEnvironmentBlock(out env, primaryToken, false)) {
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "CreateEnvironmentBlock failed");
+                }
                 var si = new STARTUPINFO();
                 si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
                 si.lpDesktop = "winsta0\\default";
@@ -267,7 +259,10 @@ namespace Sysmon {
                 bool gotExit = GetExitCodeProcess(pi.hProcess, out exitCode);
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
-                if (waitRc == 0 && gotExit && exitCode != 0) {
+                if (waitRc != 0 || !gotExit) {
+                    throw new Exception("injected session process did not confirm completion");
+                }
+                if (exitCode != 0) {
                     throw new Exception("injected session process exited with code 0x" + exitCode.ToString("X8"));
                 }
             } finally {
@@ -327,15 +322,19 @@ try {
             Write-ControlResult -Available $true -Applied $true -State $state
         }
         'media_toggle' {
-            if ([Environment]::UserInteractive) {
-                [Sysmon.HostControl]::MediaPlayPause()
+            if ([Diagnostics.Process]::GetCurrentProcess().SessionId -ne 0) {
+                Assert-ExePath
+                & $ExePath -control-emit media_play_pause
+                if ($LASTEXITCODE -ne 0) {
+                    throw 'native media input failed'
+                }
             } else {
                 Invoke-MediaToggleInActiveSession
             }
             Write-ControlResult -Available $true -Applied $true -State 'toggled'
         }
         'lock_screen' {
-            if ([Environment]::UserInteractive) {
+            if ([Diagnostics.Process]::GetCurrentProcess().SessionId -ne 0) {
                 [Sysmon.HostControl]::LockScreen()
             } else {
                 Invoke-LockScreenInActiveSession

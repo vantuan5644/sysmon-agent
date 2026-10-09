@@ -502,7 +502,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v140",
+    dashboard_build: "sysmon-static-v152",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -520,7 +520,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v140",
+    dashboard_build: "sysmon-static-v152",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1004,7 +1004,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v140, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v152, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1052,7 +1052,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v140; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v152; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1062,7 +1062,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v140",
+    dashboard_build: "sysmon-static-v152",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1072,7 +1072,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v140",
+    dashboard_build: "sysmon-static-v152",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1207,7 +1207,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v140", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v152", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -2457,5 +2457,89 @@ assert(
   "demoting to polling did not start the metrics poll timer",
 );
 delete context.EventSource;
+
+// Device use is separate from mute. Older hosts and stale observations must
+// stop animations rather than leave an apparently live capture indicator.
+const activityNow = new Date().toISOString();
+const liveDevices = {
+  microphone: { state: "active", observed_at: activityNow },
+  camera: { state: "active", observed_at: activityNow },
+  camera_control: { state: "enabled", available: true, restore_pending: false },
+};
+context.renderDeviceActivity(liveDevices, activityNow);
+assert(document.getElementById("micCtlState").textContent === "—", "unobserved mute state appeared known");
+assert(document.getElementById("cameraCtlState").textContent === "On", "enabled camera state missing");
+assert(document.getElementById("cameraCtl").classList.contains("device-on"), "enabled camera lacks on border");
+assert(!document.getElementById("micCtl").classList.contains("device-on"), "unknown microphone has on border");
+assert(document.getElementById("micCtl").classList.contains("activity-active"), "microphone use has no animated state");
+assert(document.getElementById("cameraCtl").classList.contains("activity-active"), "camera use has no animated state");
+assert(document.getElementById("micCtlUsage").textContent === "Busy", "microphone use label missing");
+assert(document.getElementById("cameraCtlUsage").textContent === "Busy", "camera use label missing");
+context.setControlMuted("mic_mute", document.getElementById("micCtl"), true);
+assert(document.getElementById("micCtlUsage").textContent === "Busy", "mute erased capture activity");
+assert(document.getElementById("micCtl").getAttribute("aria-label").includes("currently muted"), "activity hid mute state from accessible label");
+assert(document.getElementById("micCtlState").textContent === "Off", "activity hid visible mute state");
+assert(!document.getElementById("micCtl").classList.contains("device-on"), "muted microphone kept on border");
+context.setCameraControlState({ state: "disabled", available: true, restore_pending: true });
+assert(document.getElementById("cameraCtlState").textContent === "Off", "activity hid visible camera state");
+assert(!document.getElementById("cameraCtl").classList.contains("device-on"), "disabled busy camera kept on border");
+assert(document.getElementById("cameraCtlUsage").textContent === "Busy", "camera state erased activity");
+const announcement = document.getElementById("deviceActivityStatus").textContent;
+context.renderDeviceActivity(liveDevices, activityNow);
+assert(document.getElementById("deviceActivityStatus").textContent === announcement, "unchanged activity announcement changed");
+context.renderDeviceActivity({
+  ...liveDevices,
+  microphone: { state: "idle", observed_at: activityNow },
+  camera: { state: "idle", observed_at: activityNow },
+  camera_control: { state: "disabled", available: true, restore_pending: true },
+}, activityNow);
+assert(document.getElementById("micCtl").classList.contains("activity-idle"), "idle microphone state missing");
+assert(document.getElementById("micCtlUsage").textContent === "Idle", "idle usage label missing");
+assert(!document.getElementById("micCtl").classList.contains("device-on"), "idle activity gave muted mic an on border");
+assert(document.getElementById("micCtlState").textContent === "Off", "idle microphone lost its mute state");
+assert(document.getElementById("cameraCtlState").textContent === "Off", "disabled camera label missing");
+assert(document.getElementById("cameraCtl").getAttribute("aria-label").includes("Restore"), "camera restore action missing");
+context.renderDeviceActivity({
+  ...liveDevices,
+  microphone: { state: "active", observed_at: "2000-01-01T00:00:00Z" },
+  camera: { state: "unknown", observed_at: activityNow },
+}, activityNow);
+for (const id of ["micCtl", "cameraCtl"]) {
+  assert(!document.getElementById(id).classList.contains("activity-active"), `${id} animated stale or unknown data`);
+  assert(!document.getElementById(id).classList.contains("activity-idle"), `${id} represented unknown data as idle`);
+}
+context.renderDeviceActivity(liveDevices, activityNow);
+// Host clocks ahead or behind the browser must keep fresh idle borders stable.
+for (const offset of [-3600000, 3600000]) {
+  const hostTime = new Date(Date.now() + offset).toISOString();
+  const devices = {
+    microphone: { state: "idle", observed_at: hostTime },
+    camera: { state: "idle", observed_at: hostTime },
+  };
+  context.renderDeviceActivity(devices, hostTime);
+  for (let tick = 0; tick < 4; tick++) {
+    fakeNow += 2000;
+    context.renderDeviceActivity(devices);
+    for (const id of ["micCtl", "cameraCtl"]) {
+      assert(document.getElementById(id).classList.contains("activity-idle"), `${id} lost fresh border with host clock offset ${offset}`);
+    }
+  }
+  fakeNow += 3000;
+  context.renderDeviceActivity(devices);
+  for (const id of ["micCtl", "cameraCtl"]) {
+    assert(!document.getElementById(id).classList.contains("activity-idle"), `${id} kept border after activity stopped refreshing`);
+  }
+}
+context.renderDeviceActivity(liveDevices, activityNow);
+context.setConnectionState("paused", "Paused");
+assert(!document.getElementById("cameraCtl").classList.contains("activity-active"), "paused camera kept animating");
+context.renderDeviceActivity(null);
+assert(document.getElementById("micCtlUsage").textContent === "—", "missing activity appeared idle");
+context.setControlMuted("mic_mute", document.getElementById("micCtl"), false);
+assert(document.getElementById("micCtlState").textContent === "On", "unmute state missing");
+assert(document.getElementById("micCtl").classList.contains("device-on"), "unmuted microphone lacks on border");
+assert(document.getElementById("micCtl").getAttribute("aria-label").includes("unmuted; usage unknown"), "compact labels lost accessible meaning");
+assert(document.getElementById("micCtlUsage").textContent === "—", "unmute changed usage");
+assert(!document.getElementById("micCtl").classList.contains("activity-active"), "older host retained mic animation");
 
 console.log("ok: dashboard runtime smoke test passed");

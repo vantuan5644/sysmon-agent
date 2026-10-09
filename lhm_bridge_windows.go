@@ -73,9 +73,18 @@ var (
 // on that host timed out, the agent killed and respawned the daemon on every
 // sample, and CPU power and temperatures were never reported at all.
 //
-// Recycling re-Opens after a generous count / age so hot-plugged hardware (USB
-// PSU) is picked up and to shed any long-lived driver/handle drift, without
-// churning cold re-Opens.
+// After a generous count / age the next full read is sent as a rescan, which
+// re-enumerates the USB PSU groups inside the running daemon so a hot-plugged
+// PSU is picked up. It used to kill the daemon instead, so the respawn's fresh
+// Computer.Open() would find it, and that was too blunt: Open() also rebuilds
+// the storage group, whose DiskInfoToolkit pass tries a dozen vendor ATA/NVMe
+// pass-through commands on every USB disk it cannot identify. Measured on
+// BBLWIN (2026-10-09), a Genesys GL3224 SD reader hung on one of them and was
+// USB-reset about 10 s after every respawn - a ~5 s I/O stall each 9 minutes,
+// and once the last 4 KiB of a write that had already completed never reached
+// the card. Storage needs no re-Open anyway: the storage group follows drive
+// arrival and removal itself (see Sync-StorageNodes in lhm-bridge-daemon.ps1).
+// The daemon is now respawned only after a transport failure.
 //
 // These are package vars (not consts) so unit tests can shorten the deadlines
 // and backoff to run in milliseconds without waiting on real timers.
@@ -84,9 +93,13 @@ var (
 	lhmDaemonWarmReadTimeout = 6 * time.Second
 	lhmDaemonRestartBackoff  = 2 * time.Second
 	lhmDaemonDisableFailures = 6
-	lhmDaemonRecycleReads    = 240
-	lhmDaemonRecycleAge      = 30 * time.Minute
+	lhmDaemonRescanReads     = 240
+	lhmDaemonRescanAge       = 30 * time.Minute
 )
+
+// lhmDaemonRescanRequest is the request line that re-enumerates hot-pluggable
+// hardware before answering with an ordinary full snapshot.
+const lhmDaemonRescanRequest = "rescan"
 
 // lhmDaemonProcess is the spawn contract the daemon talks over. The production
 // implementation launches a long-lived pwsh running the embedded daemon script;
@@ -170,7 +183,7 @@ func (p *pwshLhmDaemonProcess) Start() (io.WriteCloser, io.Reader, func() error,
 // request/response at a time over its stdio channel (the daemon is a strict
 // line-by-line request/response protocol, so only one request may be in flight).
 // It handles cold-vs-warm deadlines, restart with backoff after a transport
-// failure, periodic recycle (re-Open) for hot-plugged hardware, and permanent
+// failure, a periodic in-place rescan for hot-plugged hardware, and permanent
 // disable when the daemon can never start (pwsh / DLL missing) so the caller can
 // fall back to the one-shot bridge.
 type lhmDaemon struct {
@@ -185,8 +198,9 @@ type lhmDaemon struct {
 	disabled       bool
 	coldRead       bool // true until the first success after a (re)start
 	everSucceeded  bool // true once the daemon has produced any good read
-	reads          int
-	startedAt      time.Time
+	reads          int  // full reads since the last (re)start or rescan
+	scannedAt      time.Time
+	rescanDue      bool // the next full read is sent as a rescan
 	consecFailures int
 	nextRestartAt  time.Time
 }
@@ -212,11 +226,16 @@ func (d *lhmDaemon) readRequest(ctx context.Context, request string) (lhmBridgeR
 		return lhmBridgeResult{}, err
 	}
 
+	if request == "read" && d.rescanDue {
+		request = lhmDaemonRescanRequest
+	}
 	deadline := lhmDaemonWarmReadTimeout
-	if d.coldRead {
+	if d.coldRead || request == lhmDaemonRescanRequest {
 		// The first read after a (re)start still pays Computer.Open() plus the
 		// prime pass, which the daemon performs at its own startup before it
-		// reads the request line.
+		// reads the request line. A rescan re-enumerates the PSU groups before
+		// its read, so it gets the same headroom rather than risking a timeout
+		// whose respawn would cost the full Open() it exists to avoid.
 		deadline = lhmDaemonColdReadTimeout
 	}
 	result, err := d.requestLocked(ctx, deadline, request)
@@ -224,7 +243,7 @@ func (d *lhmDaemon) readRequest(ctx context.Context, request string) (lhmBridgeR
 		d.handleFailureLocked()
 		return lhmBridgeResult{}, err
 	}
-	d.handleSuccessLocked(request != "osd")
+	d.handleSuccessLocked(request)
 	return result, nil
 }
 
@@ -266,8 +285,10 @@ func (d *lhmDaemon) ensureAliveLocked(ctx context.Context) error {
 	d.kill = kill
 	d.alive = true
 	d.coldRead = true
-	d.startedAt = time.Now()
+	// A fresh Open() enumerates everything, so it counts as a scan.
+	d.scannedAt = time.Now()
 	d.reads = 0
+	d.rescanDue = false
 	return nil
 }
 
@@ -343,20 +364,25 @@ func (d *lhmDaemon) recordFailureLocked() {
 	}
 }
 
-func (d *lhmDaemon) handleSuccessLocked(fullRead bool) {
+func (d *lhmDaemon) handleSuccessLocked(request string) {
 	d.everSucceeded = true
 	d.consecFailures = 0
 	d.coldRead = false
-	// Lightweight OSD reads should not accelerate full-snapshot recycling.
-	if fullRead {
-		d.reads++
+	switch request {
+	case "osd":
+		// Lightweight OSD reads should not accelerate the hot-plug rescan.
+		return
+	case lhmDaemonRescanRequest:
+		d.reads = 0
+		d.scannedAt = time.Now()
+		d.rescanDue = false
+		return
 	}
-	if d.reads >= lhmDaemonRecycleReads || time.Since(d.startedAt) >= lhmDaemonRecycleAge {
-		// Recycle: tear down so the next read re-spawns with a fresh Open(),
-		// re-enumerating any hot-plugged hardware and shedding driver drift.
-		// coldRead stays false here, but ensureAliveLocked resets it on the
-		// restart so the next (cold) read gets the long deadline again.
-		d.teardownLocked()
+	d.reads++
+	if d.reads >= lhmDaemonRescanReads || time.Since(d.scannedAt) >= lhmDaemonRescanAge {
+		// Never tear the process down here: a respawn's Open() re-runs storage
+		// detection against every USB disk (see lhmDaemonRescanReads).
+		d.rescanDue = true
 	}
 }
 

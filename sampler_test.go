@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -43,6 +44,59 @@ func (f *fakeLaneCollector) CollectSlow(ctx context.Context) func(*Metrics) {
 	return func(m *Metrics) {
 		m.GPU = GPUSet{Available: false, Error: "no gpu in test"}
 	}
+}
+
+type stalledSlowCollector struct{ fakeLaneCollector }
+
+func (f *stalledSlowCollector) CollectSlow(ctx context.Context) func(*Metrics) {
+	<-ctx.Done()
+	return nil
+}
+
+func TestDeviceActivityCanBeWarmingWhenMetricsFirstBecomeReady(t *testing.T) {
+	s := newSampler(&fakeLaneCollector{hostname: "test-host"}, 0, 0)
+	s.fastEvery = 20 * time.Millisecond
+	s.devices = newDeviceManager(filepath.Join(t.TempDir(), "settings.json"), &fakeDeviceBackend{})
+	s.Start()
+	defer s.Stop()
+	// Inspect without recording HTTP demand: CPU readiness does not imply that
+	// the demand-aware activity worker has performed its first observation.
+	waitForCond(t, 2*time.Second, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.haveSnapshot && s.snapshot.CPU.Available
+	})
+	first, err := s.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.DeviceActivity != nil {
+		t.Fatal("expected initial activity warmup before first device tick")
+	}
+	waitForCond(t, 4*time.Second, func() bool {
+		current, _ := s.Collect(context.Background())
+		return current.DeviceActivity != nil && !current.DeviceActivity.Microphone.ObservedAt.IsZero()
+	})
+}
+
+func TestDeviceActivityRefreshesWhileSlowCollectorIsStalled(t *testing.T) {
+	lane := &stalledSlowCollector{fakeLaneCollector: fakeLaneCollector{hostname: "test-host"}}
+	s := newSampler(lane, 0, 0)
+	s.fastEvery = 20 * time.Millisecond
+	s.devices = newDeviceManager(filepath.Join(t.TempDir(), "settings.json"), &fakeDeviceBackend{devices: []cameraDevice{testCamera("a", true)}})
+	_, unsubscribe := s.Subscribe()
+	defer unsubscribe()
+	s.Start()
+	defer s.Stop()
+	var first Metrics
+	waitForCond(t, 2*time.Second, func() bool {
+		first, _ = s.Collect(context.Background())
+		return first.CPU.Available && first.DeviceActivity != nil && first.DeviceActivity.Microphone.State == "active"
+	})
+	waitForCond(t, 4*time.Second, func() bool {
+		current, _ := s.Collect(context.Background())
+		return current.DeviceActivity != nil && current.DeviceActivity.Microphone.ObservedAt.After(first.DeviceActivity.Microphone.ObservedAt) && current.CPU.Value > first.CPU.Value
+	})
 }
 
 func waitForCond(t *testing.T, timeout time.Duration, cond func() bool) {

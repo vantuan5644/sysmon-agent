@@ -125,30 +125,12 @@ function writeFixture(root) {
 </head>
 <body>
   <main class="shell">
-    <header class="topbar">
-      <div>
-        <p class="eyebrow" id="platform">linux / amd64 / 6.8.0-homelab</p>
-        <h1 id="hostname">labbox-mini</h1>
-      </div>
-      <div class="top-actions">
-        <button class="button" type="button" aria-label="Dim mode" aria-pressed="false" title="Dim mode">&#9680;</button>
-        <button class="button active" type="button" aria-label="Screen shift mode" aria-pressed="true" title="Screen shift mode">&#8644;</button>
-        <button class="button active" type="button" aria-label="Keep screen awake" aria-pressed="true" title="Keep screen awake">&#9728;</button>
-        <button class="button" type="button" aria-label="Pause updates" aria-pressed="false" title="Pause updates">&#8545;</button>
-      </div>
-    </header>
-    <div class="status-row">
-      <section class="status-strip" role="button" tabindex="0" aria-label="Refresh metrics now">
-        <span class="status-dot ok"></span>
-        <span>Live</span>
-        <span class="muted">up 7h 12m / saved / app</span>
-        <span class="muted">03:16:00 / 4s / 142ms</span>
-      </section>
-      <button class="alerts-chip" type="button" aria-label="2 alerts; show details">
-        <span aria-hidden="true">&#9888;</span>
-        <span>2</span>
-      </button>
-    </div>
+    ${readFileSync(join(scriptDir, "static", "index.html"), "utf8").match(/<header class="topbar">[\s\S]*?<\/header>/)[0]
+      .replace('id="hostname">Sysmon', 'id="hostname">labbox-mini')
+      .replace('id="platform">Loading', 'id="platform">linux / amd64 / 6.8.0-homelab')
+      .replace('id="statusText">Connecting', 'id="statusText">Live')
+      .replace('id="agentMeta" class="muted">--', 'id="agentMeta" class="muted">up 7h 12m / saved / app')
+      .replace('id="updatedAt" class="muted">--', 'id="updatedAt" class="muted">03:16:00 / 4s / 142ms')}
     <section class="panel issues-panel" role="button" tabindex="0" aria-label="Expand issue details" aria-expanded="false" aria-live="polite">
       <div class="section-head">
         <h2>Issues</h2>
@@ -268,14 +250,13 @@ function verifyStaticLayout(fixturePath) {
     `min-width: 0;`,
     `@media (pointer: coarse)`,
     `grid-template-columns: repeat(4, 40px);`,
-    `@media (max-width: 390px)`,
+    `@media (max-width: 480px)`,
     `flex-direction: column;`,
-    `grid-template-columns: repeat(4, minmax(0, 1fr));`,
+    `grid-column: 1 / -1;`,
     `@media (orientation: landscape) and (max-height: 500px)`,
     `flex: 1 1 auto;`,
     `width: min(21vw, 172px, max(0px, calc(100cqh - 114px)));`,
     `flex-direction: row;`,
-    `padding-bottom: calc(env(safe-area-inset-bottom) + 4px);`,
     `touch-action: manipulation;`,
     `overflow-wrap: anywhere;`,
     `.alerts-panel,`,
@@ -294,8 +275,8 @@ function verifyStaticLayout(fixturePath) {
   ]) {
     assertIncludes(css, needle, "dashboard CSS");
   }
-  // The narrow-screen status strip must keep the state and the timestamp on the
-  // first row, with the metadata dropping to its own full-width row below.
+  // The desktop status strip keeps state and timestamp together, with metadata
+  // on its own row. Narrow screens give the timestamp an additional row.
   // Matched loosely so adding a strip column (the build badge added one) does
   // not fail a layout that still satisfies the requirement.
   if (!/"state( \w+)* updated"/.test(css)) {

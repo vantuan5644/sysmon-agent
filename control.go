@@ -12,10 +12,12 @@ import (
 type ControlAction string
 
 const (
+	ControlCameraToggle ControlAction = "camera_toggle"
 	// ControlMicMute toggles the mute state of every active capture endpoint
 	// (all microphones) on the host.
 	ControlMicMute ControlAction = "mic_mute"
-	// ControlMediaToggle sends a play/pause media key to the active session.
+	// ControlMediaToggle toggles the active player's playback. Windows uses
+	// media-session controls with a keyboard fallback for legacy players.
 	ControlMediaToggle ControlAction = "media_toggle"
 	// ControlVolumeMute toggles mute on the default playback (speaker) endpoint.
 	ControlVolumeMute ControlAction = "volume_mute"
@@ -27,16 +29,18 @@ const (
 // and rendered in the toolbar.
 var controlActionOrder = []ControlAction{
 	ControlMicMute,
+	ControlCameraToggle,
 	ControlMediaToggle,
 	ControlVolumeMute,
 	ControlLockScreen,
 }
 
 var controlActionLabels = map[ControlAction]string{
-	ControlMicMute:     "Mic mute",
-	ControlMediaToggle: "Play/Pause",
-	ControlVolumeMute:  "Speaker mute",
-	ControlLockScreen:  "Lock screen",
+	ControlCameraToggle: "Camera",
+	ControlMicMute:      "Mic mute",
+	ControlMediaToggle:  "Play/Pause",
+	ControlVolumeMute:   "Speaker mute",
+	ControlLockScreen:   "Lock screen",
 }
 
 func isKnownControlAction(action ControlAction) bool {
@@ -54,12 +58,13 @@ type ControlRequest struct {
 // control that cannot be applied degrades into available=false / applied=false
 // with an Error rather than failing the HTTP request.
 type ControlResult struct {
-	Action    ControlAction `json:"action"`
-	Available bool          `json:"available"`
-	Applied   bool          `json:"applied"`
-	State     string        `json:"state,omitempty"`
-	Message   string        `json:"message,omitempty"`
-	Error     string        `json:"error,omitempty"`
+	CameraControl *CameraControlState `json:"camera_control,omitempty"`
+	Action        ControlAction       `json:"action"`
+	Available     bool                `json:"available"`
+	Applied       bool                `json:"applied"`
+	State         string              `json:"state,omitempty"`
+	Message       string              `json:"message,omitempty"`
+	Error         string              `json:"error,omitempty"`
 }
 
 // ControlCapability advertises whether a control is supported on this host so

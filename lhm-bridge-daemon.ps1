@@ -19,16 +19,20 @@
 #     the per-read loop below keeps emitting a single unavailable error object
 #     for every request, so the agent degrades identically to the one-shot
 #     bridge instead of churning process restarts.
-#   - "osd" updates CPU/GPU hardware only; other lines request the full sensor
-#     snapshot. Both modes write one compact JSON line and flush.
+#   - "osd" updates CPU/GPU hardware only; "rescan" re-enumerates hot-pluggable
+#     hardware (Update-HotPluggedHardware) and then answers like a full read;
+#     other lines request the full sensor snapshot. Every mode writes one
+#     compact JSON line and flushes.
 #   - On a per-read exception: write one unavailable error object, flush, keep
-#     looping. The agent decides whether to recycle.
+#     looping. The agent decides whether to restart the process.
 #   - On stdin EOF (ReadLine returns $null, i.e. the agent closed stdin for a
 #     clean shutdown): exit 0.
 #
-# The agent periodically kills and restarts this process (every N reads / M
-# minutes) so hot-plugged hardware (USB PSU) is re-enumerated with a fresh
-# Computer.Open(), and to shed any long-lived driver/handle drift.
+# The agent sends "rescan" every N reads / M minutes so a hot-plugged USB PSU is
+# picked up. It used to kill and respawn this process for that, but a fresh
+# Computer.Open() also re-runs storage detection, which sends vendor pass-through
+# commands to every USB disk and USB-reset an SD card reader mid-write; see the
+# lhmDaemonRescanReads comment in lhm_bridge_windows.go.
 #
 # Usage: pwsh -NoProfile -ExecutionPolicy Bypass -File lhm-bridge-daemon.ps1
 #
@@ -224,6 +228,43 @@ function Update-StorageTemperatures {
         foreach ($entry in $cached) { $all.Add($entry) }
     }
     return $all
+}
+
+# Re-reads the storage rotation from the drives the Computer holds now. The
+# storage group follows drive arrival and removal by itself (DiskInfoToolkit
+# listens for WM_DEVICECHANGE and checks only the drive that changed), so a
+# drive plugged in after Open() shows up in $computer.Hardware without another
+# Open(). A drive that left must also leave the cache, or its last reading
+# would be re-emitted forever now that no periodic respawn clears it.
+function Sync-StorageNodes($computer) {
+    $current = @($computer.Hardware | Where-Object { Test-StorageNode $_ })
+    $present = @{}
+    foreach ($hw in $current) { $present[$hw.Identifier.ToString()] = $true }
+    foreach ($id in @($script:StorageTemps.Keys)) {
+        if (-not $present.ContainsKey($id)) { $script:StorageTemps.Remove($id) }
+    }
+    $script:StorageNodes.Clear()
+    foreach ($hw in $current) { $script:StorageNodes.Add($hw) }
+}
+
+# Re-enumerates hardware that can be hot-plugged, inside the open Computer.
+# LibreHardwareMonitor adds or removes a sensor group when its Is*Enabled flag
+# flips on an open Computer, so cycling IsPsuEnabled rebuilds only the USB PSU
+# groups. It also retries a PSU that another process held exclusively at
+# startup, which is what made Open() fall back to New-LhmComputer $false.
+# Storage is left alone on purpose (see Sync-StorageNodes).
+function Update-HotPluggedHardware($computer) {
+    if ($computer.PSObject.Properties['IsPsuEnabled']) {
+        try {
+            $computer.IsPsuEnabled = $false
+            $computer.IsPsuEnabled = $true
+        }
+        catch {
+            # Still held elsewhere: leave PSU off and keep every other sensor.
+            try { $computer.IsPsuEnabled = $false } catch {}
+        }
+    }
+    Sync-StorageNodes $computer
 }
 
 # Selects the aggregate output power (watts) from a PSU hardware node's Power
@@ -534,6 +575,9 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             $json = New-ErrorObject $startupError | ConvertTo-Json -Compress -Depth 6
         } elseif ($line -eq 'osd') {
             $json = Read-LhmOsdSnapshot $computer
+        } elseif ($line -eq 'rescan') {
+            Update-HotPluggedHardware $computer
+            $json = Read-LhmSnapshot $computer
         } else {
             $json = Read-LhmSnapshot $computer
         }

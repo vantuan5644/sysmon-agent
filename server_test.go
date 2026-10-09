@@ -581,7 +581,7 @@ func TestClientCheckHandlerRecordsDashboardVisit(t *testing.T) {
 	}
 
 	post := httptest.NewRecorder()
-	postReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v140","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
+	postReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v152","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
 	postReq.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
 	postReq.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile Safari")
 	handler.ServeHTTP(post, postReq)
@@ -686,7 +686,7 @@ func TestStatusKeepsDeviceClientCheckAfterHistoryRotates(t *testing.T) {
 	}
 
 	device := httptest.NewRecorder()
-	deviceReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v140","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
+	deviceReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v152","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
 	deviceReq.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
 	deviceReq.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile Safari")
 	handler.ServeHTTP(device, deviceReq)
@@ -1469,6 +1469,23 @@ func TestControlHandlerAppliesKnownAction(t *testing.T) {
 	}
 	if result.Action != ControlMicMute || !result.Applied || result.State != "muted" {
 		t.Fatalf("result = %+v, want applied mic_mute muted", result)
+	}
+}
+
+func TestControlHandlerAppliesCameraAction(t *testing.T) {
+	controller := &fakeController{result: ControlResult{Available: true, Applied: true, State: "disabled", CameraControl: &CameraControlState{Available: true, State: "disabled", RestorePending: true}}}
+	handler := newControlTestHandler(t, controller)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, newSameOriginControlPostRequest(`{"action":"camera_toggle"}`))
+	if rec.Code != http.StatusOK || controller.gotAction != ControlCameraToggle {
+		t.Fatalf("camera action status=%d action=%q body=%s", rec.Code, controller.gotAction, rec.Body.String())
+	}
+	var result ControlResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.CameraControl == nil || !result.CameraControl.RestorePending || result.State != "disabled" {
+		t.Fatalf("camera result missing restore state: %+v", result)
 	}
 }
 
