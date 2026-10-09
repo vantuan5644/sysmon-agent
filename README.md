@@ -44,8 +44,9 @@ years-old handset with nothing plugged in makes a perfect, near-zero-power desk 
   refreshing live over Server-Sent Events.
 - 🎛️ **At-a-glance gauges** — concentric rings (CPU utilization outer, **core-clock
   inner**), a small live trend per card, and amber/red warning thresholds.
-- 🔘 **Quick controls** — mute mic, play/pause media, mute speaker, and lock the screen
-  straight from the dashboard footer.
+- 🔘 **Quick controls** — mute the mic, turn local cameras off, play/pause media, mute the
+  speaker, and lock the screen from a control row above every page, with live mic and camera
+  activity indicators.
 - 🧮 **AI usage page** — an optional fourth page with Claude Code plan usage (5-hour
   session, weekly, per-model weeklies, usage credits), Codex quota, and a seven-day token
   chart for each. Reads the local files both tools already write; hidden unless you point
@@ -162,7 +163,7 @@ defaults so the monitor still comes up.
 **Linux.** Two units ship under `deploy/`:
 
 - [`deploy/sysmon-agent.user.service`](deploy/sysmon-agent.user.service) (recommended for
-  desktops) runs under your per-user systemd manager so the **footer controls** (mic/media/
+  desktops) runs under your per-user systemd manager so the **host controls** (mic/media/
   speaker/lock) can reach PipeWire/PulseAudio, `playerctl`, and `loginctl lock-session`.
 - [`deploy/sysmon-agent.service`](deploy/sysmon-agent.service) runs as a system service for
   headless hosts.
@@ -179,6 +180,35 @@ sudo loginctl enable-linger "$USER"
 [`run-linux.sh`](run-linux.sh) rebuilds, reinstalls to `/usr/local/bin`, and restarts the
 right unit. Don't add `ProtectSystem`/`PrivateDevices`/`ProtectKernelModules` — they break
 the `/proc`, sysfs, hwmon, and RAPL reads.
+
+**CPU package power (recommended).** The kernel ships the RAPL `energy_uj` counter as
+`0400` root-only, and both units run the agent unprivileged with `NoNewPrivileges=true`, so
+without this rule CPU power reports "present but not readable". The rule makes the counter
+world-readable (power readings are low-sensitivity) and is a no-op on hosts without RAPL:
+
+```bash
+sudo install -m0644 scripts/udev/99-powercap-rapl.rules /etc/udev/rules.d/
+sudo udevadm trigger --subsystem-match=powercap
+```
+
+It matches udev's `change` action as well as `add`, so the trigger applies it immediately,
+with no reboot or agent restart.
+
+**Camera button (optional).** Both units run the agent as a regular user, and Linux camera
+control writes each USB video interface's `authorized` file plus `/sys/bus/usb/drivers_probe`,
+which are root-only by default. A udev rule and a tmpfiles entry hand them to a
+`sysmon-camera` group:
+
+```bash
+sudo groupadd -r sysmon-camera && sudo usermod -aG sysmon-camera "$USER"
+sudo install -m0644 scripts/udev/70-sysmon-camera.rules /etc/udev/rules.d/
+sudo install -m0644 scripts/tmpfiles/sysmon-camera.conf /etc/tmpfiles.d/
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/sysmon-camera.conf
+sudo udevadm trigger --subsystem-match=usb --action=change
+```
+
+Log out and back in (or reboot) so the user manager picks up the group. Until then, Camera
+reports that control requires root or the `sysmon-camera` group.
 
 **Windows.** `install-windows.ps1` registers a native `SysmonAgent` service (pure stdlib SCM
 integration — the same binary is both console app and service). From an elevated PowerShell:
@@ -253,6 +283,45 @@ the full dashboard collector. On Windows an independent one-second loop asks the
 LibreHardwareMonitor bridge for CPU/GPU sensors only, and only while an OSD client is
 active; hardware readings older than 3.5 s are suppressed. Other platforms currently serve
 CPU usage there and report the hardware fields unavailable.
+</details>
+
+<details>
+<summary><b>Host controls &amp; capture activity</b></summary>
+
+Mic, Camera, Media, Speaker, and Lock stay above every dashboard page. Capture buttons show
+a compact `On · Idle` summary: control state first, usage second. For Mic, On means unmuted
+and Off means muted; Camera uses On/Off/Mix for supported local devices. A green border means
+On, independently of usage. **Busy** means capture use was detected and gets amber text and an
+animated indicator; **Idle** means no use was detected within the available coverage; a dash
+means unknown. Paused, disconnected, or observations older than ten seconds show unknown usage
+without animation, and reduced-motion preferences keep indicators static.
+
+Mute state is unknown until a control action returns; after that it shows the agent's last
+action, so a mute toggled in another app does not appear. A muted microphone can still have an
+open capture session: mute silences audio without closing the app's session. The animated bars
+show that capture is in use; they carry no sound-level information.
+
+**Camera** toggles supported local devices: Windows Camera-class devices and older USB video
+devices, or Linux USB video interfaces. Windows needs Administrator or LocalSystem (the
+installed service runs as LocalSystem); Linux needs root or the `sysmon-camera` group set up
+in the deploy section above. Many virtual and network cameras are outside this control's
+coverage, and disabling a camera can interrupt an ongoing call or camera-based sign-in.
+Device failures and partial results are shown explicitly, and cameras that were already
+disabled are left alone.
+
+Camera control requires a persistent `-settings` path. Before changing devices the agent saves
+recovery records at `<settings-path>.cameras.json`; the next Camera action restores only the
+recorded devices, including after an agent restart. Missing devices keep their entries until
+reconnected, so do not delete that file while cameras need restoring. On Linux only the video
+interfaces are disabled, which keeps the microphone of a combined USB webcam working.
+
+Activity is collected in the background, at most once every two seconds. Windows uses Core
+Audio capture sessions plus best-effort microphone and camera privacy records from loaded user
+profiles. Linux uses `pw-dump`, or PulseAudio recording streams via `pactl`, supplemented by
+ALSA capture state and V4L2 device holders; a system service may not see the desktop session,
+in which case usage stays unknown. A V4L2 handle means the device is open, which need not mean
+frames are streaming. Treat the indicators as an activity aid; they cannot promise that every
+capture path was inspected.
 </details>
 
 <details>
@@ -354,7 +423,8 @@ Two kernel settings can stand in the way, and the dry-run reports both:
 <summary><b>Platform notes</b></summary>
 
 **Linux** — CPU/memory/disk/network from `/proc`; CPU package power from Intel/AMD RAPL
-(`/sys/class/powercap`), unavailable on hosts without it; temperatures from `/sys/class/hwmon`
+(`/sys/class/powercap`), unavailable on hosts without it and, for a non-root agent, until
+`scripts/udev/99-powercap-rapl.rules` is installed (see the deploy section); temperatures from `/sys/class/hwmon`
 and `/sys/class/thermal`. NVIDIA needs `nvidia-smi` in `PATH`; AMD via the `amdgpu` DRM
 sysfs; Intel iGPU is best-effort. Container/bridge and remote-mount interfaces are skipped.
 
