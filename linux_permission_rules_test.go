@@ -2,6 +2,9 @@ package main
 
 import (
 	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -50,5 +53,61 @@ func TestCameraRulesGrantWhatTheAgentChecks(t *testing.T) {
 	// probeWritable gates all camera control on drivers_probe being writable.
 	if !strings.Contains(tmpfiles, "/sys/bus/usb/drivers_probe 0220 root sysmon-camera") {
 		t.Error("sysmon-camera.conf no longer makes /sys/bus/usb/drivers_probe group-writable for sysmon-camera")
+	}
+}
+
+func TestRaplRuleOpensTheCounterTheCollectorReads(t *testing.T) {
+	collector := readPermissionRuleFile(t, "collector_linux.go")
+	rule := readPermissionRuleFile(t, "scripts/udev/99-powercap-rapl.rules")
+
+	if !strings.Contains(collector, `filepath.Join(dir, "energy_uj")`) {
+		t.Error("collector_linux.go no longer reads energy_uj; recheck scripts/udev/99-powercap-rapl.rules")
+	}
+	for _, want := range []string{
+		`SUBSYSTEM=="powercap"`,
+		`ACTION=="add|change"`,
+		"chmod 0444 /sys/class/powercap/intel-rapl:*/energy_uj",
+	} {
+		if !strings.Contains(rule, want) {
+			t.Errorf("99-powercap-rapl.rules is missing %q", want)
+		}
+	}
+}
+
+// TestScriptPathsNamedInSourceExist catches the next upstream message that
+// points at an internal-only file: every scripts/... path named in shipped Go
+// source must exist here, or users following the message find nothing.
+func TestScriptPathsNamedInSourceExist(t *testing.T) {
+	ref := regexp.MustCompile(`scripts/[A-Za-z0-9_./-]+\.(?:rules|conf|service|sh)`)
+	var found []string
+	err := filepath.WalkDir(".", func(name string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if name != "." && strings.HasPrefix(entry.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		for _, path := range ref.FindAllString(readPermissionRuleFile(t, name), -1) {
+			found = append(found, path)
+			if _, err := os.Stat(path); err != nil {
+				t.Errorf("%s names %s, which this repo does not ship", name, path)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Guard the scan itself: these two references are known to exist today.
+	for _, want := range []string{"scripts/udev/70-sysmon-camera.rules", "scripts/udev/99-powercap-rapl.rules"} {
+		if !slices.Contains(found, want) {
+			t.Errorf("scan did not find %s; the pattern or the source changed", want)
+		}
 	}
 }

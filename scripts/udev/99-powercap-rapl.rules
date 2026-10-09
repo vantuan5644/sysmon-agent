@@ -1,0 +1,20 @@
+# Expose RAPL package energy counters to unprivileged readers.
+#
+# The kernel ships /sys/class/powercap/intel-rapl:*/energy_uj as 0400 root-only.
+# sysmon-agent's systemd unit runs the agent under an unprivileged User= with
+# NoNewPrivileges=true, so without this rule CPU package power degrades with a
+# "not readable" error on an otherwise healthy bare-metal host. Power readings
+# are low-sensitivity, so world-readable (0444) is the intended relaxation.
+#
+# Install with:
+#   sudo install -m 0644 scripts/udev/99-powercap-rapl.rules /etc/udev/rules.d/
+#   sudo udevadm trigger --subsystem-match=powercap
+#
+# The rule matches ACTION=="add|change" on purpose. Boot fires "add", but
+# `udevadm trigger` defaults to "change" -- an add-only rule installs cleanly,
+# reports nothing, and silently leaves energy_uj at 0400 until the next reboot.
+#
+# Hosts that expose no RAPL interface at all (some VMs, locked-down BIOS) are
+# unaffected: the glob is simply a no-op there.
+SUBSYSTEM=="powercap", ACTION=="add|change", \
+  RUN+="/bin/sh -c 'chmod 0444 /sys/class/powercap/intel-rapl:*/energy_uj 2>/dev/null; true'"
