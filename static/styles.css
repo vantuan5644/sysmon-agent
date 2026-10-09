@@ -10,8 +10,11 @@
   --warn: #f5b84b;
   --bad: #ff6b6b;
   --accent: #52c7ff;
+  --control-surface: #101720;
+  --device-on: var(--good);
+  --capture-busy: var(--warn);
   --pad-x: 12px;
-  --pad-top: 12px;
+  --pad-top: 8px;
   --pad-bottom: 18px;
 }
 
@@ -86,7 +89,7 @@ button {
   height: 100svh;
   margin: 0 auto;
   /* Flex column so the pager (flex: 1 1 auto) grows to fill the viewport and the
-     page dots + host controls stay docked at the bottom on every page, instead
+     page dots stay below the pager and host controls stay above every page, instead
      of being pushed below the fold by a tall page 3. Each .page then owns its
      own vertical scroller (see .page below), so the document never has to grow
      past the viewport. */
@@ -95,20 +98,62 @@ button {
   padding:
     calc(var(--pad-top) + env(safe-area-inset-top))
     calc(var(--pad-x) + env(safe-area-inset-right))
-    0
+    max(0px, calc(env(safe-area-inset-bottom) - 6px))
     calc(var(--pad-x) + env(safe-area-inset-left));
 }
 
+/* Set by syncStandaloneViewportGap (app.js) when an iOS Home Screen app's
+   viewport is shorter than the screen. The shell grows by the shortfall to
+   reach the bottom edge, and position: fixed keeps that extra height out of
+   the document's scrollable overflow so the page does not scroll by it. */
+html.standalone-gap .shell {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: calc(100svh + var(--standalone-gap, 0px));
+}
+
 .topbar {
-  display: flex;
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr) auto;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   min-height: 48px;
+  flex: 0 0 auto;
+}
+
+/* One native refresh button covers the header; explicit actions sit above it. */
+.status-refresh {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border: 0;
+  border-radius: 8px;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.status-refresh:hover {
+  background: rgb(82 199 255 / 5%);
+}
+
+.status-refresh:active {
+  background: rgb(82 199 255 / 10%);
+}
+
+.top-actions,
+.alerts-chip {
+  position: relative;
+  z-index: 2;
 }
 
 .topbar > :first-child {
-  flex: 1;
   min-width: 0;
 }
 
@@ -119,11 +164,17 @@ button {
   min-width: 0;
 }
 
+.host-identity {
+  min-width: 0;
+}
+
 .eyebrow {
   margin: 0;
   color: var(--muted);
   font-size: 0.72rem;
   text-transform: uppercase;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -139,7 +190,7 @@ h1 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 2.1rem;
+  font-size: 1.25rem;
 }
 
 h2 {
@@ -201,18 +252,16 @@ h2 {
    existing status-strip row, so it costs zero extra vertical space, and tapping
    it swipes to the page that owns the detail.
 
-   The chip is a SIBLING of the strip, not a child: the strip is itself a
-   role="button" (tap = refresh now, the stale-shell recovery path), and a real
-   button nested inside a role="button" is invalid ARIA and an ambiguous tap
-   target. A flex wrapper also keeps the strip's grid columns / mobile
-   grid-template-areas untouched. */
+   The chip and header actions sit above the full-header refresh button,
+   keeping each action independent without nesting interactive elements. */
 .status-row {
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-#statusStrip {
+.status-strip {
   flex: 1 1 auto;
   min-width: 0;
 }
@@ -250,18 +299,20 @@ h2 {
 
 .status-strip {
   display: grid;
-  grid-template-columns: auto auto 1fr auto;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  grid-template-areas: "state ver updated" "meta meta meta";
   align-items: center;
-  gap: 8px;
-  margin: 10px 0;
+  column-gap: 6px;
+  row-gap: 3px;
+  margin: 0;
   min-height: 30px;
   color: var(--muted);
-  font-size: 0.83rem;
+  font-size: 0.68rem;
   cursor: pointer;
   touch-action: manipulation;
 }
 
-.status-strip:focus-visible {
+.status-refresh:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
   border-radius: 7px;
@@ -295,13 +346,27 @@ h2 {
   background: color-mix(in srgb, var(--warn) 12%, transparent);
 }
 
+#statusText {
+  grid-area: state;
+}
+
+#agentVersion {
+  grid-area: ver;
+}
+
 #agentMeta {
+  grid-area: meta;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 #updatedAt {
+  grid-area: updated;
+  justify-self: end;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -338,29 +403,17 @@ h2 {
   margin-bottom: 10px;
 }
 
-.bottom-controls {
-  position: sticky;
-  bottom: 0;
+.host-controls {
+  flex: 0 0 auto;
   z-index: 20;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin:
-    12px
-    calc(-1 * (var(--pad-x) + env(safe-area-inset-right)))
-    0
-    calc(-1 * (var(--pad-x) + env(safe-area-inset-left)));
-  padding:
-    10px
-    calc(var(--pad-x) + env(safe-area-inset-right))
-    calc(env(safe-area-inset-bottom) + 8px)
-    calc(var(--pad-x) + env(safe-area-inset-left));
+  margin: 6px 0;
+  padding: 4px;
   background: var(--panel-strong);
-  border-top: 1px solid var(--line);
-  box-shadow: 0 -8px 16px rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--line);
+  border-radius: 12px;
 }
 
-.bottom-controls .control-row {
+.host-controls .control-row {
   margin: 0;
 }
 
@@ -378,11 +431,21 @@ h2 {
 }
 
 .control-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 1.25rem;
+  height: 1.25rem;
   font-size: 1.2rem;
   line-height: 1;
 }
 
 .control-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
   max-width: 100%;
   overflow: hidden;
   font-size: 0.62rem;
@@ -390,8 +453,19 @@ h2 {
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--muted);
-  white-space: nowrap;
+  min-height: 22px;
+  line-height: 11px;
+  white-space: normal;
   text-overflow: ellipsis;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .control-btn.active .control-label {
@@ -444,11 +518,16 @@ h2 {
      gives it the pager's full (definite) height, and overflow-y: auto makes a
      tall page 3 scroll internally instead of inflating the whole shell.
      min-height: 0 lets it actually shrink to that height rather than being
-     floored by its content. overscroll-behavior: contain stops a page scroll
-     from chaining to the document/body bounce. */
+     floored by its content. overscroll-behavior-y: contain stops a page scroll
+     from chaining to the document/body bounce.
+     Y only, never the shorthand: overflow-y: auto makes the page a scroll
+     container on BOTH axes, and contain on x swallowed every horizontal swipe
+     instead of handing it to the pager, so pages switched only via the dots. */
   min-height: 0;
+  overflow-x: hidden;
   overflow-y: auto;
-  overscroll-behavior: contain;
+  overscroll-behavior-x: auto;
+  overscroll-behavior-y: contain;
   scroll-snap-align: start;
   scroll-snap-stop: always;
 }
@@ -537,11 +616,12 @@ h2 {
 }
 
 .gauge-grid {
-  height: 100%;
+  height: auto;
+  align-content: start;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  grid-auto-rows: minmax(0, 1fr);
-  gap: 12px;
+  grid-auto-rows: auto;
+  gap: 8px;
 }
 
 /* On wide screens (tablet / desktop) the four cards fit comfortably in a single
@@ -569,7 +649,7 @@ h2 {
   padding: 8px 6px 6px;
   text-align: center;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto auto minmax(2.2rem, auto) 24px;
+  grid-template-rows: auto auto auto minmax(2.2rem, auto) 24px;
   row-gap: 2px;
 }
 
@@ -593,7 +673,7 @@ h2 {
   container-type: inline-size;
   display: grid;
   place-items: center;
-  width: min(40vw, 172px, max(0px, calc(50cqh - var(--card-stack))));
+  width: min(38vw, 144px, max(0px, calc(50cqh - var(--card-stack))));
   min-width: 0;
   align-self: center;
   aspect-ratio: 1;
@@ -610,7 +690,7 @@ h2 {
 
 @media (min-width: 560px) {
   .gauge {
-    width: min(172px, 18vw, max(0px, calc(100cqh - 123px)));
+    width: min(144px, 17vw, max(0px, calc(100cqh - 123px)));
   }
 }
 
@@ -1440,11 +1520,11 @@ h2 {
   }
 
   h1 {
-    font-size: 1.7rem;
+    font-size: 1.1rem;
   }
 
   .gauge-grid {
-    gap: 10px;
+    gap: 8px;
   }
 
   .gauge {
@@ -1468,29 +1548,21 @@ h2 {
     padding: 0 9px;
   }
 
+  .topbar {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+    gap: 6px 10px;
+  }
+
+  .top-actions {
+    grid-column: 1 / -1;
+  }
+
   .status-strip {
-    grid-template-columns: auto auto 1fr;
-    grid-template-areas:
-      "state ver updated"
-      "meta meta meta";
-  }
-
-  #statusText {
-    grid-area: state;
-  }
-
-  #agentVersion {
-    grid-area: ver;
-  }
-
-  #agentMeta {
-    grid-area: meta;
-    font-size: 0.74rem;
+    grid-template-areas: "state ver ver" "meta meta meta" "updated updated updated";
   }
 
   #updatedAt {
-    grid-area: updated;
-    justify-self: end;
+    justify-self: start;
   }
 }
 
@@ -1521,7 +1593,7 @@ h2 {
   }
 
   .control-btn {
-    padding: 0 6px;
+    padding: 0 4px;
   }
 }
 
@@ -1551,24 +1623,6 @@ h2 {
   }
 }
 
-@media (max-width: 390px) {
-  .topbar {
-    align-items: stretch;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .top-actions {
-    width: 100%;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-
-  .button {
-    width: 100%;
-    min-width: 0;
-  }
-}
-
 /* Landscape phone is the primary "always-on glance" target: a slim header and
    four large circles that fill the viewport height. The bottom host controls
    (mic / media / speaker / lock) stay docked as a slim horizontal bar so they
@@ -1577,7 +1631,10 @@ h2 {
 @media (orientation: landscape) and (max-height: 500px) {
   .shell {
     --pad-top: 6px;
-    max-width: none;
+    /* width, not max-width: the base rule caps WIDTH at 760px, which max-width
+       cannot lift, so every phone wider than that in landscape (926px, 956px)
+       got a centered 760px column with empty bands either side. */
+    width: 100%;
     min-height: 100vh;
     min-height: 100svh;
     display: flex;
@@ -1586,7 +1643,7 @@ h2 {
   }
 
   h1 {
-    font-size: 1.5rem;
+    font-size: 1.25rem;
   }
 
   .topbar {
@@ -1621,7 +1678,7 @@ h2 {
     flex: 1 1 auto;
     grid-auto-rows: minmax(0, 1fr);
     align-items: stretch;
-    gap: 10px;
+    gap: 8px;
   }
 
   .metric-card {
@@ -1648,10 +1705,10 @@ h2 {
     font-size: 0.92rem;
   }
 
-  .bottom-controls {
+  .host-controls {
     margin-top: 0;
     padding-top: 6px;
-    padding-bottom: calc(env(safe-area-inset-bottom) + 4px);
+    padding-bottom: 6px;
   }
 
   .control-btn {
@@ -1676,6 +1733,10 @@ h2 {
      and let the shell grow again, which is the exact bug this layout fixes. */
   .shell {
     height: 100dvh;
+  }
+
+  html.standalone-gap .shell {
+    height: calc(100dvh + var(--standalone-gap, 0px));
   }
 }
 
@@ -1705,3 +1766,39 @@ h2 {
 /* GPU hotspot is display-only and keeps neutral styling beside core warnings. */
 #gpuDetail { white-space: normal; overflow-wrap: anywhere; }
 .gpu-hotspot-detail { color: var(--muted); }
+
+/* The border indicates control state; usage has its own text and animation. */
+.control-btn[data-control="mic_mute"], .control-btn[data-control="camera_toggle"] {
+  border-color: var(--line);
+  background: var(--control-surface);
+}
+.control-btn.device-on { border-color: var(--device-on); }
+.control-summary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  max-width: 100%;
+  font-size: 0.625rem;
+  line-height: 12px;
+  white-space: nowrap;
+}
+.control-btn:has(.control-summary) .control-label { min-height: 11px; }
+.control-device-state { color: var(--text); font-weight: 700; }
+.control-state-separator, .control-usage { color: var(--muted); }
+.control-btn.activity-active .control-usage { color: var(--capture-busy); }
+.mic-glyph, .camera-glyph { position: relative; }
+.mic-live-bars { display: none; align-items: center; gap: 2px; height: 14px; }
+.mic-live-bars i { width: 3px; height: 14px; transform: scaleY(0.35); background: var(--capture-busy); border-radius: 2px; }
+.activity-active .mic-live-bars { display: inline-flex; position: absolute; left: calc(100% + 4px); top: 50%; transform: translateY(-50%); }
+.activity-active .mic-live-bars i { animation: mic-activity 900ms ease-in-out infinite alternate; }
+.activity-active .mic-live-bars i:nth-child(2) { animation-delay: -300ms; }
+.activity-active .mic-live-bars i:nth-child(3) { animation-delay: -600ms; }
+.camera-live-dot { display: none; position: absolute; left: calc(100% + 3px); top: 50%; transform: translateY(-50%); width: 7px; height: 7px; background: var(--capture-busy); border-radius: 50%; }
+.activity-active .camera-live-dot { display: inline-block; animation: camera-activity 1200ms ease-in-out infinite; }
+@keyframes mic-activity { to { transform: scaleY(1); } }
+@keyframes camera-activity { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) {
+  .activity-active .mic-live-bars i, .activity-active .camera-live-dot { animation: none; }
+  .mic-live-bars i:nth-child(2) { transform: scaleY(0.85); }
+}

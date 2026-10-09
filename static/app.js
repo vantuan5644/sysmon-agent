@@ -106,7 +106,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v140";
+const dashboardBuild = "sysmon-static-v152";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -133,16 +133,20 @@ const thresholdTargets = [
 // host-side config (CLI flags / env), not touch controls.
 const controlButtonIDs = {
   mic_mute: "micCtl",
+  camera_toggle: "cameraCtl",
   media_toggle: "mediaCtl",
   volume_mute: "volumeCtl",
   lock_screen: "lockCtl",
 };
 const controlActionLabels = {
   mic_mute: "Microphones",
+  camera_toggle: "Camera",
   media_toggle: "Media",
   volume_mute: "Speaker",
   lock_screen: "Screen",
 };
+const pendingControlActions = new Set();
+let lastAvailableControls = new Set();
 // updateDismissedKey returns the localStorage key for a per-version update
 // dismissal. Dismissing vX.Y.Z once keeps the banner quiet across reloads until
 // a newer version ships (then the new tag changes the key and the banner
@@ -236,12 +240,6 @@ document.addEventListener("DOMContentLoaded", () => {
     button.addEventListener("click", () => setProcSort(button.dataset.procSort));
   }
   $("statusStrip").addEventListener("click", refreshNow);
-  $("statusStrip").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      refreshNow();
-    }
-  });
   setupPager();
   reflectProcSort();
 
@@ -257,6 +255,9 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   window.addEventListener("resize", scheduleClientCheck);
   window.addEventListener("orientationchange", scheduleClientCheck);
+  window.addEventListener("resize", syncStandaloneViewportGap);
+  window.addEventListener("orientationchange", syncStandaloneViewportGap);
+  syncStandaloneViewportGap();
 
   registerServiceWorker();
 
@@ -442,6 +443,28 @@ function setupPager() {
   window.addEventListener("orientationchange", syncHeight);
   syncDots();
   syncHeight();
+}
+
+// iOS Home Screen apps with a black-translucent status bar report innerHeight
+// (and 100dvh/100svh) short by the status-bar inset in portrait: an iPhone 13
+// Pro Max measures 428x879 on a 926-tall screen, so a 100dvh shell left a
+// blank strip along the bottom. Measure the shortfall against the screen and
+// let CSS add it back. It is zero in landscape and anywhere the viewport
+// already matches the screen, so a WebKit fix turns this into a no-op.
+function syncStandaloneViewportGap() {
+  const root = document.documentElement;
+  if (!root?.style || !root.classList) {
+    return;
+  }
+  let gap = 0;
+  if (navigator.standalone === true && window.screen) {
+    const long = Math.max(window.screen.width, window.screen.height);
+    const short = Math.min(window.screen.width, window.screen.height);
+    const screenHeight = window.innerHeight > window.innerWidth ? long : short;
+    gap = Math.max(0, Math.min(80, screenHeight - window.innerHeight));
+  }
+  root.style.setProperty("--standalone-gap", `${gap}px`);
+  root.classList.toggle("standalone-gap", gap > 0);
 }
 
 function schedulePolling() {
@@ -786,6 +809,7 @@ function reviveStreamIfSilent() {
 }
 
 function markStaleIfNeeded() {
+  renderDeviceActivity(lastDeviceActivity);
   refreshMetricAge();
   if (state.paused || state.metricsInFlight || state.lastMetricsAtMS === 0 || state.connectionKind === "bad") {
     return;
@@ -1609,6 +1633,7 @@ function writeStoredBoolean(key, value) {
 }
 
 function render(metrics) {
+  renderDeviceActivity(metrics.device_activity, metrics.timestamp);
   $("hostname").textContent = metrics.hostname || "unknown";
   $("platform").textContent = [metrics.os, metrics.arch, metrics.platform].filter(Boolean).join(" / ");
   renderMetricTimestamp(metrics.timestamp, metrics.collection_duration_ms);
@@ -2067,9 +2092,8 @@ function renderMetricAlertsFromMessages(messages) {
 }
 
 // showAlertDetails swipes to the page that owns the Alerts panel. No
-// stopPropagation needed: the chip is a sibling of the status strip inside
-// .status-row, not a child of it, so the strip's refresh handler never sees
-// this tap.
+// stopPropagation needed: the alert chip is a separate button above the
+// full-header refresh target, so refreshing never handles this tap.
 function showAlertDetails() {
   goToPage(statusPageIndex);
 }
@@ -3219,6 +3243,7 @@ function alertRow(message) {
 }
 
 function setConnectionState(kind, text) {
+  if (kind === "bad" || kind === "paused" || kind === "loading") renderDeviceActivity(null);
   clearTransientStatus();
   state.connectionKind = kind;
   state.connectionText = text;
@@ -3267,7 +3292,9 @@ function applyControlCapabilities(controls) {
   for (const [action, id] of Object.entries(controlButtonIDs)) {
     const button = $(id);
     button.disabled = !available.has(action);
+    if (pendingControlActions.has(action)) button.disabled = true;
   }
+  lastAvailableControls = available;
 }
 
 // sendControl POSTs one host-control action and reflects the outcome. mic/volume
@@ -3275,7 +3302,7 @@ function applyControlCapabilities(controls) {
 // media/lock just confirm they were applied. Any failure degrades to a transient
 // status line -- it never throws.
 async function sendControl(action, button) {
-  if (!button || button.disabled) {
+  if (!button || button.disabled || pendingControlActions.has(action)) {
     return;
   }
   // Lock Screen is destructive enough to require an arm-then-confirm: the first
@@ -3290,6 +3317,8 @@ async function sendControl(action, button) {
   }
   disarmControl();
   const label = controlActionLabels[action] || "Control";
+  pendingControlActions.add(action);
+  button.disabled = true;
   try {
     const response = await fetchWithTimeout(
       "/api/control",
@@ -3304,6 +3333,9 @@ async function sendControl(action, button) {
       throw new Error(`HTTP ${response.status}`);
     }
     const result = await response.json();
+    if (action === "camera_toggle") {
+      setCameraControlState(result.camera_control || { available: result.available, state: result.state, error: result.error || result.message });
+    }
     if (result?.applied === true) {
       reflectControlResult(action, button, result, label);
       return;
@@ -3312,6 +3344,9 @@ async function sendControl(action, button) {
     showTransientStatus(`${label}: ${reason || "unavailable"}`);
   } catch (error) {
     showTransientStatus(`${label}: ${controlErrorText(error)}`);
+  } finally {
+    pendingControlActions.delete(action);
+    button.disabled = !lastAvailableControls.has(action);
   }
 }
 
@@ -3352,6 +3387,10 @@ function disarmControl() {
 
 function reflectControlResult(action, button, result, label) {
   const resultState = String(result?.state || "").toLowerCase();
+  if (action === "camera_toggle") {
+    showTransientStatus(`Camera ${resultState}${result.message ? `: ${result.message}` : ""}`);
+    return;
+  }
   if (action === "mic_mute" || action === "volume_mute") {
     let muted;
     if (resultState === "muted") {
@@ -3380,12 +3419,108 @@ function reflectControlResult(action, button, result, label) {
 function setControlMuted(action, button, muted) {
   setPressed(button, muted);
   if (action === "mic_mute") {
-    $("micCtlLabel").textContent = muted ? "Muted" : "Mic";
+    microphoneMuted = muted;
+    updateDeviceControlLabel("microphone");
     return;
   }
   if (action === "volume_mute") {
     $("volumeCtlGlyph").textContent = muted ? "🔇" : "🔊";
     $("volumeCtlLabel").textContent = muted ? "Muted" : "Speaker";
+  }
+}
+
+let microphoneMuted = null;
+let lastDeviceActivity = null;
+let cameraControlState = "unavailable";
+let cameraRestorePending = false;
+
+function setCameraControlState(control) {
+  if (!control) return;
+  cameraControlState = control.state || "unavailable";
+  cameraRestorePending = control.restore_pending === true;
+  const button = $("cameraCtl");
+  if (!button) return;
+  if (control.available === true) lastAvailableControls.add("camera_toggle");
+  else lastAvailableControls.delete("camera_toggle");
+  button.disabled = control.available !== true || pendingControlActions.has("camera_toggle");
+  setPressed(button, cameraControlState === "disabled");
+  const outside = control.unsupported > 0 ? `; ${control.unsupported} virtual or other cameras are not controlled` : "";
+  button.title = (control.error || "Controls supported local cameras; restores only cameras disabled by Sysmon") + outside;
+  updateDeviceControlLabel("camera");
+}
+
+function updateDeviceControlLabel(kind) {
+  const mic = kind === "microphone";
+  const button = $(mic ? "micCtl" : "cameraCtl");
+  const label = $(mic ? "micCtlLabel" : "cameraCtlLabel");
+  if (!button || !label) return;
+  const active = button.classList.contains("activity-active");
+  const muted = microphoneMuted === true;
+  const deviceState = mic ? (microphoneMuted === null ? "—" : muted ? "Off" : "On") :
+    cameraControlState === "disabled" ? "Off" : cameraControlState === "enabled" ? "On" :
+    cameraControlState === "mixed" ? "Mix" : "—";
+  const idle = button.classList.contains("activity-idle");
+  const activity = active ? "Busy" : idle ? "Idle" : "—";
+  const stateDescription = mic ? (microphoneMuted === null ? "mute state unknown" : muted ? "muted" : "unmuted") :
+    cameraControlState === "disabled" ? "supported cameras disabled" :
+    cameraControlState === "enabled" ? "supported cameras enabled" :
+    cameraControlState === "mixed" ? "supported cameras partly enabled" : "camera state unknown";
+  const activityDescription = active ? "in use" : idle ? "no use detected" : "usage unknown";
+  const stateLabel = $(mic ? "micCtlState" : "cameraCtlState");
+  const usageLabel = $(mic ? "micCtlUsage" : "cameraCtlUsage");
+  if (stateLabel) {
+    stateLabel.textContent = deviceState;
+    stateLabel.title = stateDescription;
+  }
+  if (usageLabel) {
+    usageLabel.textContent = activity;
+    usageLabel.title = activityDescription;
+  }
+  button.classList.toggle("device-on", deviceState === "On");
+  const operation = mic ? (muted ? "Unmute all microphones" : "Mute all microphones") :
+    cameraRestorePending ? "Restore cameras disabled by Sysmon" : "Disable supported local cameras";
+  const explanation = mic ? "; mute silences audio while apps can keep a capture session open" :
+    "; activity may include cameras outside this control's coverage";
+  button.setAttribute("aria-label", `${operation}; currently ${stateDescription}; ${activityDescription}${explanation}`);
+}
+
+let deviceActivityReceivedAt = 0;
+let deviceActivityInitialAges = {};
+
+function deviceActivityElapsedMS() {
+  return typeof window.__sysmonNow === "function" ? nowMS() : performance.now();
+}
+
+function renderDeviceActivity(activity, metricsTimestamp) {
+  // Compare timestamps from the same host. A viewing device's wall clock can
+  // differ by seconds or minutes; use monotonic elapsed time after reception.
+  if (metricsTimestamp !== undefined || activity !== lastDeviceActivity) {
+    const sampledAt = Date.parse(metricsTimestamp);
+    deviceActivityReceivedAt = deviceActivityElapsedMS();
+    deviceActivityInitialAges = Object.fromEntries(["microphone", "camera"].map((kind) =>
+      [kind, sampledAt - Date.parse(activity?.[kind]?.observed_at)]));
+  }
+  lastDeviceActivity = activity || null;
+  if (activity?.camera_control) setCameraControlState(activity.camera_control);
+  for (const kind of ["microphone", "camera"]) {
+    const button = $(kind === "microphone" ? "micCtl" : "cameraCtl");
+    if (!button) continue;
+    const reading = activity?.[kind];
+    const age = deviceActivityInitialAges[kind] + Math.max(0, deviceActivityElapsedMS() - deviceActivityReceivedAt);
+    const fresh = !state.paused && Number.isFinite(age) && age >= -2000 && age <= 10000;
+    button.classList.toggle("activity-active", fresh && reading?.state === "active");
+    button.classList.toggle("activity-idle", fresh && reading?.state === "idle");
+    if (reading) button.title = [reading.coverage, reading.error, kind === "camera" ? activity?.camera_control?.error : ""].filter(Boolean).join("; ");
+    updateDeviceControlLabel(kind);
+  }
+  const status = $("deviceActivityStatus");
+  if (status) {
+    const text = ["microphone", "camera"].map((kind) => {
+      const button = $(kind === "microphone" ? "micCtl" : "cameraCtl");
+      const activity = button?.classList.contains("activity-active") ? "in use" : button?.classList.contains("activity-idle") ? "no use detected" : "usage unknown";
+      return `${kind === "microphone" ? "Microphone" : "Camera"}: ${activity}`;
+    }).join(". ");
+    if (status.textContent !== text) status.textContent = text;
   }
 }
 

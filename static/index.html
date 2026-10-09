@@ -18,8 +18,22 @@
     <header class="topbar">
       <div class="topbar-id">
         <span id="statusDot" class="status-dot"></span>
-        <h1 id="hostname">Sysmon</h1>
-        <p class="eyebrow" id="platform">Loading</p>
+        <div class="host-identity">
+          <h1 id="hostname">Sysmon</h1>
+          <p class="eyebrow" id="platform">Loading</p>
+        </div>
+      </div>
+      <div class="status-row">
+        <section class="status-strip" aria-live="polite">
+          <span id="statusText">Connecting</span>
+          <span id="agentVersion" class="agent-version" hidden>--</span>
+          <span id="agentMeta" class="muted">--</span>
+          <span id="updatedAt" class="muted">--</span>
+        </section>
+        <button id="alertsChip" class="alerts-chip" type="button" aria-label="Show alert details" hidden>
+          <span aria-hidden="true">⚠</span>
+          <span id="alertsChipCount">0</span>
+        </button>
       </div>
       <div class="top-actions">
         <button id="dimBtn" class="button" type="button" aria-label="Dim mode" aria-pressed="false" title="Dim mode">◐</button>
@@ -27,20 +41,8 @@
         <button id="wakeBtn" class="button" type="button" aria-label="Keep screen awake" aria-pressed="false" title="Keep screen awake">☀</button>
         <button id="pauseBtn" class="button" type="button" aria-label="Pause updates" aria-pressed="false" title="Pause updates">Ⅱ</button>
       </div>
+      <button id="statusStrip" class="status-refresh" type="button" aria-label="Refresh metrics now" title="Refresh metrics now"></button>
     </header>
-
-    <div class="status-row">
-      <section id="statusStrip" class="status-strip" role="button" tabindex="0" aria-label="Refresh metrics now" aria-live="polite">
-        <span id="statusText">Connecting</span>
-        <span id="agentVersion" class="agent-version" hidden>--</span>
-        <span id="agentMeta" class="muted">--</span>
-        <span id="updatedAt" class="muted">--</span>
-      </section>
-      <button id="alertsChip" class="alerts-chip" type="button" aria-label="Show alert details" hidden>
-        <span aria-hidden="true">⚠</span>
-        <span id="alertsChipCount">0</span>
-      </button>
-    </div>
 
     <section id="updatePanel" class="panel update-panel" role="status" aria-live="polite" hidden>
       <span id="updateText" class="update-text">--</span>
@@ -48,6 +50,42 @@
         <button id="updateApplyBtn" class="update-btn" type="button">Update</button>
         <button id="updateDismissBtn" class="update-dismiss" type="button" aria-label="Dismiss update notice">×</button>
       </span>
+    </section>
+
+    <section class="host-controls" aria-label="Host controls">
+      <span id="deviceActivityStatus" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></span>
+      <section class="control-row" aria-label="Host controls">
+        <button id="micCtl" class="control-btn" type="button" data-control="mic_mute" aria-pressed="false" aria-label="Mute all microphones" disabled>
+          <span class="control-glyph mic-glyph" aria-hidden="true">🎙<span class="mic-live-bars"><i></i><i></i><i></i></span></span>
+          <span class="control-label" id="micCtlLabel">Mic</span>
+          <span class="control-summary" aria-hidden="true">
+            <span class="control-device-state" id="micCtlState">—</span>
+            <span class="control-state-separator">·</span>
+            <span class="control-usage" id="micCtlUsage">—</span>
+          </span>
+        </button>
+        <button id="cameraCtl" class="control-btn" type="button" data-control="camera_toggle" aria-pressed="false" aria-label="Disable supported local cameras" disabled>
+          <span class="control-glyph camera-glyph" aria-hidden="true">📷<span class="camera-live-dot"></span></span>
+          <span class="control-label" id="cameraCtlLabel">Camera</span>
+          <span class="control-summary" aria-hidden="true">
+            <span class="control-device-state" id="cameraCtlState">—</span>
+            <span class="control-state-separator">·</span>
+            <span class="control-usage" id="cameraCtlUsage">—</span>
+          </span>
+        </button>
+        <button id="mediaCtl" class="control-btn" type="button" data-control="media_toggle" aria-label="Play or pause media" disabled>
+          <span class="control-glyph" aria-hidden="true">⏯</span>
+          <span class="control-label">Media</span>
+        </button>
+        <button id="volumeCtl" class="control-btn" type="button" data-control="volume_mute" aria-pressed="false" aria-label="Mute speaker" disabled>
+          <span class="control-glyph" id="volumeCtlGlyph" aria-hidden="true">🔊</span>
+          <span class="control-label" id="volumeCtlLabel">Speaker</span>
+        </button>
+        <button id="lockCtl" class="control-btn" type="button" data-control="lock_screen" aria-label="Lock the screen" disabled>
+          <span class="control-glyph" aria-hidden="true">🔒</span>
+          <span class="control-label" id="lockCtlLabel">Lock</span>
+        </button>
+      </section>
     </section>
 
     <div id="pager" class="pager">
@@ -206,26 +244,7 @@
       <button id="pageDot3" class="page-dot" type="button" aria-label="AI usage" aria-current="false" hidden></button>
     </nav>
 
-    <footer class="bottom-controls" aria-label="Host controls">
-      <section class="control-row" aria-label="Host controls">
-        <button id="micCtl" class="control-btn" type="button" data-control="mic_mute" aria-pressed="false" aria-label="Mute all microphones" disabled>
-          <span class="control-glyph" aria-hidden="true">🎙</span>
-          <span class="control-label" id="micCtlLabel">Mic</span>
-        </button>
-        <button id="mediaCtl" class="control-btn" type="button" data-control="media_toggle" aria-label="Play or pause media" disabled>
-          <span class="control-glyph" aria-hidden="true">⏯</span>
-          <span class="control-label">Media</span>
-        </button>
-        <button id="volumeCtl" class="control-btn" type="button" data-control="volume_mute" aria-pressed="false" aria-label="Mute speaker" disabled>
-          <span class="control-glyph" id="volumeCtlGlyph" aria-hidden="true">🔊</span>
-          <span class="control-label" id="volumeCtlLabel">Speaker</span>
-        </button>
-        <button id="lockCtl" class="control-btn" type="button" data-control="lock_screen" aria-label="Lock the screen" disabled>
-          <span class="control-glyph" aria-hidden="true">🔒</span>
-          <span class="control-label" id="lockCtlLabel">Lock</span>
-        </button>
-      </section>
-    </footer>
+
   </main>
   <script src="/app.js" defer></script>
 </body>

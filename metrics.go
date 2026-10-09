@@ -185,14 +185,15 @@ type TailscaleStatus struct {
 }
 
 type Metrics struct {
-	Hostname   string       `json:"hostname"`
-	OS         string       `json:"os"`
-	Arch       string       `json:"arch"`
-	Platform   string       `json:"platform,omitempty"`
-	Timestamp  time.Time    `json:"timestamp"`
-	CPUName    string       `json:"cpu_name,omitempty"`
-	MemoryName string       `json:"memory_name,omitempty"`
-	CPU        NumberMetric `json:"cpu_percent"`
+	DeviceActivity *DeviceActivitySet `json:"device_activity,omitempty"`
+	Hostname       string             `json:"hostname"`
+	OS             string             `json:"os"`
+	Arch           string             `json:"arch"`
+	Platform       string             `json:"platform,omitempty"`
+	Timestamp      time.Time          `json:"timestamp"`
+	CPUName        string             `json:"cpu_name,omitempty"`
+	MemoryName     string             `json:"memory_name,omitempty"`
+	CPU            NumberMetric       `json:"cpu_percent"`
 	// CPUPower is whole-socket power. CPUCorePower/CPUSocPower/CPUMiscPower are
 	// its per-rail breakdown, currently AMD-only (read from the SMU power table
 	// via the LibreHardwareMonitor bridge) and unavailable elsewhere. The

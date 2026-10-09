@@ -47,8 +47,8 @@ type windowsController struct{}
 
 // NewSystemController returns the Windows host controller. Mic and speaker mute
 // use Core Audio endpoint properties, which work from the LocalSystem service
-// session. Media play/pause and lock screen are injected into the active console
-// session via CreateProcessAsUser when the agent runs non-interactively.
+// session. Media play/pause and lock screen run in the active console session
+// through a native helper launched with CreateProcessAsUser.
 func NewSystemController() SystemController { return windowsController{} }
 
 // windowsControlActionArg maps a public action to the bridge -Action argument.

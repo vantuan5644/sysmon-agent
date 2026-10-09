@@ -23,7 +23,7 @@ func TestPWAInstallMetadata(t *testing.T) {
 		`apple-mobile-web-app-capable`,
 		`apple-mobile-web-app-title`,
 		`id="agentMeta"`,
-		`id="statusStrip" class="status-strip" role="button" tabindex="0" aria-label="Refresh metrics now"`,
+		`id="statusStrip" class="status-refresh" type="button" aria-label="Refresh metrics now"`,
 		`class="status-row"`,
 		`id="alertsChip" class="alerts-chip" type="button"`,
 		`id="alertsChipCount"`,
@@ -132,7 +132,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v140"`,
+		`const STATIC_CACHE = "sysmon-static-v152"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -408,7 +408,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 5000;`,
-		`const dashboardBuild = "sysmon-static-v140";`,
+		`const dashboardBuild = "sysmon-static-v152";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -1019,7 +1019,7 @@ func TestDashboardThresholdValuesDriveColoring(t *testing.T) {
 	}
 }
 
-// The bottom toolbar exposes four host-control buttons (mic mute, media
+// The top toolbar exposes host-control buttons (mic mute, camera, media
 // play/pause, speaker mute, lock screen) wired by fixed id to /api/control.
 func TestDashboardHostControlButtons(t *testing.T) {
 	index, err := staticFS.ReadFile("static/index.html")
@@ -1029,6 +1029,7 @@ func TestDashboardHostControlButtons(t *testing.T) {
 	indexHTML := string(index)
 	for _, needle := range []string{
 		`id="micCtl" class="control-btn" type="button" data-control="mic_mute"`,
+		`id="cameraCtl" class="control-btn" type="button" data-control="camera_toggle"`,
 		`id="mediaCtl" class="control-btn" type="button" data-control="media_toggle"`,
 		`id="volumeCtl" class="control-btn" type="button" data-control="volume_mute"`,
 		`id="lockCtl" class="control-btn" type="button" data-control="lock_screen"`,
@@ -1039,6 +1040,9 @@ func TestDashboardHostControlButtons(t *testing.T) {
 		if !strings.Contains(indexHTML, needle) {
 			t.Fatalf("index.html missing host control markup %q", needle)
 		}
+	}
+	if strings.Index(indexHTML, `class="host-controls"`) > strings.Index(indexHTML, `id="pager"`) {
+		t.Fatal("host controls must precede the pager")
 	}
 	// The removed refresh + threshold rows must be gone.
 	for _, absent := range []string{`data-interval=`, `threshold-row`, `class="segment`} {
@@ -1055,6 +1059,7 @@ func TestDashboardHostControlButtons(t *testing.T) {
 	for _, needle := range []string{
 		`const controlButtonIDs = {`,
 		`mic_mute: "micCtl",`,
+		`camera_toggle: "cameraCtl",`,
 		`media_toggle: "mediaCtl",`,
 		`volume_mute: "volumeCtl",`,
 		`lock_screen: "lockCtl",`,
@@ -1083,7 +1088,8 @@ func TestDashboardHostControlButtons(t *testing.T) {
 		`.control-glyph {`,
 		`.control-label {`,
 		`.control-btn:disabled {`,
-		`.bottom-controls {`,
+		`.host-controls {`,
+		`@media (prefers-reduced-motion: reduce)`,
 	} {
 		if !strings.Contains(cssText, needle) {
 			t.Fatalf("styles.css missing host control style %q", needle)
@@ -1120,15 +1126,14 @@ func TestNarrowDeviceHeaderKeepsHostnameUsable(t *testing.T) {
 	}
 	css := string(data)
 	for _, needle := range []string{
-		`@media (max-width: 390px) {`,
+		`@media (max-width: 480px) {`,
 		`.topbar {`,
-		`align-items: stretch;`,
-		`flex-direction: column;`,
+		`grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);`,
 		`.top-actions {`,
-		`width: 100%;`,
-		`grid-template-columns: repeat(4, minmax(0, 1fr));`,
+		`grid-column: 1 / -1;`,
+		`grid-template-columns: repeat(4, 40px);`,
 		`.button {`,
-		`width: 100%;`,
+		`width: 40px;`,
 		`min-width: 0;`,
 	} {
 		if !strings.Contains(css, needle) {
@@ -1141,12 +1146,12 @@ func TestNarrowDeviceHeaderKeepsHostnameUsable(t *testing.T) {
 		shellPaddingPX  = 10 * 2
 		buttonGapPX     = 6 * 3
 		buttonCount     = 4
-		minTouchPX      = 40
+		buttonWidthPX   = 40
 	)
 	contentWidth := viewportWidthPX - shellPaddingPX
-	buttonWidth := (contentWidth - buttonGapPX) / buttonCount
-	if buttonWidth < minTouchPX {
-		t.Fatalf("narrow header action button width = %dpx, want at least %dpx", buttonWidth, minTouchPX)
+	buttonsWidth := buttonCount*buttonWidthPX + buttonGapPX
+	if buttonsWidth > contentWidth {
+		t.Fatalf("narrow header controls need %dpx but only have %dpx", buttonsWidth, contentWidth)
 	}
 }
 
@@ -1181,7 +1186,7 @@ func TestNarrowDeviceMetricCardsFitFourAcross(t *testing.T) {
 		`.gauge {`,
 		`min-width: 0;`,
 		`.control-btn {`,
-		`padding: 0 6px;`,
+		`padding: 0 4px;`,
 	} {
 		if !strings.Contains(css, needle) {
 			t.Fatalf("styles.css missing narrow device layout rule %q", needle)
@@ -1219,7 +1224,7 @@ func TestLandscapeDeviceFillsViewportWithGauges(t *testing.T) {
 		`flex: 1 1 auto;`,
 		`width: min(21vw, 172px, max(0px, calc(100cqh - 114px)));`,
 		`min-width: 0;`,
-		`.bottom-controls {`,
+		`.host-controls {`,
 		`display: none;`,
 	} {
 		if !strings.Contains(css, needle) {
@@ -1352,7 +1357,7 @@ func TestMobileStatusMetadataRemainsVisible(t *testing.T) {
 		`grid-area: meta;`,
 		`.status-dot.warn {`,
 		`.status-dot.paused {`,
-		`.status-strip:focus-visible {`,
+		`.status-refresh:focus-visible {`,
 		`touch-action: manipulation;`,
 	} {
 		if !strings.Contains(css, needle) {

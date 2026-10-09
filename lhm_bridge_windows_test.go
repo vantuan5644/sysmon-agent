@@ -198,25 +198,25 @@ func (inst *fakeInstance) serve() {
 // daemonTestEnv saves/restores the daemon timing/policy vars and shortens them so
 // the transport tests run in milliseconds instead of seconds.
 type daemonTestEnv struct {
-	cold       time.Duration
-	warm       time.Duration
-	backoff    time.Duration
-	disable    int
-	recycle    int
-	recycleAge time.Duration
-	spawn      func() (lhmDaemonProcess, error)
+	cold      time.Duration
+	warm      time.Duration
+	backoff   time.Duration
+	disable   int
+	rescan    int
+	rescanAge time.Duration
+	spawn     func() (lhmDaemonProcess, error)
 }
 
 func shortenDaemonTimings(t *testing.T) *daemonTestEnv {
 	t.Helper()
 	saved := &daemonTestEnv{
-		cold:       lhmDaemonColdReadTimeout,
-		warm:       lhmDaemonWarmReadTimeout,
-		backoff:    lhmDaemonRestartBackoff,
-		disable:    lhmDaemonDisableFailures,
-		recycle:    lhmDaemonRecycleReads,
-		recycleAge: lhmDaemonRecycleAge,
-		spawn:      newLhmDaemonProcess,
+		cold:      lhmDaemonColdReadTimeout,
+		warm:      lhmDaemonWarmReadTimeout,
+		backoff:   lhmDaemonRestartBackoff,
+		disable:   lhmDaemonDisableFailures,
+		rescan:    lhmDaemonRescanReads,
+		rescanAge: lhmDaemonRescanAge,
+		spawn:     newLhmDaemonProcess,
 	}
 	lhmDaemonColdReadTimeout = 80 * time.Millisecond
 	lhmDaemonWarmReadTimeout = 80 * time.Millisecond
@@ -227,8 +227,8 @@ func shortenDaemonTimings(t *testing.T) *daemonTestEnv {
 		lhmDaemonWarmReadTimeout = saved.warm
 		lhmDaemonRestartBackoff = saved.backoff
 		lhmDaemonDisableFailures = saved.disable
-		lhmDaemonRecycleReads = saved.recycle
-		lhmDaemonRecycleAge = saved.recycleAge
+		lhmDaemonRescanReads = saved.rescan
+		lhmDaemonRescanAge = saved.rescanAge
 		newLhmDaemonProcess = saved.spawn
 	})
 	return saved
@@ -445,32 +445,143 @@ func TestLhmDaemonNeverDisablesAfterItHasSucceeded(t *testing.T) {
 	}
 }
 
-func TestLhmDaemonRecycleRestartsAfterReadThreshold(t *testing.T) {
-	lhmDaemonRecycleReads = 2 // recycle after every 2 successful reads
-	good := func(string) (string, fakeAction) { return goodBridgeJSON, fakeRespond }
-	fake := &fakeDaemonProcess{behaviors: []func(string) (string, fakeAction){good}}
-	installFakeDaemon(t, fake)
-	d := &lhmDaemon{}
+// recordingDaemon returns a fake daemon that answers every request with
+// goodBridgeJSON and records each request line it receives.
+func recordingDaemon() (*fakeDaemonProcess, func() []string) {
+	var mu sync.Mutex
+	var lines []string
+	fake := &fakeDaemonProcess{behaviors: []func(string) (string, fakeAction){func(line string) (string, fakeAction) {
+		mu.Lock()
+		lines = append(lines, line)
+		mu.Unlock()
+		return goodBridgeJSON, fakeRespond
+	}}}
+	return fake, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), lines...)
+	}
+}
 
-	// Two successful reads hit the recycle threshold; the process is torn down so
-	// the next read spawns a fresh one (a fresh Computer.Open() re-enumerates
-	// hardware). After the recycle, coldRead is re-armed for the cold re-Open.
-	for i := 0; i < lhmDaemonRecycleReads; i++ {
+// TestLhmDaemonRescansInPlaceAfterReadThreshold pins the replacement for the old
+// periodic respawn. Once the threshold is reached the next full read goes out as
+// a rescan to the SAME process; a respawn would re-run Computer.Open(), whose
+// storage detection USB-reset an SD card reader every 9 minutes on BBLWIN and
+// once lost the tail of a completed write.
+func TestLhmDaemonRescansInPlaceAfterReadThreshold(t *testing.T) {
+	fake, requests := recordingDaemon()
+	installFakeDaemon(t, fake)
+	lhmDaemonRescanReads = 2
+	d := &lhmDaemon{}
+	defer d.Close()
+
+	for i := 0; i < 4; i++ {
 		if _, err := d.read(context.Background()); err != nil {
 			t.Fatalf("read #%d error: %v", i+1, err)
 		}
 	}
+	// OSD reads neither count toward the threshold nor get upgraded.
+	if _, err := d.readRequest(context.Background(), "osd"); err != nil {
+		t.Fatalf("osd read error: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := d.read(context.Background()); err != nil {
+			t.Fatalf("read after osd #%d error: %v", i+1, err)
+		}
+	}
+
+	want := []string{"read", "read", lhmDaemonRescanRequest, "read", "osd", "read", lhmDaemonRescanRequest}
+	if got := requests(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("request lines = %v, want %v", got, want)
+	}
 	if got := fake.startCount(); got != 1 {
-		t.Fatalf("start count before recycle-read = %d, want 1", got)
+		t.Fatalf("process start count = %d, want 1 (a rescan must not respawn the daemon)", got)
 	}
-	// The next read recycles: the recycled read uses the long cold deadline again
-	// (lhmDaemonColdReadTimeout), and a fresh process is started.
-	lhmDaemonColdReadTimeout = 5 * time.Second
+}
+
+func TestLhmDaemonRescansInPlaceAfterAge(t *testing.T) {
+	fake, requests := recordingDaemon()
+	installFakeDaemon(t, fake)
+	d := &lhmDaemon{}
+	defer d.Close()
+
 	if _, err := d.read(context.Background()); err != nil {
-		t.Fatalf("recycle read error: %v", err)
+		t.Fatalf("first read error: %v", err)
 	}
-	if got := fake.startCount(); got != 2 {
-		t.Fatalf("start count after recycle-read = %d, want 2 (fresh Open())", got)
+	// Backdate rather than shrink the age: Windows' clock can return the same
+	// reading twice in a row, so even a 1 ns age is not reliably exceeded.
+	d.mu.Lock()
+	d.scannedAt = time.Now().Add(-2 * lhmDaemonRescanAge)
+	d.mu.Unlock()
+	for i := 0; i < 2; i++ {
+		if _, err := d.read(context.Background()); err != nil {
+			t.Fatalf("read #%d error: %v", i+2, err)
+		}
+	}
+	want := []string{"read", "read", lhmDaemonRescanRequest}
+	if got := requests(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("request lines = %v, want %v", got, want)
+	}
+	if got := fake.startCount(); got != 1 {
+		t.Fatalf("process start count = %d, want 1", got)
+	}
+}
+
+// TestLhmDaemonScriptHandlesTheRescanRequest keeps the two halves of the
+// protocol in step: an unknown line falls through to a plain full read, so a
+// renamed request on one side would silently stop every rescan.
+func TestLhmDaemonScriptHandlesTheRescanRequest(t *testing.T) {
+	script := readLhmBridgeScript(t, "lhm-bridge-daemon.ps1")
+	if !strings.Contains(script, "$line -eq '"+lhmDaemonRescanRequest+"'") {
+		t.Fatalf("lhm-bridge-daemon.ps1 does not handle the %q request line", lhmDaemonRescanRequest)
+	}
+}
+
+func TestLhmDaemonRescanScriptRebuildsOnlyPsuAndSyncsStorage(t *testing.T) {
+	shell, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("pwsh unavailable")
+	}
+	script := `
+$ErrorActionPreference = 'Stop'
+$tokens=$null; $errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'lhm-bridge-daemon.ps1'),[ref]$tokens,[ref]$errors)
+foreach ($name in @('Test-StorageNode','Sync-StorageNodes','Update-HotPluggedHardware')) {
+    $function=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)
+    . ([scriptblock]::Create($function.Extent.Text))
+}
+function New-TestHardware($id,$type) { [pscustomobject]@{Identifier=$id;HardwareType=$type;Name=$id} }
+function New-TestComputer($hardware,[bool]$psuThrows) {
+    $c=[pscustomobject]@{Hardware=$hardware;Sets=(New-Object System.Collections.Generic.List[string]);PsuThrows=$psuThrows;Psu=$true}
+    $c | Add-Member ScriptProperty IsPsuEnabled { $this.Psu } { param($v) $this.Sets.Add([string]$v); if ($v -and $this.PsuThrows) { throw 'PSU held exclusively' }; $this.Psu=$v }
+    return $c
+}
+$script:StorageNodes=New-Object System.Collections.Generic.List[object]
+$script:StorageTemps=@{}
+$gone=New-TestHardware '/nvme/3' 'Storage'
+$kept=New-TestHardware '/nvme/0' 'Storage'
+$new=New-TestHardware '/nvme/4' 'Storage'
+$cpu=New-TestHardware '/amdcpu/0' 'Cpu'
+$script:StorageNodes.Add($gone); $script:StorageNodes.Add($kept)
+$script:StorageTemps['/nvme/3']=@(@{name='gone';value=40}); $script:StorageTemps['/nvme/0']=@(@{name='kept';value=35})
+
+$computer=New-TestComputer @($cpu,$kept,$new) $false
+Update-HotPluggedHardware $computer
+if (($computer.Sets -join ',') -ne 'False,True') { throw "PSU toggles: $($computer.Sets -join ',')" }
+if (-not $computer.IsPsuEnabled) { throw 'PSU left disabled after a clean rescan' }
+if ((($script:StorageNodes | ForEach-Object Identifier) -join ',') -ne '/nvme/0,/nvme/4') { throw "storage nodes: $(($script:StorageNodes | ForEach-Object Identifier) -join ',')" }
+if ($script:StorageTemps.ContainsKey('/nvme/3')) { throw 'a removed drive kept its cached temperature' }
+if (-not $script:StorageTemps.ContainsKey('/nvme/0')) { throw 'a present drive lost its cached temperature' }
+
+$held=New-TestComputer @($cpu,$kept) $true
+Update-HotPluggedHardware $held
+if ($held.IsPsuEnabled) { throw 'PSU reported enabled although re-adding it threw' }
+if ((($script:StorageNodes | ForEach-Object Identifier) -join ',') -ne '/nvme/0') { throw 'storage not synced after a PSU failure' }
+Write-Output 'PASS'
+`
+	output, err := exec.Command(shell, "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("rescan fixture: %v\n%s", err, output)
 	}
 }
 

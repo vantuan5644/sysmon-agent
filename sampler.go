@@ -60,6 +60,7 @@ type subscriber struct {
 // dashboard stream at high rates and fixes the request-timeout that plain
 // per-request collection caused on Windows.
 type sampler struct {
+	devices   *deviceManager
 	inner     MetricsCollector
 	lanes     laneCollector
 	hostname  string
@@ -176,6 +177,10 @@ func (s *sampler) Start() {
 		s.wg.Add(1)
 		go s.runOSDLoop(ctx, collector)
 	}
+	if s.devices != nil {
+		s.wg.Add(1)
+		go s.runDeviceLoop(ctx)
+	}
 
 	if s.lanes == nil {
 		s.wg.Add(1)
@@ -246,6 +251,10 @@ func (s *sampler) runWholeLoop(ctx context.Context) {
 		started := time.Now()
 		metrics, err := s.inner.Collect(ctx)
 		if err == nil {
+			if s.devices != nil {
+				activity := s.devices.snapshot()
+				metrics.DeviceActivity = &activity
+			}
 			s.publishWhole(metrics)
 		}
 		if sleepCanceled(ctx, s.slowEvery) {
@@ -258,6 +267,23 @@ func (s *sampler) runWholeLoop(ctx context.Context) {
 			}
 		}
 		_ = started
+	}
+}
+
+// Device status has its own demand-aware worker: slow hardware collection can
+// take longer than the dashboard's activity freshness window. It must neither
+// delay capture observations nor block metrics requests and SSE publication.
+func (s *sampler) runDeviceLoop(ctx context.Context) {
+	defer s.wg.Done()
+	for {
+		if s.hasDemand() {
+			started := time.Now()
+			activity := s.devices.sample(ctx)
+			s.applyAndPublish(func(m *Metrics) { m.DeviceActivity = &activity }, started)
+		}
+		if sleepCanceled(ctx, 2*time.Second) {
+			return
+		}
 	}
 }
 

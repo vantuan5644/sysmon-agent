@@ -218,6 +218,25 @@ window.addEventListener("load", function () {
     '<span class="core-bar" style="--h:6%"></span>'.repeat(32) + '</span>';
   var chartRows = [cores].concat(trends);
   var shell = document.querySelector(".shell");
+  var controls = document.querySelector(".host-controls");
+  for (var id of ["micCtl", "cameraCtl"]) {
+    var button = document.getElementById(id);
+    button.classList.add("activity-active");
+    button.disabled = false;
+  }
+  document.getElementById("micCtlState").textContent = "Off";
+  document.getElementById("micCtlUsage").textContent = "Busy";
+  document.getElementById("cameraCtlState").textContent = "Mix";
+  document.getElementById("cameraCtlUsage").textContent = "Busy";
+  document.getElementById("hostname").textContent = "workstation-with-a-long-name";
+  document.getElementById("platform").textContent = "windows / amd64 / 10.0.26100";
+  document.getElementById("statusText").textContent = "Live";
+  document.getElementById("agentVersion").hidden = false;
+  document.getElementById("agentVersion").textContent = "v0.1.44";
+  document.getElementById("agentMeta").textContent = "up 7h 12m / saved / app / checked 2m ago";
+  document.getElementById("updatedAt").textContent = "03:16:00 / 4s / 142ms";
+  var identityRect = document.querySelector(".topbar-id").getBoundingClientRect();
+  var statusRect = document.querySelector(".status-row").getBoundingClientRect();
   var pager = document.getElementById("pager");
   var pages = Array.prototype.slice.call(document.querySelectorAll(".page"));
   var alertsPanelEl = document.getElementById("alertsPanel");
@@ -225,6 +244,39 @@ window.addEventListener("load", function () {
   var cpuReading = document.createRange();
   cpuReading.selectNodeContents(document.getElementById("cpuDetail"));
   var report = {
+    header: { identityTop: identityRect.top, identityBottom: identityRect.bottom,
+      identityRight: identityRect.right, statusTop: statusRect.top,
+      statusBottom: statusRect.bottom, statusLeft: statusRect.left, statusRight: statusRect.right,
+      inHeader: !!document.getElementById("statusStrip").closest(".topbar") },
+    refreshTargets: [".topbar-id", ".status-strip", "#agentMeta"].map(function (selector) {
+      var rect = document.querySelector(selector).getBoundingClientRect();
+      return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2).id;
+    }),
+    actionTargets: ["alertsChip", "dimBtn", "shiftBtn", "wakeBtn", "pauseBtn"].map(function (id) {
+      var rect = document.getElementById(id).getBoundingClientRect();
+      return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2).closest("button").id;
+    }),
+    controlsInPager: !!controls.closest("#pager"),
+    controlsBottom: controls.getBoundingClientRect().bottom,
+    pagerTop: pager.getBoundingClientRect().top,
+    controls: Array.from(controls.querySelectorAll(".control-btn")).map(function (button) {
+      var rect = button.getBoundingClientRect();
+      var label = button.querySelector(".control-label");
+      var labelRect = label.getBoundingClientRect();
+      var textRange = document.createRange();
+      textRange.selectNodeContents(label);
+      var textRect = textRange.getBoundingClientRect();
+      var glyphRect = button.querySelector(".control-glyph").getBoundingClientRect();
+      var horizontal = getComputedStyle(button).flexDirection === "row";
+      var groupCenter = horizontal ? (glyphRect.left + labelRect.right) / 2 : (glyphRect.left + glyphRect.right) / 2;
+      return { textCenterOffset: (textRect.left + textRect.right - labelRect.left - labelRect.right) / 2,
+        groupCenterOffset: groupCenter - (rect.left + rect.right) / 2, left: rect.left, right: rect.right, width: rect.width, height: rect.height,
+        labelWidth: label.clientWidth, labelContentWidth: label.scrollWidth,
+        labelHeight: label.clientHeight, labelContentHeight: label.scrollHeight };
+    }),
+    cameraAnimation: getComputedStyle(document.querySelector(".camera-live-dot")).animationName,
+    micAnimation: getComputedStyle(document.querySelector(".mic-live-bars i")).animationName,
+    reducedMotion: matchMedia("(prefers-reduced-motion: reduce)").matches,
     gauges: Array.from(document.querySelectorAll(".metric-card .gauge")).map(function (gauge) {
       var rect = gauge.getBoundingClientRect();
       var center = gauge.querySelector(".gauge-center");
@@ -318,6 +370,7 @@ function measureOnce(browser, fixturePath) {
       // zero-height viewport, which would make every measurement meaningless.
       "--headless=new",
       "--disable-gpu",
+      ...(process.env.SYSMON_LAYOUT_REDUCED_MOTION === "1" ? ["--force-prefers-reduced-motion"] : []),
       "--no-sandbox",
       // Without these, Chrome's first-run setup on a COLD profile delays window
       // sizing past load: the very first run reports a zero-height viewport (and
@@ -358,6 +411,33 @@ function decodeEntities(text) {
 }
 
 function assertPagerInvariants(m) {
+  if (m.refreshTargets.some((id) => id !== "statusStrip") ||
+      m.actionTargets.join(",") !== "alertsChip,dimBtn,shiftBtn,wakeBtn,pauseBtn") {
+    throw new Error("Header refresh target intercepts a separate action or misses machine details");
+  }
+  const header = m.header;
+  if (!header.inHeader || header.identityRight > header.statusLeft ||
+      header.statusRight > m.viewportWidth || header.identityBottom <= header.statusTop ||
+      header.statusBottom <= header.identityTop) {
+    throw new Error("Machine identity and status must share a row without overlap: " + JSON.stringify(header));
+  }
+  if (m.controlsInPager || m.controlsBottom > m.pagerTop + 1 || m.controls.length !== 5) {
+    throw new Error("Host controls must remain above every page with five buttons");
+  }
+  for (const button of m.controls) {
+    if (Math.abs(button.textCenterOffset) > 1 || Math.abs(button.groupCenterOffset) > 1) {
+      throw new Error("Control icon or text is not centered: " + JSON.stringify(button));
+    }
+    if (button.left < 0 || button.right > m.viewportWidth + 1 || button.width < 40 || button.height < 36 ||
+        button.labelContentWidth > button.labelWidth + 1 || button.labelContentHeight > button.labelHeight + 1) {
+      throw new Error("Active control label or touch target does not fit: " + JSON.stringify(button));
+    }
+  }
+  if (m.reducedMotion) {
+    if (m.cameraAnimation !== "none" || m.micAnimation !== "none") throw new Error("Reduced motion still animates capture indicators");
+  } else if (!m.cameraAnimation || m.cameraAnimation === "none" || !m.micAnimation || m.micAnimation === "none") {
+    throw new Error("Active capture animation missing");
+  }
   for (const gauge of m.gauges) {
     if (gauge.valueContentWidth > gauge.valueWidth + 1 || gauge.subContentWidth > gauge.subWidth + 1 ||
         gauge.centerWidth > gauge.diameter * 0.68 + 1 || gauge.centerHeight > gauge.diameter * 0.5 + 1) {
@@ -463,6 +543,10 @@ function assertPagerInvariants(m) {
 function findChromiumBrowser() {
   const candidates = [
     process.env.CHROME_BIN,
+    ...(process.platform === "win32" ? [
+      "C:/Program Files/Google/Chrome/Application/chrome.exe",
+      "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+    ] : []),
     "chromium",
     "chromium-browser",
     "google-chrome",
@@ -474,6 +558,11 @@ function findChromiumBrowser() {
     const binary = candidate.includes("/") ? resolve(candidate) : candidate;
     if (candidate.includes("/") && !existsSync(binary)) {
       continue;
+    }
+    // Windows browser --version launches an interactive browser and may never
+    // exit. Installed absolute paths can be used directly for headless checks.
+    if (process.platform === "win32" && existsSync(binary)) {
+      return { name: candidate, binary };
     }
     const probe = spawnSync(binary, ["--version"], { encoding: "utf8" });
     if (probe.status === 0) {
