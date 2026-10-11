@@ -132,7 +132,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v154"`,
+		`const STATIC_CACHE = "sysmon-static-v156"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -316,6 +316,8 @@ func TestDashboardUpdateBannerMatchesServerContract(t *testing.T) {
 		`class="update-dismiss"`,
 		`id="agentVersion"`,
 		`class="agent-version"`,
+		`id="buildToken"`,
+		`class="build-badges"`,
 	} {
 		if !strings.Contains(indexHTML, needle) {
 			t.Fatalf("index.html missing update banner markup %q", needle)
@@ -331,6 +333,8 @@ func TestDashboardUpdateBannerMatchesServerContract(t *testing.T) {
 		`.agent-version`,
 		`.agent-version.is-release`,
 		`.agent-version.is-dev`,
+		`.agent-version.build-token`,
+		`.build-badges`,
 		`.update-panel`,
 		`.update-panel.update-applying`,
 		`.update-panel.update-error`,
@@ -408,7 +412,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 5000;`,
-		`const dashboardBuild = "sysmon-static-v154";`,
+		`const dashboardBuild = "sysmon-static-v156";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,

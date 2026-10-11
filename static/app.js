@@ -121,7 +121,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v154";
+const dashboardBuild = "sysmon-static-v156";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -1145,6 +1145,7 @@ function renderStatus(status) {
   }
   applyControlCapabilities(status?.controls);
   renderAgentVersion(status);
+  renderBuildToken(status);
   renderUpdatePanel(status);
   renderStatusIssues(status);
   renderDisplayModeIssues();
@@ -1189,6 +1190,7 @@ function renderPeerStatus(status) {
   state.hostThresholds = thresholds ? normalizeThresholds(thresholds) : null;
   applyControlCapabilities(status?.controls);
   renderAgentVersion(status);
+  renderBuildToken(status);
   hideUpdatePanel();
   state.staleDashboardBuild = "";
   state.statusIssueMessages = [];
@@ -1449,6 +1451,8 @@ function resetHostView() {
   state.codexUsageInFlight = false;
   renderQuota({ configured: false, source: "none", rows: [] });
   renderCodexUsage({ configured: false, source: "none", rows: [], token_days: [] });
+  renderAgentVersion(null);
+  renderBuildToken(null);
   disarmControl();
   pendingControlActions.clear();
   for (const action of [...controlSync.keys()]) endControlSync(action);
@@ -1619,6 +1623,22 @@ function renderAgentVersion(status) {
   badge.title = isRelease
     ? `Running release ${version}`
     : `Running a development build (${version}) - self-update is disabled`;
+}
+
+// renderBuildToken shows the in-view host's dashboard build as "v155" beside
+// the channel badge. Every hand-built binary reads "dev", so the token is what
+// tells which build a host runs; for a peer it can differ from this app's own.
+function renderBuildToken(status) {
+  const badge = $("buildToken");
+  if (!badge) {
+    return;
+  }
+  const build = String(status?.dashboard_build || "").trim();
+  const match = /^sysmon-static-(v\d+)$/.exec(build);
+  badge.hidden = !match;
+  badge.textContent = match ? match[1] : "";
+  badge.title = !match ? "" : build === dashboardBuild ? `Dashboard build ${build}` :
+    `Host dashboard build ${build}; this app is ${dashboardBuild}`;
 }
 
 // isDevBuild reports whether the agent is an untagged build. Dev builds cannot
@@ -4174,7 +4194,7 @@ function renderDeviceActivity(activity, metricsTimestamp) {
   }
   lastDeviceActivity = activity || null;
   if (activity?.camera_control) streamControlReading("camera_toggle", activity.camera_control);
-  // Hosts before sysmon-static-v154 report no mute state; theirs stays as the
+  // Hosts on builds before v155 report no mute state; theirs stays as the
   // last toggle result left it.
   if (activity?.microphone_mute) streamControlReading("mic_mute", muteStateValue(activity.microphone_mute.state));
   if (activity?.speaker_mute) streamControlReading("volume_mute", muteStateValue(activity.speaker_mute.state));

@@ -502,7 +502,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v154",
+    dashboard_build: "sysmon-static-v156",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -520,7 +520,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v154",
+    dashboard_build: "sysmon-static-v156",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -935,6 +935,14 @@ assert(document.getElementById("agentVersion").hidden === false, "release versio
 assert(document.getElementById("agentVersion").textContent === "release v0.1.4", "release build badge text did not render");
 assert(document.getElementById("agentVersion").classList.contains("is-release"), "release build badge missing is-release class");
 assert(!document.getElementById("agentVersion").classList.contains("is-dev"), "release build badge kept the is-dev class");
+// The build badge names the host's dashboard build beside the channel badge.
+const ownBuild = sampleStatus().dashboard_build;
+assert(document.getElementById("buildToken").hidden === false, "the host's dashboard build was not shown");
+assert(document.getElementById("buildToken").textContent === ownBuild.replace("sysmon-static-", ""), "build badge did not shorten the token to vNNN");
+assert(document.getElementById("buildToken").title === `Dashboard build ${ownBuild}`, "build badge title did not name the full token");
+context.renderBuildToken({ version: "dev" });
+assert(document.getElementById("buildToken").hidden === true, "a status without a dashboard build showed a build badge");
+context.renderBuildToken(sampleStatus());
 
 // A release build with an update available shows the banner as usual.
 context.renderStatus({
@@ -995,6 +1003,7 @@ assert(document.getElementById("updateApplyBtn").disabled === false, "apply butt
 
 context.renderStatus(sampleStatus());
 assert(document.getElementById("agentVersion").hidden === true, "returning to a versionless status left the build badge visible");
+assert(document.getElementById("buildToken").hidden === false, "a versionless status hid the dashboard build it does report");
 
 context.renderStatus(sampleObservedStatus());
 assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / app / seen 12s", "agent status metadata did not render client-check age");
@@ -1004,7 +1013,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v154, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v156, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1052,7 +1061,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v154; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v156; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1062,7 +1071,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v154",
+    dashboard_build: "sysmon-static-v156",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1072,7 +1081,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v154",
+    dashboard_build: "sysmon-static-v156",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1207,7 +1216,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v154", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v156", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -2714,7 +2723,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v154" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v156" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],
@@ -2783,6 +2792,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   assert(document.getElementById("shell").inert === false, "closing the host sheet left the page inert");
   assert(document.getElementById("cpuValue").textContent === "--", "previous host's CPU stayed on screen after the switch");
   assert(document.getElementById("hostname").textContent === "peer", "the switch did not name the new host at once");
+  assert(document.getElementById("buildToken").hidden === true, "the previous host's build stayed on screen after the switch");
   assert(document.body.classList.contains("host-remote"), "viewing a peer did not mark the page remote");
   assert(localStorageValues.get("sysmon:host") === "peer", "the selected host was not remembered");
   await flushMicrotasks();
@@ -2791,6 +2801,8 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   assert(!requested.includes("/api/metrics") && !requested.includes("/api/status"), "the switch still asked the local agent for host data");
   assert(document.getElementById("hostname").textContent === "peerbox", "peer metrics did not render");
   assert(document.getElementById("platform").textContent.startsWith("via labbox"), "remote view did not say which agent relays it");
+  assert(document.getElementById("buildToken").textContent === "v99", "the peer's own build was not shown");
+  assert(document.getElementById("buildToken").title.includes("this app is"), "a peer on another build did not say this app's build");
   localMetricsHold.resolve();
   await flushMicrotasks();
   assert(document.getElementById("hostname").textContent === "peerbox", "a stale local response painted over the peer");
