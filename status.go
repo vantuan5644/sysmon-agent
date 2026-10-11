@@ -8,7 +8,7 @@ import (
 
 var agentStartedAt = time.Now().UTC()
 
-const dashboardBuild = "sysmon-static-v154"
+const dashboardBuild = "sysmon-static-v156"
 
 type AgentStatus struct {
 	Status            string              `json:"status"`

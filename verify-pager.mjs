@@ -233,6 +233,8 @@ window.addEventListener("load", function () {
   document.getElementById("statusText").textContent = "Live";
   document.getElementById("agentVersion").hidden = false;
   document.getElementById("agentVersion").textContent = "v0.1.44";
+  document.getElementById("buildToken").hidden = false;
+  document.getElementById("buildToken").textContent = "v999";
   document.getElementById("agentMeta").textContent = "up 7h 12m / saved / app / checked 2m ago";
   document.getElementById("updatedAt").textContent = "03:16:00 / 4s / 142ms";
   var identityRect = document.querySelector(".topbar-id").getBoundingClientRect();

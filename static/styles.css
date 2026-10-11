@@ -639,12 +639,26 @@ body.host-remote .host-controls {
   background: color-mix(in srgb, var(--warn) 12%, transparent);
 }
 
-#statusText {
-  grid-area: state;
+/* The host's dashboard build ("v155") beside the channel badge. Every
+   hand-built binary reads "dev", so this is what tells two of them apart.
+   Neutral styling, since it only identifies the build. */
+.agent-version.build-token {
+  color: var(--muted);
+  border-color: var(--line);
+  font-variant-numeric: tabular-nums;
 }
 
-#agentVersion {
+/* Both badges share the strip's "ver" grid area at every breakpoint. */
+.build-badges {
   grid-area: ver;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+#statusText {
+  grid-area: state;
 }
 
 #agentMeta {
