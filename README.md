@@ -9,11 +9,11 @@ all of them.
 <p align="center">
   <img src="assets/screenshot-linux.JPEG" alt="Sysmon Agent dashboard monitoring a Linux host" width="760">
   <br>
-  <em>Linux host</em>
+  <em>Linux host (hostname blurred)</em>
   <br><br>
   <img src="assets/screenshot-windows.png" alt="Sysmon Agent dashboard monitoring a Windows host" width="760">
   <br>
-  <em>Windows host</em>
+  <em>Windows host (hostname and Wi-Fi name blurred)</em>
 </p>
 
 ---
@@ -121,6 +121,15 @@ host) and pick a machine; the device remembers the choice. While another host is
 its name and the control row are tinted and the line under the name reads `via <agent>`:
 the mic, camera, media, speaker and lock buttons act on the host in view, and Lock's confirm
 prompt names it.
+
+<p align="center">
+  <img src="assets/host-picker.png" alt="The host list open over the dashboard: three agents, the serving one marked 'this agent' and checked" width="300">
+  &nbsp;&nbsp;
+  <img src="assets/host-remote.png" alt="Another machine in view: its name and the control row tinted, and 'via' plus the serving agent under the name" width="300">
+  <br>
+  <em>Left: the host list. Right: another machine in view, relayed by the agent the app was
+  installed from. Hostnames blurred.</em>
+</p>
 
 ### How it works
 
