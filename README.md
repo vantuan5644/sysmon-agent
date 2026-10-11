@@ -18,20 +18,6 @@ all of them.
 
 ---
 
-## See it live
-
-The dashboard below is running on an **iPhone 8 Plus (2017)** as a Home-Screen web app —
-**no cable, no companion app to install, no GPU.** The phone is just on Wi-Fi painting
-HTML; every sensor is read on the host PC and pushed over the network. That's why a
-years-old handset with nothing plugged in makes a perfect, near-zero-power desk monitor.
-
-| Idle | Under CPU load |
-| :---: | :---: |
-| <img src="assets/idle.gif" alt="Dashboard idle on an iPhone 8 Plus" width="420"> | <img src="assets/under-load.gif" alt="Dashboard under CPU load on an iPhone 8 Plus" width="420"> |
-| Gauges tick live at a glance | Same phone, host under load — the CPU **clock ring fills** and the temperature crosses its threshold and turns **amber**, in real time |
-
----
-
 ## Highlights
 
 - 📱 **Installable PWA** — add it to any phone, tablet, or browser Home Screen. Runs great
@@ -52,8 +38,8 @@ years-old handset with nothing plugged in makes a perfect, near-zero-power desk 
 - 🌙 **Made for always-on** — dim mode, a slow screen shift against burn-in, keep-awake, and
   pause, one tap each.
 - 🔘 **Quick controls** — mute the mic, turn local cameras off, play/pause media, mute the
-  speaker, and lock the screen from a control row above every page, with live mic and camera
-  activity indicators.
+  speaker, and lock the screen from a control row above every page. Each button shows the
+  host's own state, including a mute made in another app, plus live mic and camera activity.
 - 🔀 **One app, every host** — tap the hostname to switch between every machine running the
   agent, found on your tailnet automatically or listed with `-peers`. One Home Screen app
   covers them all, with no SSH and nothing extra on the phone. See
@@ -400,7 +386,8 @@ turns that off).
   physical drive (model, size, capacity, temperature); **network** RX/TX per interface, the
   active uplink (Wi-Fi SSID or Ethernet link speed) and Tailscale state.
 - **Processes**: the busiest apps and processes by CPU, RAM, GPU memory and disk I/O.
-- **Device activity**: whether the microphone and camera are in use, for the control row.
+- **Device activity**: whether the microphone and camera are in use, and the mic, speaker and
+  camera state, for the control row.
 - **Temperatures** from Linux hwmon/thermal or Windows ACPI/LibreHardwareMonitor, and **PSU**
   total output power when a USB-linked smart PSU is present (Windows LHM bridge).
 
@@ -431,9 +418,13 @@ animated indicator; **Idle** means no use was detected within the available cove
 means unknown. Paused, disconnected, or observations older than ten seconds show unknown usage
 without animation, and reduced-motion preferences keep indicators static.
 
-Mute state is unknown until a control action returns; after that it shows the agent's last
-action, so a mute toggled in another app does not appear. A muted microphone can still have an
-open capture session: mute silences audio without closing the app's session. The animated bars
+Mute state comes from the host with each activity observation: Mic covers every active
+microphone (Mix when only some are muted), Speaker the default playback device, so a mute made
+in another app or with a keyboard key shows within about two seconds. While a Mic, Camera or
+Speaker toggle is in flight, its state reads `…` and the button takes no further taps; once the
+host confirms, the button shows the new state, and readings taken before the toggle cannot
+revert it. A muted microphone can still have an open capture session: mute silences audio
+without closing the app's session. The animated bars
 show that capture is in use; they carry no sound-level information.
 
 **Camera** toggles supported local devices: Windows Camera-class devices and older USB video
@@ -457,6 +448,11 @@ ALSA capture state and V4L2 device holders; a system service may not see the des
 in which case usage stays unknown. A V4L2 handle means the device is open, which need not mean
 frames are streaming. Treat the indicators as an activity aid; they cannot promise that every
 capture path was inspected.
+
+Mute state is read from Core Audio endpoint mute on Windows. On Linux, Mic reads every
+non-monitor source from `pactl --format=json list sources`, and Speaker reads the default sink
+through `wpctl` (or `pactl`), the same targets the toggles change; without `pactl`, Mic falls
+back to the default source. A toggle triggers a fresh observation at once.
 </details>
 
 <details>
