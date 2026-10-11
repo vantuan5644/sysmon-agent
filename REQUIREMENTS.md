@@ -86,7 +86,16 @@ choco install librehardwaremonitor -y
 winget install LibreHardwareMonitor.LibreHardwareMonitor
 ```
 
-The bridge searches both install locations automatically. The `LibreHardwareMonitorLib.dll`
+The bridge searches both install locations automatically, but a per-user WinGet install sits
+in a profile the **LocalSystem service cannot read**, so use Option A (or a portable copy in
+`C:\Program Files\LibreHardwareMonitor`) for the service and keep Option B for console runs.
+`install-windows.ps1 -Action Status` warns when the library is only visible per-user.
+
+**PawnIO (LibreHardwareMonitor 0.9.5 and later).** These releases read the CPU through the
+separate [PawnIO](https://github.com/namazso/PawnIO.Setup) driver, which the
+LibreHardwareMonitor download does not include. Without it CPU package power, the CPU
+temperature and the board's sensors stay unavailable while GPU and PSU readings work.
+Install PawnIO once (elevated), then restart the agent. The `LibreHardwareMonitorLib.dll`
 shipped by recent releases targets **.NET 10**, so the bridge must run under PowerShell 7
 (`pwsh`); Windows PowerShell 5.1 cannot load it. The agent resolves pwsh automatically.
 

@@ -3,7 +3,8 @@
 **Turn any old phone into a live system monitor for your PC.** One small binary serves a
 beautiful dashboard — CPU, GPU, RAM, disk, network, temperatures, and power — as an
 installable web app you add to your Home Screen. The host does all the work; the device
-just paints the screen.
+just paints the screen. Run it on several machines and one Home Screen app switches between
+all of them.
 
 <p align="center">
   <img src="assets/screenshot-linux.JPEG" alt="Sysmon Agent dashboard monitoring a Linux host" width="760">
@@ -42,14 +43,21 @@ years-old handset with nothing plugged in makes a perfect, near-zero-power desk 
   file per OS, nothing to install alongside it.
 - 🖥️ **Full-system telemetry** — CPU, GPU, RAM, disk, network, temperatures, and power,
   refreshing live over Server-Sent Events.
-- 🎛️ **At-a-glance gauges** — concentric rings (CPU utilization outer, **core-clock
-  inner**), a small live trend per card, and amber/red warning thresholds.
+- 🎛️ **At-a-glance gauges** — concentric rings: CPU load with the **core clock** inside,
+  GPU load with VRAM, RAM, and network download with upload. Per-core load bars on the CPU
+  card, a short live trend on the others, and amber/red warning thresholds.
+- 📋 **Apps, drives and alerts** — a page of the busiest apps or processes (CPU, RAM, GPU
+  memory, disk I/O; tap a column to sort), and a status page with each drive's capacity and
+  temperature, threshold alerts, and any sensor that could not be read.
+- 🌙 **Made for always-on** — dim mode, a slow screen shift against burn-in, keep-awake, and
+  pause, one tap each.
 - 🔘 **Quick controls** — mute the mic, turn local cameras off, play/pause media, mute the
   speaker, and lock the screen from a control row above every page, with live mic and camera
   activity indicators.
-- 🔀 **One app, every host** — tap the hostname to switch to any other agent on your
-  tailnet (found automatically) or listed with `-peers`. The agent you installed the app
-  from relays the view, so the device keeps a single Home Screen app.
+- 🔀 **One app, every host** — tap the hostname to switch between every machine running the
+  agent, found on your tailnet automatically or listed with `-peers`. One Home Screen app
+  covers them all, with no SSH and nothing extra on the phone. See
+  [Watch several hosts](#watch-several-hosts).
 - 🧮 **AI usage page** — an optional fourth page with Claude Code plan usage (5-hour
   session, weekly, per-model weeklies, usage credits), Codex quota, and a seven-day token
   chart for each. Reads the local files both tools already write; hidden unless you point
@@ -98,34 +106,102 @@ sudo tailscale serve --bg --https=9443 http://127.0.0.1:9099
 Open `https://TAILSCALE_HOST:9443/` on the device → **Add to Home Screen** (Safari) or
 **Install app** (Chrome) → set the device's auto-lock to *Never* for an always-on monitor.
 Any other HTTPS reverse proxy (Caddy, nginx, Cloudflare Tunnel) works too. On Windows,
-`install-windows.ps1 -Action Install -TailscaleServe` sets up the same Serve route.
-
-### Watch several hosts
-
-Run the agent on each machine, then tap the hostname at the top of the dashboard (a `⌄`
-appears once there is another host) and pick one. The device remembers the choice. While
-another host is in view its name and the control row are tinted and the line under the
-name reads `via <agent>`, because the mic, camera, media, speaker and lock buttons act on
-the host in view.
-
-The app stays on the agent it was installed from, which relays the other host's metrics,
-live stream, status, AI usage and controls. The device only names a host by id; the agent
-looks the address up in its own list. Hosts come from:
-
-- **Tailscale discovery** (on by default; `-peer-discovery=false` turns it off). The agent
-  reads `tailscale status`, skips phones, offline machines and nodes shared in from other
-  tailnets, and asks each remaining machine for `/api/status` on `:9443` (Tailscale Serve)
-  and `:9099`. Only replies from a Sysmon agent are listed.
-- **A pinned list**: `-peers "nas=https://nas.example.ts.net:9443,http://10.0.0.5:9099"`
-  (env `SYSMON_PEERS`). The same list can go on every host; an entry pointing at the agent
-  itself is dropped.
-
-Discovery runs only when a dashboard asks for the host list (page load, opening the list,
-or a list over five minutes old), at most once per 10 seconds, with a 2.5-second timeout per
-request. A relayed live stream adds about 230 KB/s through the serving agent while another
-host is in view.
+`install-windows.ps1 -Action Install -TailscaleServe` sets up the same Serve route; after the
+one-click setup, run it from an elevated PowerShell as
+`& "C:\Program Files\Sysmon Agent\install-windows.ps1" -Action Install -TailscaleServe`.
+Watching several machines? Add just one of them; the others are a tap away inside the app.
 
 ---
+
+## Watch several hosts
+
+Run the agent on each machine you want to watch, then add **one** of them to your Home
+Screen. Tap the hostname at the top of the dashboard (a `⌄` appears once there is another
+host) and pick a machine; the device remembers the choice. While another host is in view,
+its name and the control row are tinted and the line under the name reads `via <agent>`:
+the mic, camera, media, speaker and lock buttons act on the host in view, and Lock's confirm
+prompt names it.
+
+### How it works
+
+There is no SSH and nothing to install on the phone. Every machine's own agent collects its
+own metrics, exactly as it does for a single host. The agent you installed the app from
+forwards the dashboard's requests to the others over ordinary HTTP(S):
+
+```
+iPhone app ──HTTPS──▶ agent on desk-pc    (the one the app was installed from)
+                          │  GET https://nas.<tailnet>.ts.net:9443/api/stream
+                          ▼
+                      agent on nas         (collects nas's own metrics)
+```
+
+1. **Listing hosts.** The serving agent runs `tailscale status --json` on its own machine to
+   see which machines are online, then sends one `GET /api/status` to each of them on `:9443`
+   (Tailscale Serve) and `:9099`. Machines that answer as a Sysmon agent are listed, along with
+   any you pinned with `-peers`.
+2. **Viewing a host.** The dashboard asks its own agent for `/api/hosts/<id>/stream`. That
+   agent opens a connection to the other agent's `/api/stream`, the same live feed that
+   agent's own dashboard reads, and copies it back as it arrives. Status, AI usage and
+   metrics polling travel the same way.
+3. **Buttons.** Lock, mute and the rest go the same route, as a `POST` to the other agent's
+   `/api/control`.
+
+The app stays on the agent it was installed from because of how iPhone Home Screen apps
+work: one that opens another address drops into a Safari sheet, and an HTTPS page may not
+fetch a plain-HTTP agent at all. Forwarding needs nothing new on the other machines, so
+agents on older releases still appear; a feature an older build lacks only blanks that panel.
+
+### Where hosts come from
+
+- **Tailscale discovery**, on by default (`-peer-discovery=false` turns it off). Phones,
+  offline machines and nodes shared in from other tailnets are skipped, and only replies from
+  a Sysmon agent are listed.
+- **A pinned list**: `-peers "nas=https://nas.example.ts.net:9443,http://10.0.0.5:9099"`
+  (env `SYSMON_PEERS`), for machines outside Tailscale. The same list can go on every host;
+  an entry pointing at the agent itself is dropped.
+
+### Network and safety
+
+- The dashboard names a host only by id. The agent looks the address up in its own list and
+  answers anything else with 404, so it cannot be used to reach other addresses.
+- Dim, screen shift, client checks and self-update stay with the agent serving the app:
+  they describe the viewing device or replace that agent's own binary.
+- A forwarded button press must pass the serving agent's same-origin check first, exactly
+  like a local one.
+- Between agents, a tailnet address keeps traffic inside Tailscale's encrypted tunnel. A
+  pinned `http://` LAN address is plain HTTP on your LAN, the same as opening that agent
+  directly.
+- Discovery runs only when a dashboard asks for the host list (page load, opening the list,
+  or a list over five minutes old), at most once every 10 seconds, with a 2.5-second timeout
+  per request.
+- A forwarded live stream adds about 230 KB/s through the serving agent while another host
+  is in view. Install the app from a machine that stays on: if it sleeps, every host view goes
+  with it.
+
+---
+
+<details>
+<summary><b>The dashboard: pages and buttons</b></summary>
+
+Swipe sideways between pages; the dots at the bottom show where you are.
+
+1. **Live metrics** — the CPU, GPU, RAM and NET gauges.
+2. **More status** — threshold alerts, every drive with its capacity and temperature, and an
+   Issues list of sensors that could not be read (with the reason). "All clear" when empty.
+3. **App details** — the busiest apps, or individual processes, by CPU, RAM, GPU memory and
+   disk I/O. Tap a column header to sort.
+4. **AI usage** — optional, see below. Hidden unless configured.
+
+Above every page:
+
+- **Hostname** — tap it to switch hosts when there is more than one.
+- **Status strip** — connection state, agent version, uptime and sample age. Tap anywhere in
+  the header to refresh now.
+- **Alert chip** (`⚠ 3`) — appears when a threshold is crossed; tap it to jump to the alerts.
+- **◐ ⇄ ☀ Ⅱ** — dim mode, screen shift (moves the layout a few pixels over time against
+  burn-in), keep the screen awake, and pause updates.
+- **Control row** — Mic, Camera, Media, Speaker and Lock for the host in view.
+</details>
 
 <details>
 <summary><b>Run options &amp; endpoints</b></summary>
@@ -151,6 +227,11 @@ SYSMON_BIND=127.0.0.1 SYSMON_PORT=9099 ./sysmon-agent
 | `/api/osd` | small cached CPU/GPU payload for an on-screen display overlay |
 | `/api/quota` | Claude Code quota + token history (AI usage page) |
 | `/api/codex-usage` | Codex quota + token history (AI usage page) |
+| `/api/hosts` | the host list for the host picker (`?refresh=1` asks for a rescan) |
+| `/api/hosts/{id}/…` | `metrics`, `stream`, `status`, `quota`, `codex-usage` and `control`, forwarded to another agent |
+| `/api/settings` | GET or POST display settings (dim, screen shift, update check) |
+| `/api/control` | POST a host control: mic, camera, media, speaker, lock |
+| `/api/update` | POST to self-update (Windows service only) |
 
 When bound to a wildcard like `0.0.0.0`, startup logs print likely dashboard URLs
 (Tailscale addresses first), skipping virtual/container interfaces. Open the port through
@@ -171,7 +252,7 @@ value keeps the saved default.
 | `-fast-ms` / `SYSMON_FAST_MS` | min 100, default 200 | fast-lane (CPU/RAM) interval |
 | `-slow-ms` / `SYSMON_SLOW_MS` | min 500, default 1500 | slow-lane (power/temps/disk/net/GPU) interval |
 | `-refresh-ms` / `SYSMON_REFRESH_MS` | {250,500,1000,2000} | dashboard refresh interval |
-| `-cpu-warn` / `-mem-warn` / `-disk-warn` / `-gpu-warn` | 50–90 | utilization warn thresholds (%) |
+| `-cpu-warn` / `-mem-warn` / `-disk-warn` / `-gpu-warn` (`SYSMON_CPU_WARN`, …) | 50–90 | utilization warn thresholds (%) |
 | `-temp-warn` / `SYSMON_TEMP_WARN` | 50–90 (°C) | temperature warn threshold |
 | `-settings` / `SYSMON_SETTINGS` | path | optional JSON file for persisted settings |
 | `-claude-config-dir` / `SYSMON_CLAUDE_CONFIG_DIR` | path | Claude Code config dir for the AI usage page (default `$CLAUDE_CONFIG_DIR`, then `$HOME/.claude`; missing = Claude section hidden) |
@@ -179,8 +260,14 @@ value keeps the saved default.
 | `-codex-config-dir` / `SYSMON_CODEX_CONFIG_DIR` | path | Codex config dir for the AI usage page (default `$CODEX_HOME`, then `$HOME/.codex`; missing = Codex section hidden) |
 | `-codex-quota-poll` / `SYSMON_CODEX_QUOTA_POLL` | bool, off | refresh Codex quota every 5 min through the installed Codex CLI |
 | `-codex-binary` / `SYSMON_CODEX_BINARY` | path | Codex CLI used by the poll (default: `codex` on `PATH`) |
-| `-tls` / `SYSMON_TLS` | bool | enable direct TLS (`-cert`/`-key`) |
-| `-self-check` / `-wait-health` / `-wait-ready` | bool | in-process checks / startup gates |
+| `-peers` / `SYSMON_PEERS` | `[name=]URL,…` | other agents to list in the host picker |
+| `-peer-discovery` / `SYSMON_PEER_DISCOVERY` | bool, on | find agents on the tailnet when the host list is opened |
+| `-no-update-check` / `SYSMON_UPDATE_CHECK=0` | off | turn off the update check and self-update |
+| `-tls` / `SYSMON_TLS` | bool | enable direct TLS with `-cert`/`-key` (`SYSMON_CERT`/`SYSMON_KEY`) |
+| `-self-check` / `-wait-health` / `-wait-ready` | bool | run in-process checks, or wait for a running agent's health or readiness, then exit |
+| `-version` | | print the version and exit |
+| `SYSMON_LHM_DAEMON` (Windows) | on | `0` uses the one-shot LibreHardwareMonitor bridge: slower, and no drive temperatures |
+| `SYSMON_LHM_STORAGE_MS` (Windows) | 15000 | how often each drive's temperature is refreshed; `0` turns drive temperatures off |
 
 Invalid persisted settings are backed up with a `.bad-...` suffix and the agent starts with
 defaults so the monitor still comes up.
@@ -246,7 +333,7 @@ integration — the same binary is both console app and service). From an elevat
 .\install-windows.ps1 -Action Install
 .\install-windows.ps1 -Action Install -TempWarn 85   # AMD: Tctl idles hot, 70 C warns constantly
 .\install-windows.ps1 -Action Install -TailscaleServe  # also publish https://<machine>.<tailnet>.ts.net:9443
-.\install-windows.ps1 -Action Status      # probes /readyz, reports settings + AI usage sources
+.\install-windows.ps1 -Action Status      # checks /readyz, reports settings, AI usage sources, Serve
 .\install-windows.ps1 -Action Update      # download + verify + swap + rollback
 .\install-windows.ps1 -Action Uninstall
 ```
@@ -282,9 +369,12 @@ SYSTEM-privileged process executes it, and both engines refuse to update without
 
 **Turning the check off.** It is on by default. Toggle `update_check_enabled` via
 `POST /api/settings`, or hard-disable it host-side with `-no-update-check` /
-`SYSMON_UPDATE_CHECK=0` (flag/env wins over the setting). Disabled means no outbound calls
-at all. With the AI usage page left in its default files-only mode (no `-claude-quota-poll`,
-no `-codex-quota-poll`), `api.github.com` is the only endpoint the agent ever contacts.
+`SYSMON_UPDATE_CHECK=0` (flag/env wins over the setting). Disabled means no update calls at
+all. With the AI usage page left in its default files-only mode (no `-claude-quota-poll`, no
+`-codex-quota-poll`), `api.github.com` is the only internet endpoint the agent contacts.
+Inside your own network it also asks other agents for their status when a dashboard opens
+the host list (see [Watch several hosts](#watch-several-hosts); `-peer-discovery=false`
+turns that off).
 </details>
 
 <details>
@@ -292,10 +382,16 @@ no `-codex-quota-poll`), `api.github.com` is the only endpoint the agent ever co
 
 `GET /api/metrics` returns hostname/OS/arch/timestamp plus:
 
-- **CPU** usage %, package power (W) when exposed, current + max/boost clock (MHz), die temp.
+- **CPU** load overall and per core; package power (W) with core/SoC rails where exposed; the
+  average and fastest-core clock, the highest clock observed since start, and the rated and
+  base clocks; and the CPU temperature with the name of the sensor it came from.
 - **GPU** usage/VRAM/temp/power (NVIDIA via `nvidia-smi`; AMD/Intel via DRM sysfs on Linux),
   plus the NVIDIA hotspot where it can be read (see below).
-- **RAM** used/total/%, **disk** per mounted local filesystem, **network** RX/TX per interface.
+- **RAM** used/total/% and swap; **disks** per mounted local filesystem; **storage** per
+  physical drive (model, size, capacity, temperature); **network** RX/TX per interface, the
+  active uplink (Wi-Fi SSID or Ethernet link speed) and Tailscale state.
+- **Processes**: the busiest apps and processes by CPU, RAM, GPU memory and disk I/O.
+- **Device activity**: whether the microphone and camera are in use, for the control row.
 - **Temperatures** from Linux hwmon/thermal or Windows ACPI/LibreHardwareMonitor, and **PSU**
   total output power when a USB-linked smart PSU is present (Windows LHM bridge).
 
@@ -471,6 +567,12 @@ choco install librehardwaremonitor -y                # machine-wide (recommended
 winget install --scope machine Microsoft.PowerShell  # pwsh — required for the bridge
 ```
 
+LibreHardwareMonitor 0.9.5 and later read the CPU through the separate
+[**PawnIO**](https://github.com/namazso/PawnIO.Setup) driver, which the LibreHardwareMonitor
+download does not include. Without it CPU package power, the CPU temperature and the board's
+sensors stay unavailable while GPU and PSU readings work. Install PawnIO once, then restart
+the service.
+
 A per-user install lands in a profile the LocalSystem service can't read, so those sensors
 silently go unavailable. The same bridge also reports PSU output power for USB-linked smart
 PSUs (Corsair HXi/RMi, NZXT, Seasonic, …).
@@ -494,7 +596,7 @@ Linux/macOS/Windows (no wine):
 
 It cross-compiles a stripped, version-stamped exe with an embedded icon, then wraps it in an
 NSIS Modern-UI wizard that runs the existing `install-windows.ps1` (service + firewall +
-recovery + `/readyz` gate) and registers a clean uninstaller. Needs **Go 1.22+** and
+recovery + `/readyz` readiness check) and registers a clean uninstaller. Needs **Go 1.22+** and
 **NSIS** (`makensis`; `apt install nsis` / `brew install nsis` / AUR `nsis`); ImageMagick is
 optional for icon regeneration. For public distribution, sign the exe + installer to avoid
 the SmartScreen warning.
