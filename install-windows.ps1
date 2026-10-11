@@ -34,6 +34,16 @@ param(
     # with the desktop widget: two pollers on one account fight the rate limit.
     [switch]$ClaudeQuotaPoll,
     [switch]$NoFirewall,
+    # Publish the dashboard over Tailscale Serve HTTPS, so every host shares one
+    # address shape: https://<machine>.<tailnet>.ts.net:9443. That is the secure
+    # context an iPhone Home Screen app needs, and the first address other
+    # agents try when they look for this one. Install applies it with
+    # `tailscale serve --bg`, which tailscaled keeps across reboots but loses on
+    # a logout or reinstall; re-running Install with the switch restores it.
+    # Uninstall with the switch removes it. Status always reports it.
+    [switch]$TailscaleServe,
+    [ValidateRange(1, 65535)]
+    [int]$TailscaleServePort = 9443,
     # Update-only: pin/downgrade to a specific vX.Y.Z tag (default: latest).
     [string]$UpdateVersion,
     # Update-only: reapply the same version even if the channel reports it as
@@ -1000,6 +1010,112 @@ function Show-PwshStatus {
     Write-Host '  # or: choco install powershell-core'
 }
 
+function Find-TailscaleCli {
+    $command = Get-Command tailscale -CommandType Application -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+    $candidate = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+    if (Test-Path -LiteralPath $candidate) {
+        return $candidate
+    }
+    return $null
+}
+
+function Get-TailscaleServeTarget {
+    return "http://$(Format-UrlHost (Resolve-HealthHost)):$Port"
+}
+
+# Native stderr under ErrorActionPreference=Stop throws in Windows PowerShell
+# 5.1, so tailscale runs with Continue and is judged by its exit code.
+function Invoke-TailscaleCli([string]$TailscaleCli, [string[]]$Arguments) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $TailscaleCli @Arguments 2>&1 | ForEach-Object { "$_" }
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($output -join ' ') }
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
+# Get-TailscaleServeUrls lists the HTTPS URLs whose Serve handler proxies to
+# this agent, read from `tailscale serve status --json`.
+function Get-TailscaleServeUrls([string]$TailscaleCli) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $raw = & $TailscaleCli serve status --json 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $raw) {
+            return @()
+        }
+        $config = ($raw -join "`n") | ConvertFrom-Json
+    } catch {
+        return @()
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    $targets = @((Get-TailscaleServeTarget), "http://127.0.0.1:$Port", "http://localhost:$Port")
+    $urls = @()
+    if ($config.Web) {
+        foreach ($site in $config.Web.PSObject.Properties) {
+            if (-not $site.Value.Handlers) {
+                continue
+            }
+            foreach ($handler in $site.Value.Handlers.PSObject.Properties) {
+                if ($targets -contains [string]$handler.Value.Proxy) {
+                    $urls += "https://$($site.Name)$($handler.Name)"
+                }
+            }
+        }
+    }
+    return $urls
+}
+
+function Publish-TailscaleServe {
+    $tailscale = Find-TailscaleCli
+    if (-not $tailscale) {
+        Write-Warning 'Tailscale CLI not found, so the dashboard was not published on Tailscale Serve. Install Tailscale, then re-run Install with -TailscaleServe.'
+        return
+    }
+    $target = Get-TailscaleServeTarget
+    $result = Invoke-TailscaleCli $tailscale @('serve', '--bg', "--https=$TailscaleServePort", $target)
+    if ($result.ExitCode -ne 0) {
+        # Like the firewall rule, a Serve failure must not fail the install: the
+        # service runs and is reachable on its own port.
+        Write-Warning "tailscale serve failed (exit $($result.ExitCode)); the service is still installed. Details: $($result.Output)"
+        return
+    }
+    Show-TailscaleServeStatus
+}
+
+function Unpublish-TailscaleServe {
+    $tailscale = Find-TailscaleCli
+    if (-not $tailscale) {
+        return
+    }
+    $result = Invoke-TailscaleCli $tailscale @('serve', "--https=$TailscaleServePort", 'off')
+    if ($result.ExitCode -ne 0) {
+        Write-Warning "Could not remove the Tailscale Serve proxy on HTTPS port $TailscaleServePort (exit $($result.ExitCode)). Details: $($result.Output)"
+        return
+    }
+    Write-Host "Removed the Tailscale Serve proxy on HTTPS port $TailscaleServePort."
+}
+
+function Show-TailscaleServeStatus {
+    $tailscale = Find-TailscaleCli
+    if (-not $tailscale) {
+        Write-Host 'Tailscale Serve: tailscale CLI not found; the dashboard is reachable on its own port only.'
+        return
+    }
+    $urls = @(Get-TailscaleServeUrls $tailscale)
+    if ($urls.Count -gt 0) {
+        Write-Host "Tailscale Serve: $($urls -join ', ') -> $(Get-TailscaleServeTarget)"
+        return
+    }
+    Write-Warning "Tailscale Serve does not publish this agent. Home Screen apps and other agents expect https://<machine>.<tailnet>.ts.net:$TailscaleServePort/. Fix: re-run Install with -TailscaleServe."
+}
+
 function Install-Agent {
     Assert-Admin
 
@@ -1044,6 +1160,9 @@ function Install-Agent {
 
     Start-AgentService
     Wait-AgentReadyAdvisory
+    if ($TailscaleServe) {
+        Publish-TailscaleServe
+    }
     Get-Service -Name $ServiceName
     Show-LhmLibraryStatus
     Show-PwshStatus
@@ -1062,6 +1181,9 @@ function Uninstall-Agent {
     }
 
     Remove-ServiceFirewallRules
+    if ($TailscaleServe) {
+        Unpublish-TailscaleServe
+    }
 }
 
 function Show-Status {
@@ -1071,6 +1193,7 @@ function Show-Status {
         $serviceInstalled = $true
         $service
         Show-AgentReadiness
+        Show-TailscaleServeStatus
         Show-LhmLibraryStatus
         Show-PwshStatus
         Show-DashboardSettings

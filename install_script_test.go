@@ -198,6 +198,47 @@ func TestWindowsInstallerUpdateAction(t *testing.T) {
 	}
 }
 
+// -TailscaleServe publishes the agent at https://<machine>.<tailnet>.ts.net:9443,
+// the address shape every host shares and the one peer discovery tries first.
+// tailscaled drops a Serve config on logout or reinstall, so Install must
+// re-apply it and Status must say when it is missing. Same parity rule as the
+// Update engine above.
+func TestWindowsInstallerTailscaleServe(t *testing.T) {
+	data, err := os.ReadFile("install-windows.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+	for _, needle := range []string{
+		`[switch]$TailscaleServe,`,
+		`[int]$TailscaleServePort = 9443,`,
+		`function Find-TailscaleCli`,
+		`Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'`,
+		`function Get-TailscaleServeTarget`,
+		`return "http://$(Format-UrlHost (Resolve-HealthHost)):$Port"`,
+		`@('serve', '--bg', "--https=$TailscaleServePort", $target)`,
+		`@('serve', "--https=$TailscaleServePort", 'off')`,
+		`& $TailscaleCli serve status --json 2>$null`,
+		`if ($TailscaleServe) {
+        Publish-TailscaleServe
+    }`,
+		`if ($TailscaleServe) {
+        Unpublish-TailscaleServe
+    }`,
+		`Show-AgentReadiness
+        Show-TailscaleServeStatus`,
+		`Fix: re-run Install with -TailscaleServe.`,
+	} {
+		// The working tree is CRLF for .ps1 files; compare line-ending blind.
+		if !strings.Contains(strings.ReplaceAll(script, "\r\n", "\n"), needle) {
+			t.Errorf("install-windows.ps1 missing %q", needle)
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+}
+
 func TestWindowsVerifierDefaults(t *testing.T) {
 	data, err := os.ReadFile("verify-windows.ps1")
 	if err != nil {

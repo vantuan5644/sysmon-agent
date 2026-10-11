@@ -47,6 +47,9 @@ years-old handset with nothing plugged in makes a perfect, near-zero-power desk 
 - 🔘 **Quick controls** — mute the mic, turn local cameras off, play/pause media, mute the
   speaker, and lock the screen from a control row above every page, with live mic and camera
   activity indicators.
+- 🔀 **One app, every host** — tap the hostname to switch to any other agent on your
+  tailnet (found automatically) or listed with `-peers`. The agent you installed the app
+  from relays the view, so the device keeps a single Home Screen app.
 - 🧮 **AI usage page** — an optional fourth page with Claude Code plan usage (5-hour
   session, weekly, per-model weeklies, usage credits), Codex quota, and a seven-day token
   chart for each. Reads the local files both tools already write; hidden unless you point
@@ -94,7 +97,33 @@ sudo tailscale serve --bg --https=9443 http://127.0.0.1:9099
 
 Open `https://TAILSCALE_HOST:9443/` on the device → **Add to Home Screen** (Safari) or
 **Install app** (Chrome) → set the device's auto-lock to *Never* for an always-on monitor.
-Any other HTTPS reverse proxy (Caddy, nginx, Cloudflare Tunnel) works too.
+Any other HTTPS reverse proxy (Caddy, nginx, Cloudflare Tunnel) works too. On Windows,
+`install-windows.ps1 -Action Install -TailscaleServe` sets up the same Serve route.
+
+### Watch several hosts
+
+Run the agent on each machine, then tap the hostname at the top of the dashboard (a `⌄`
+appears once there is another host) and pick one. The device remembers the choice. While
+another host is in view its name and the control row are tinted and the line under the
+name reads `via <agent>`, because the mic, camera, media, speaker and lock buttons act on
+the host in view.
+
+The app stays on the agent it was installed from, which relays the other host's metrics,
+live stream, status, AI usage and controls. The device only names a host by id; the agent
+looks the address up in its own list. Hosts come from:
+
+- **Tailscale discovery** (on by default; `-peer-discovery=false` turns it off). The agent
+  reads `tailscale status`, skips phones, offline machines and nodes shared in from other
+  tailnets, and asks each remaining machine for `/api/status` on `:9443` (Tailscale Serve)
+  and `:9099`. Only replies from a Sysmon agent are listed.
+- **A pinned list**: `-peers "nas=https://nas.example.ts.net:9443,http://10.0.0.5:9099"`
+  (env `SYSMON_PEERS`). The same list can go on every host; an entry pointing at the agent
+  itself is dropped.
+
+Discovery runs only when a dashboard asks for the host list (page load, opening the list,
+or a list over five minutes old), at most once per 10 seconds, with a 2.5-second timeout per
+request. A relayed live stream adds about 230 KB/s through the serving agent while another
+host is in view.
 
 ---
 
@@ -216,6 +245,7 @@ integration — the same binary is both console app and service). From an elevat
 ```powershell
 .\install-windows.ps1 -Action Install
 .\install-windows.ps1 -Action Install -TempWarn 85   # AMD: Tctl idles hot, 70 C warns constantly
+.\install-windows.ps1 -Action Install -TailscaleServe  # also publish https://<machine>.<tailnet>.ts.net:9443
 .\install-windows.ps1 -Action Status      # probes /readyz, reports settings + AI usage sources
 .\install-windows.ps1 -Action Update      # download + verify + swap + rollback
 .\install-windows.ps1 -Action Uninstall
