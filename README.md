@@ -190,8 +190,9 @@ Swipe sideways between pages; the dots at the bottom show where you are.
 Above every page:
 
 - **Hostname** — tap it to switch hosts when there is more than one.
-- **Status strip** — connection state, agent version, uptime and sample age. Tap anywhere in
-  the header to refresh now.
+- **Status strip** — connection state, agent version (`release vX.Y.Z` or `dev`) with the
+  dashboard build beside it (`v156`), uptime and sample age. For another host in view the
+  build is that host's own. Tap anywhere in the header to refresh now.
 - **Alert chip** (`⚠ 3`) — appears when a threshold is crossed; tap it to jump to the alerts.
 - **◐ ⇄ ☀ Ⅱ** — dim mode, screen shift (moves the layout a few pixels over time against
   burn-in), keep the screen awake, and pause updates.
