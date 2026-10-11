@@ -56,6 +56,11 @@ func main() {
 	codexConfigDir := flag.String("codex-config-dir", envString("SYSMON_CODEX_CONFIG_DIR", ""), "Codex config directory holding local sessions (defaults to $CODEX_HOME then $HOME/.codex; missing = Codex usage hidden)")
 	codexQuotaPoll := flag.Bool("codex-quota-poll", envBool("SYSMON_CODEX_QUOTA_POLL", false), "poll Codex account quota through the installed CLI every 5 minutes")
 	codexBinary := flag.String("codex-binary", envString("SYSMON_CODEX_BINARY", ""), "Codex CLI executable for quota polling (default: codex on PATH)")
+	// Host switching: the dashboard can view other agents through this one.
+	// -peers pins hosts explicitly; discovery asks online tailnet machines for
+	// an agent's /api/status, only when a dashboard asks for the host list.
+	peerList := flag.String("peers", envString("SYSMON_PEERS", ""), "other agents the dashboard can switch to, comma-separated [name=]URL entries (e.g. minipc=https://minipc.example.ts.net:9443)")
+	peerDiscovery := flag.Bool("peer-discovery", envBool("SYSMON_PEER_DISCOVERY", true), "find other agents on the tailnet (tailscale status, then one request each to :9443 and :9099) when a dashboard opens the host list")
 	showVersion := flag.Bool("version", false, "print the build version and exit")
 	flag.Parse()
 
@@ -137,6 +142,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("settings: %v", err)
 	}
+	peers, err := parsePeerList(*peerList)
+	if err != nil {
+		log.Fatalf("peers: %v", err)
+	}
 	hostUpdate := hostSettingsUpdate(*refreshMS, *cpuWarn, *memWarn, *diskWarn, *gpuWarn, *tempWarn)
 	if !hostSettingsUpdateEmpty(hostUpdate) {
 		if _, err := state.UpdateSettings(hostUpdate); err != nil {
@@ -192,6 +201,10 @@ func main() {
 	if err := listen.validate(); err != nil {
 		log.Fatal(err)
 	}
+
+	// Wired after -self-check returns, so the self-check can never reach the
+	// tailnet: discovery is demand-driven, but this makes it structural.
+	state.SetPeerRegistry(newPeerRegistry(peerRegistryOptions{Configured: peers, Discover: *peerDiscovery}))
 
 	metricsSampler.Start()
 	defer metricsSampler.Stop()

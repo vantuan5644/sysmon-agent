@@ -1,13 +1,14 @@
 package main
 
 import (
+	"os"
 	"runtime"
 	"time"
 )
 
 var agentStartedAt = time.Now().UTC()
 
-const dashboardBuild = "sysmon-static-v152"
+const dashboardBuild = "sysmon-static-v153"
 
 type AgentStatus struct {
 	Status            string              `json:"status"`
@@ -37,6 +38,12 @@ type AgentStatus struct {
 	// console runs) so the dashboard can hide the self-update affordance and
 	// direct the user to the installer / package manager path.
 	UpdateCheckSupported bool `json:"update_check_supported"`
+	// Hostname and InstanceID identify this agent to a peer building its host
+	// picker: the first is its display fallback, the second tells one agent
+	// reached under two addresses (or a host list naming the asking agent
+	// itself) apart from two agents. InstanceID changes per process.
+	Hostname   string `json:"hostname"`
+	InstanceID string `json:"instance_id"`
 }
 
 type ReadinessStatus struct {
@@ -56,6 +63,7 @@ func newAgentStatus(state *RuntimeState, controls []ControlCapability, now time.
 	if uptime < 0 {
 		uptime = 0
 	}
+	hostname, _ := os.Hostname()
 	checker := state.UpdateChecker()
 	status := UpdateStatus{Available: false}
 	if checker != nil {
@@ -78,5 +86,7 @@ func newAgentStatus(state *RuntimeState, controls []ControlCapability, now time.
 		Version:              version,
 		Update:               status,
 		UpdateCheckSupported: selfUpdateSupported(),
+		Hostname:             hostname,
+		InstanceID:           agentInstanceID,
 	}
 }

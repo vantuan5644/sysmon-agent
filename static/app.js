@@ -90,6 +90,21 @@ const state = {
   codexUsageInFlight: false,
   codexUsagePayload: null,
   codexUsageReceivedAtMS: 0,
+  // Host switching. hostID "" is the agent that served this app (plain /api/*
+  // routes); any other id is a peer that agent relays to through
+  // /api/hosts/<id>/*. hostGeneration bumps on every switch, so a response
+  // that left against the previous host is dropped on arrival.
+  hostID: "",
+  hostGeneration: 0,
+  hosts: [],
+  hostsDiscovery: null,
+  hostsInFlight: false,
+  hostsRetryTimer: null,
+  hostSheetOpen: false,
+  // A peer's own warn thresholds (host-side config on that machine), applied
+  // while viewing it. Dim/shift stay with the serving agent: they describe
+  // this display, whichever host is on it.
+  hostThresholds: null,
   settings: {
     dim: false,
     shift: true,
@@ -106,7 +121,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v152";
+const dashboardBuild = "sysmon-static-v153";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -193,6 +208,13 @@ const collapsedIssueLimit = 5;
 const statusPageIndex = 1;
 const sparklineSampleLimit = 24;
 const wakePreferenceKey = "sysmon:wake-wanted";
+const hostPreferenceKey = "sysmon:host";
+// Mirrors localHostID in peers.go.
+const localHostID = "local";
+// While the host picker is open and the agent reports a scan still running,
+// ask again after this long so the list fills in.
+const hostsScanRetryMS = 2500;
+const osLabels = { windows: "Windows", linux: "Linux", darwin: "macOS" };
 
 // Set by setupPager so content re-renders (e.g. the Issues list growing) can ask
 // the pager to re-measure the active page and resize to fit it.
@@ -240,6 +262,11 @@ document.addEventListener("DOMContentLoaded", () => {
     button.addEventListener("click", () => setProcSort(button.dataset.procSort));
   }
   $("statusStrip").addEventListener("click", refreshNow);
+  $("hostSwitch").addEventListener("click", openHostSheet);
+  $("hostSheetClose").addEventListener("click", closeHostSheet);
+  $("hostSheetScrim").addEventListener("click", closeHostSheet);
+  $("hostRescan").addEventListener("click", () => fetchHosts({ refresh: true }));
+  document.addEventListener("keydown", handleHostSheetKeydown);
   setupPager();
   reflectProcSort();
 
@@ -262,6 +289,8 @@ document.addEventListener("DOMContentLoaded", () => {
   registerServiceWorker();
 
   restoreWakePreference();
+  // Before the first fetch: every host-scoped request below reads hostID.
+  restoreHostPreference();
   fetchSettings();
   fetchStatus();
   // One quota fetch at load reveals (or hides) the fourth page; afterwards the
@@ -269,6 +298,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // moves on a minutes cadence and the verifier pins the interval inventory.
   fetchQuota();
   fetchCodexUsage();
+  fetchHosts();
   syncVisibleTimers();
   fetchMetrics();
   sendClientCheck();
@@ -503,7 +533,7 @@ function openStream() {
   }
   let source;
   try {
-    source = new EventSource("/api/stream");
+    source = new EventSource(hostAPIPath("stream"));
   } catch {
     state.streamFallback = true;
     return;
@@ -516,8 +546,18 @@ function openStream() {
     state.streamFailures = 0;
     state.lastStreamAtMS = nowMS();
   };
-  source.onmessage = handleStreamMessage;
-  source.onerror = handleStreamError;
+  // A frame from a stream that a host switch has already replaced must not
+  // paint the previous host onto the new one.
+  source.onmessage = (event) => {
+    if (state.stream === source) {
+      handleStreamMessage(event);
+    }
+  };
+  source.onerror = (event) => {
+    if (state.stream === source) {
+      handleStreamError(event);
+    }
+  };
 }
 
 function closeStream() {
@@ -589,6 +629,9 @@ function scheduleStatusPolling() {
       // host has reported itself unconfigured.
       fetchQuota();
       fetchCodexUsage();
+      // The host list rides the same tick. The agent answers from its cache
+      // and rescans in the background only once the list is minutes old.
+      fetchHosts();
       // Age the usage footers on the same tick. A fetch that fails leaves the
       // last rendering in place by design; without this it would keep claiming
       // the freshness it had when it last succeeded.
@@ -730,16 +773,23 @@ async function fetchMetrics() {
   if (state.metricsInFlight) {
     return;
   }
+  const generation = state.hostGeneration;
   state.metricsInFlight = true;
   if (state.lastMetricsAtMS === 0 || state.connectionKind === "bad") {
     setConnectionState("loading", "Updating");
   }
   try {
-    const response = await fetchWithTimeout("/api/metrics", { cache: "no-store" }, metricsTimeoutMS);
+    const response = await fetchWithTimeout(hostAPIPath("metrics"), { cache: "no-store" }, metricsTimeoutMS);
+    if (!isCurrentHost(generation)) {
+      return;
+    }
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      throw new Error(await responseErrorMessage(response));
     }
     const metrics = await response.json();
+    if (!isCurrentHost(generation)) {
+      return;
+    }
     state.lastMetricsAtMS = nowMS();
     render(metrics);
     if (state.paused) {
@@ -748,10 +798,17 @@ async function fetchMetrics() {
       setConnectionState("ok", "Live");
     }
   } catch (error) {
-    setConnectionState("bad", error.message || "Offline");
+    if (!isCurrentHost(generation)) {
+      return;
+    }
+    // A relay error names the peer and the cause; that belongs in the issues
+    // list, while the status strip only has room for the verdict.
+    setConnectionState("bad", state.hostID ? "Unreachable" : (error.message || "Offline"));
     renderMetricError(error);
   } finally {
-    state.metricsInFlight = false;
+    if (isCurrentHost(generation)) {
+      state.metricsInFlight = false;
+    }
   }
 }
 
@@ -1043,19 +1100,30 @@ function positiveNumber(value, fallback) {
 }
 
 async function fetchStatus() {
+  const generation = state.hostGeneration;
   try {
-    const response = await fetchWithTimeout("/api/status", { cache: "no-store" }, auxiliaryTimeoutMS);
+    const response = await fetchWithTimeout(hostAPIPath("status"), { cache: "no-store" }, auxiliaryTimeoutMS);
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      throw new Error(await responseErrorMessage(response));
     }
-    renderStatus(await response.json());
+    const status = await response.json();
+    if (isCurrentHost(generation)) {
+      renderStatus(status);
+    }
   } catch (error) {
+    if (!isCurrentHost(generation)) {
+      return;
+    }
     $("agentMeta").textContent = "status NA";
     renderStatusError(error);
   }
 }
 
 function renderStatus(status) {
+  if (state.hostID) {
+    renderPeerStatus(status);
+    return;
+  }
   if (status?.settings && !state.settingsInFlight) {
     applySettings(status.settings);
     clearSettingsFetchIssue();
@@ -1094,6 +1162,403 @@ function renderStatusIssues(status) {
   }
   state.statusIssueMessages = messages;
   renderIssuesPanel();
+}
+
+// renderPeerStatus applies a peer's /api/status. Only what describes that
+// host carries over: its controls, its build badge, its warn thresholds. The
+// app shell, display settings, client checks and self-update all belong to
+// the agent that served this app, so the peer's view of them is ignored. A
+// peer on an older build is normal and leaves this app's shell alone.
+function renderPeerStatus(status) {
+  const thresholds = status?.settings?.thresholds;
+  state.hostThresholds = thresholds ? normalizeThresholds(thresholds) : null;
+  applyControlCapabilities(status?.controls);
+  renderAgentVersion(status);
+  hideUpdatePanel();
+  state.staleDashboardBuild = "";
+  state.statusIssueMessages = [];
+  renderIssuesPanel();
+  $("agentMeta").textContent = `up ${formatDuration(status?.uptime_seconds)} / via ${homeHostName()}`;
+}
+
+function hideUpdatePanel() {
+  const panel = $("updatePanel");
+  if (!panel) {
+    return;
+  }
+  panel.hidden = true;
+  panel.classList.remove("update-applying", "update-error");
+}
+
+// --- Host switching --------------------------------------------------------
+// The app is pinned to the agent that served it: an iOS Home Screen app cannot
+// leave its origin without dropping into a Safari sheet. So another host is
+// viewed THROUGH that agent, which lists the agents it knows at /api/hosts and
+// relays metrics, stream, status, usage and controls at /api/hosts/<id>/*.
+
+function hostAPIPath(route) {
+  return state.hostID ? `/api/hosts/${encodeURIComponent(state.hostID)}/${route}` : `/api/${route}`;
+}
+
+function isCurrentHost(generation) {
+  return generation === state.hostGeneration;
+}
+
+// responseErrorMessage keeps the local error text exactly as it always was
+// ("HTTP 500"), and for a relayed request surfaces the relay's own message,
+// which names the peer and why it could not be reached.
+async function responseErrorMessage(response) {
+  const fallback = `HTTP ${response.status}`;
+  if (!state.hostID || typeof response.json !== "function") {
+    return fallback;
+  }
+  try {
+    const body = await response.json();
+    return String(body?.error || "").trim() || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function restoreHostPreference() {
+  state.hostID = readStoredHostID();
+  renderHostSwitch();
+}
+
+function readStoredHostID() {
+  try {
+    const value = String(window.localStorage?.getItem(hostPreferenceKey) || "");
+    return /^[a-z0-9-]{1,64}$/.test(value) && value !== localHostID ? value : "";
+  } catch {
+    return "";
+  }
+}
+
+function writeStoredHostID(id) {
+  try {
+    window.localStorage?.setItem(hostPreferenceKey, id || localHostID);
+  } catch {
+  }
+}
+
+async function fetchHosts(options = {}) {
+  if (state.hostsInFlight) {
+    return;
+  }
+  state.hostsInFlight = true;
+  renderHostSheet();
+  try {
+    const response = await fetchWithTimeout(options.refresh ? "/api/hosts?refresh=1" : "/api/hosts", { cache: "no-store" }, auxiliaryTimeoutMS);
+    if (!response.ok) {
+      // An agent without the route has no other host to offer.
+      if (response.status === 404) {
+        applyHosts({ hosts: [] });
+      }
+      return;
+    }
+    applyHosts(await response.json());
+  } catch {
+    // Keep the last list; the next status tick or picker open asks again.
+  } finally {
+    state.hostsInFlight = false;
+    renderHostSheet();
+  }
+}
+
+function applyHosts(payload) {
+  const hosts = Array.isArray(payload?.hosts)
+    ? payload.hosts.filter((host) => host && typeof host.id === "string" && host.id)
+    : [];
+  state.hosts = hosts;
+  state.hostsDiscovery = payload?.discovery && typeof payload.discovery === "object" ? payload.discovery : null;
+  const scanning = state.hostsDiscovery?.scanning === true;
+  // A remembered host the agent no longer lists (dropped from -peers, or a
+  // tailnet machine it forgot across a restart) falls back to this agent,
+  // once the list is complete. A list a scan is still filling proves nothing.
+  if (state.hostID && !scanning && hosts.length > 0 && !hosts.some((host) => host.id === state.hostID)) {
+    selectHost(localHostID);
+  }
+  renderHostSwitch();
+  if (state.hostSheetOpen && scanning) {
+    clearDashboardTimeout("hostsRetryTimer");
+    state.hostsRetryTimer = setTimeout(() => {
+      state.hostsRetryTimer = null;
+      if (state.hostSheetOpen) {
+        fetchHosts();
+      }
+    }, hostsScanRetryMS);
+  }
+}
+
+function localHostEntry() {
+  return state.hosts.find((host) => host.self) || null;
+}
+
+function currentHostEntry() {
+  return state.hostID ? state.hosts.find((host) => host.id === state.hostID) || null : localHostEntry();
+}
+
+function homeHostName() {
+  const local = localHostEntry();
+  if (local?.name) {
+    return local.name;
+  }
+  const hostname = String(window.location?.hostname || "").split(".")[0];
+  return hostname || "this agent";
+}
+
+function currentHostLabel() {
+  return currentHostEntry()?.name || state.hostID || homeHostName();
+}
+
+// The switch is offered when there is somewhere to go: another agent is
+// listed, or the tailnet can be scanned for one. A single host with no
+// Tailscale (most public installs) gets no dead affordance.
+function hostSwitchAvailable() {
+  if (state.hosts.some((host) => !host.self)) {
+    return true;
+  }
+  return state.hostsDiscovery?.enabled === true && state.hostsDiscovery?.available === true;
+}
+
+function renderHostSwitch() {
+  const viewingPeer = Boolean(state.hostID);
+  document.body.classList.toggle("host-remote", viewingPeer);
+  const button = $("hostSwitch");
+  const chevron = $("hostSwitchChevron");
+  if (!button || !chevron) {
+    return;
+  }
+  // While a peer is in view the way back stays reachable, even before the
+  // host list has loaded.
+  const available = viewingPeer || hostSwitchAvailable();
+  button.hidden = !available;
+  chevron.hidden = !available;
+  button.setAttribute("aria-expanded", state.hostSheetOpen ? "true" : "false");
+  button.setAttribute("aria-label", viewingPeer
+    ? `Switch host. Viewing ${currentHostLabel()} through ${homeHostName()}`
+    : `Switch host. Viewing ${currentHostLabel()}`);
+}
+
+function openHostSheet() {
+  const sheet = $("hostSheet");
+  if (!sheet || state.hostSheetOpen) {
+    return;
+  }
+  disarmControl();
+  state.hostSheetOpen = true;
+  sheet.hidden = false;
+  setShellInert(true);
+  renderHostSwitch();
+  renderHostSheet();
+  focusElement(currentHostRow() || $("hostSheetClose"));
+  fetchHosts({ refresh: true });
+}
+
+function closeHostSheet() {
+  const sheet = $("hostSheet");
+  if (!sheet || !state.hostSheetOpen) {
+    return;
+  }
+  state.hostSheetOpen = false;
+  sheet.hidden = true;
+  clearDashboardTimeout("hostsRetryTimer");
+  setShellInert(false);
+  renderHostSwitch();
+  focusElement($("hostSwitch"));
+}
+
+// The sheet is a sibling of the shell, so marking the shell inert keeps focus
+// and the screen reader inside the sheet while it is open.
+function setShellInert(inert) {
+  const shell = $("shell");
+  if (shell) {
+    shell.inert = inert;
+  }
+}
+
+function focusElement(element) {
+  if (element && typeof element.focus === "function") {
+    element.focus();
+  }
+}
+
+function currentHostRow() {
+  const list = $("hostList");
+  const rows = list ? Array.from(list.children || []) : [];
+  return rows.find((row) => row?.getAttribute?.("aria-current") === "true") || null;
+}
+
+function handleHostSheetKeydown(event) {
+  if (state.hostSheetOpen && event?.key === "Escape") {
+    event.preventDefault?.();
+    closeHostSheet();
+  }
+}
+
+function selectHost(id) {
+  const next = !id || id === localHostID ? "" : String(id);
+  closeHostSheet();
+  if (next === state.hostID) {
+    return;
+  }
+  state.hostID = next;
+  state.hostGeneration += 1;
+  writeStoredHostID(next);
+  resetHostView();
+  renderHostSwitch();
+  schedulePolling();
+  fetchStatus();
+  fetchQuota();
+  fetchCodexUsage();
+  fetchMetrics();
+}
+
+// resetHostView drops everything the previous host left on screen. A switch
+// must never show one host's numbers under another host's name: the gauges go
+// blank, the controls disable until the new host reports what it supports, and
+// every per-host latch (stream fallback, usage support) starts over.
+function resetHostView() {
+  closeStream();
+  state.streamFallback = false;
+  state.streamFailures = 0;
+  state.streamReconnects = 0;
+  state.metricsInFlight = false;
+  state.lastProcesses = null;
+  state.hostThresholds = null;
+  state.staleDashboardBuild = "";
+  state.statusIssueMessages = [];
+  state.quotaSupported = true;
+  state.quotaInFlight = false;
+  state.codexUsageSupported = true;
+  state.codexUsageInFlight = false;
+  renderQuota({ configured: false, source: "none", rows: [] });
+  renderCodexUsage({ configured: false, source: "none", rows: [], token_days: [] });
+  disarmControl();
+  pendingControlActions.clear();
+  applyControlCapabilities([]);
+  microphoneMuted = null;
+  cameraControlState = "unavailable";
+  cameraRestorePending = false;
+  setControlMuted("volume_mute", $("volumeCtl"), false);
+  setPressed($("micCtl"), false);
+  setPressed($("cameraCtl"), false);
+  hideUpdatePanel();
+  render({ hostname: currentHostLabel() });
+  // A switch is a load: show "--" like the first paint. An empty frame
+  // renders "NA", which reads as a failed sensor.
+  for (const id of ["cpuValue", "gpuValue", "memValue", "netValue"]) {
+    $(id).textContent = "--";
+  }
+  state.history = { cpu: [], mem: [], gpu: [], net: [] };
+  state.lastMetricsAtMS = 0;
+  setConnectionState("loading", "Connecting");
+}
+
+function renderHostSheet() {
+  const list = $("hostList");
+  const summary = $("hostSheetSummary");
+  const note = $("hostDiscoveryNote");
+  const rescan = $("hostRescan");
+  if (!state.hostSheetOpen || !list || !summary || !note || !rescan) {
+    return;
+  }
+  list.textContent = "";
+  const hosts = state.hosts.length > 0
+    ? state.hosts
+    : [{ id: localHostID, name: homeHostName(), self: true, online: true, source: "local" }];
+  for (const host of hosts) {
+    list.append(hostRow(host));
+  }
+  const peers = hosts.filter((host) => !host.self);
+  const online = peers.filter((host) => host.online).length;
+  summary.textContent = peers.length === 0 ? "this agent only" : `${online}/${peers.length} online`;
+  if (peers.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "host-empty";
+    empty.textContent = "No other agents found. Run sysmon-agent on another tailnet machine, or pin one with -peers name=URL.";
+    list.append(empty);
+  }
+  const scanning = state.hostsInFlight || state.hostsDiscovery?.scanning === true;
+  rescan.disabled = scanning;
+  rescan.textContent = scanning ? "Scanning…" : "Rescan";
+  note.textContent = hostDiscoveryNote(state.hostsDiscovery);
+}
+
+function hostRow(host) {
+  const id = host.self ? localHostID : host.id;
+  const current = host.self ? !state.hostID : host.id === state.hostID;
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = ["host-row", current ? "current" : "", host.online ? "" : "offline"].filter(Boolean).join(" ");
+  row.dataset.hostId = id;
+  row.setAttribute("aria-current", current ? "true" : "false");
+
+  const dot = document.createElement("span");
+  dot.className = `host-row-dot ${host.online ? "ok" : "bad"}`;
+  dot.setAttribute("aria-hidden", "true");
+  const text = document.createElement("span");
+  text.className = "host-row-text";
+  const name = document.createElement("span");
+  name.className = "host-row-name";
+  name.textContent = host.name || id;
+  const detail = document.createElement("span");
+  detail.className = "host-row-detail";
+  detail.textContent = hostRowDetail(host);
+  text.append(name, detail);
+  row.append(dot, text);
+  if (host.self) {
+    const badge = document.createElement("span");
+    badge.className = "host-row-badge";
+    badge.textContent = "this agent";
+    row.append(badge);
+  }
+  if (current) {
+    const check = makeIcon([["polyline", { points: "5 12.5 10 17.5 19 7" }]]);
+    check.setAttribute("class", "host-row-check");
+    row.append(check);
+  }
+  row.title = host.address ? `${host.name} (${host.address})` : (host.name || id);
+  row.addEventListener("click", () => selectHost(id));
+  return row;
+}
+
+// hostRowDetail is the row's second line. Offline is stated in words as well
+// as by the hollow dot; a peer on a different build says which.
+function hostRowDetail(host) {
+  const parts = [];
+  if (!host.online) {
+    const seenMS = Date.parse(host.last_seen);
+    if (Number.isFinite(seenMS)) {
+      parts.push(`Offline, seen ${formatSampleAge(seenMS)} ago`);
+    } else {
+      parts.push(host.error ? `Offline: ${String(host.error).slice(0, 48)}` : "Offline");
+    }
+  }
+  const os = osLabels[String(host.os || "").toLowerCase()] || String(host.os || "");
+  if (os) {
+    parts.push(os);
+  }
+  parts.push(host.self ? "serves this app" : host.source === "configured" ? "pinned" : "tailnet");
+  const build = String(host.dashboard_build || "");
+  if (!host.self && build && build !== dashboardBuild) {
+    parts.push(`build ${build.replace("sysmon-static-", "")}`);
+  }
+  return joinDetail(parts);
+}
+
+function hostDiscoveryNote(discovery) {
+  if (!discovery?.enabled) {
+    return "Tailnet scan off · pin hosts with -peers";
+  }
+  if (discovery.scanning) {
+    return "Scanning tailnet…";
+  }
+  if (!discovery.available) {
+    return `Tailnet scan unavailable${discovery.error ? `: ${discovery.error}` : ""}`;
+  }
+  const scannedMS = Date.parse(discovery.scanned_at);
+  return Number.isFinite(scannedMS) ? `Tailnet scanned ${formatSampleAge(scannedMS)} ago` : "Tailnet scan on";
 }
 
 // releaseVersionPattern matches a real release tag ("v1.2.3" / "1.2.3", with an
@@ -1635,7 +2100,10 @@ function writeStoredBoolean(key, value) {
 function render(metrics) {
   renderDeviceActivity(metrics.device_activity, metrics.timestamp);
   $("hostname").textContent = metrics.hostname || "unknown";
-  $("platform").textContent = [metrics.os, metrics.arch, metrics.platform].filter(Boolean).join(" / ");
+  const platform = [metrics.os, metrics.arch, metrics.platform].filter(Boolean).join(" / ");
+  // Viewing a peer says so in words as well as in the accent tint: the
+  // control row above every page acts on whatever host this line names.
+  $("platform").textContent = state.hostID ? joinDetail([`via ${homeHostName()}`, platform]) : platform;
   renderMetricTimestamp(metrics.timestamp, metrics.collection_duration_ms);
   renderMetricAlerts(metrics);
   renderCollectionErrors(metrics.collection_errors);
@@ -2477,8 +2945,12 @@ async function fetchQuota() {
     return;
   }
   state.quotaInFlight = true;
+  const generation = state.hostGeneration;
   try {
-    const response = await fetchWithTimeout("/api/quota", { cache: "no-store" }, auxiliaryTimeoutMS);
+    const response = await fetchWithTimeout(hostAPIPath("quota"), { cache: "no-store" }, auxiliaryTimeoutMS);
+    if (!isCurrentHost(generation)) {
+      return;
+    }
     if (!response.ok) {
       // Handle !ok explicitly: the verifier's fetch stub resolves unknown
       // paths to 404, and an unhandled rejection inside node:vm would fail the
@@ -2492,6 +2964,9 @@ async function fetchQuota() {
       return;
     }
     const payload = await response.json();
+    if (!isCurrentHost(generation)) {
+      return;
+    }
     if (!payload || payload.configured !== true) {
       state.quotaSupported = false;
     }
@@ -2500,7 +2975,9 @@ async function fetchQuota() {
     // Transient network failure: leave the page (and the latch) as-is. The
     // next status tick retries.
   } finally {
-    state.quotaInFlight = false;
+    if (isCurrentHost(generation)) {
+      state.quotaInFlight = false;
+    }
   }
 }
 
@@ -2512,8 +2989,12 @@ async function fetchCodexUsage() {
     return;
   }
   state.codexUsageInFlight = true;
+  const generation = state.hostGeneration;
   try {
-    const response = await fetchWithTimeout("/api/codex-usage", { cache: "no-store" }, auxiliaryTimeoutMS);
+    const response = await fetchWithTimeout(hostAPIPath("codex-usage"), { cache: "no-store" }, auxiliaryTimeoutMS);
+    if (!isCurrentHost(generation)) {
+      return;
+    }
     if (!response.ok) {
       if (response.status === 404) {
         state.codexUsageSupported = false;
@@ -2522,6 +3003,9 @@ async function fetchCodexUsage() {
       return;
     }
     const payload = await response.json();
+    if (!isCurrentHost(generation)) {
+      return;
+    }
     if (!payload || payload.configured !== true) {
       state.codexUsageSupported = false;
     }
@@ -2529,7 +3013,9 @@ async function fetchCodexUsage() {
   } catch {
     // Preserve the last good rendering and retry on the next status tick.
   } finally {
-    state.codexUsageInFlight = false;
+    if (isCurrentHost(generation)) {
+      state.codexUsageInFlight = false;
+    }
   }
 }
 
@@ -3273,7 +3759,7 @@ function clearTransientStatus() {
 }
 
 function thresholdValue(key) {
-  return state.settings.thresholds?.[key] ?? defaultThresholds[key] ?? defaultThresholds.cpu_warn;
+  return state.hostThresholds?.[key] ?? state.settings.thresholds?.[key] ?? defaultThresholds[key] ?? defaultThresholds.cpu_warn;
 }
 
 // applyControlCapabilities enables/disables the host-control buttons from the
@@ -3317,11 +3803,12 @@ async function sendControl(action, button) {
   }
   disarmControl();
   const label = controlActionLabels[action] || "Control";
+  const generation = state.hostGeneration;
   pendingControlActions.add(action);
   button.disabled = true;
   try {
     const response = await fetchWithTimeout(
-      "/api/control",
+      hostAPIPath("control"),
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3330,9 +3817,14 @@ async function sendControl(action, button) {
       auxiliaryTimeoutMS,
     );
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      throw new Error(await responseErrorMessage(response));
     }
     const result = await response.json();
+    // The action landed on the host that was in view when it was sent; its
+    // result says nothing about the buttons of the host in view now.
+    if (!isCurrentHost(generation)) {
+      return;
+    }
     if (action === "camera_toggle") {
       setCameraControlState(result.camera_control || { available: result.available, state: result.state, error: result.error || result.message });
     }
@@ -3361,7 +3853,7 @@ function armLockControl(button) {
   if (labelEl) {
     labelEl.textContent = "Confirm?";
   }
-  showTransientStatus("Tap again to lock");
+  showTransientStatus(state.hostID ? `Tap again to lock ${currentHostLabel()}` : "Tap again to lock");
   clearDashboardTimeout("controlArmTimer");
   state.controlArmTimer = setTimeout(disarmControl, controlArmWindowMS);
 }
