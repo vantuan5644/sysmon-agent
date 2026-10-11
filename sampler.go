@@ -273,17 +273,27 @@ func (s *sampler) runWholeLoop(ctx context.Context) {
 // Device status has its own demand-aware worker: slow hardware collection can
 // take longer than the dashboard's activity freshness window. It must neither
 // delay capture observations nor block metrics requests and SSE publication.
+// A toggle wakes it early so the new state reaches the stream at once.
 func (s *sampler) runDeviceLoop(ctx context.Context) {
 	defer s.wg.Done()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		case <-s.devices.wake:
+			// No drain: with Go 1.23+ timers Stop leaves nothing to receive,
+			// and an older stale tick only costs one early, cached pass.
+			timer.Stop()
+		}
 		if s.hasDemand() {
 			started := time.Now()
 			activity := s.devices.sample(ctx)
 			s.applyAndPublish(func(m *Metrics) { m.DeviceActivity = &activity }, started)
 		}
-		if sleepCanceled(ctx, 2*time.Second) {
-			return
-		}
+		timer.Reset(2 * time.Second)
 	}
 }
 

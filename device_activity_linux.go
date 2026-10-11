@@ -156,6 +156,10 @@ func (b linuxDeviceBackend) PrepareRestore(ctx context.Context, saved []cameraDe
 	return errors.Join(failures...)
 }
 
+func (linuxDeviceBackend) AudioMute(ctx context.Context) (AudioMuteState, AudioMuteState) {
+	return linuxMicrophoneMute(ctx), linuxDefaultMute(ctx, false)
+}
+
 func (b linuxDeviceBackend) Activity(ctx context.Context) (DeviceActivity, DeviceActivity) {
 	mic := unknownDeviceActivity("capture session is inaccessible")
 	camera := unknownDeviceActivity("capture session is inaccessible")

@@ -502,7 +502,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v153",
+    dashboard_build: "sysmon-static-v154",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -520,7 +520,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v153",
+    dashboard_build: "sysmon-static-v154",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1004,7 +1004,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v153, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v154, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1052,7 +1052,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v153; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v154; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1062,7 +1062,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v153",
+    dashboard_build: "sysmon-static-v154",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1072,7 +1072,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v153",
+    dashboard_build: "sysmon-static-v154",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1207,7 +1207,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v153", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v154", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -2542,6 +2542,157 @@ assert(document.getElementById("micCtl").getAttribute("aria-label").includes("un
 assert(document.getElementById("micCtlUsage").textContent === "—", "unmute changed usage");
 assert(!document.getElementById("micCtl").classList.contains("activity-active"), "older host retained mic animation");
 
+// --- Toggle sync ---------------------------------------------------------------
+// The host reports mute state on every device sample, so a mute changed outside
+// Sysmon shows without a toggle. A toggle in flight shows only a busy mark, the
+// confirmed result shows at once, and a sample taken before the toggle never
+// paints over it.
+{
+  const savedFetch = context.fetch;
+  const mic = document.getElementById("micCtl");
+  const camera = document.getElementById("cameraCtl");
+  const speaker = document.getElementById("volumeCtl");
+  const micState = () => document.getElementById("micCtlState").textContent;
+  const cameraState = () => document.getElementById("cameraCtlState").textContent;
+  const speakerLabel = () => document.getElementById("volumeCtlLabel").textContent;
+  const at = () => new Date().toISOString();
+  const frame = (microphoneMute, speakerMute = "unmuted", cameraControl = "enabled") => ({
+    microphone: { state: "idle", observed_at: at() },
+    camera: { state: "idle", observed_at: at() },
+    camera_control: { state: cameraControl, available: true, restore_pending: cameraControl === "disabled" },
+    microphone_mute: { state: microphoneMute, observed_at: at() },
+    speaker_mute: { state: speakerMute, observed_at: at() },
+  });
+  const paint = (...args) => context.renderDeviceActivity(frame(...args), at());
+  const enableToggles = () => context.applyControlCapabilities(
+    ["mic_mute", "camera_toggle", "volume_mute"].map((action) => ({ action, available: true })),
+  );
+  let controlReply = null;
+  context.fetch = async (path, options = {}) => {
+    if (path === "/api/control" && options.method === "POST") {
+      return controlReply.promise;
+    }
+    return savedFetch(path, options);
+  };
+
+  paint("muted", "muted");
+  assert(micState() === "Off", "host-reported microphone mute did not show without a toggle");
+  assert(mic.getAttribute("aria-pressed") === "true", "host-reported mute did not press the mic button");
+  assert(speakerLabel() === "Muted" && document.getElementById("volumeCtlGlyph").textContent === "🔇", "host-reported speaker mute did not show");
+  paint("unmuted", "unmuted");
+  assert(micState() === "On" && speakerLabel() === "Speaker", "host-reported unmute did not show");
+  paint("mixed");
+  assert(micState() === "Mix", "partly muted microphones did not show as mixed");
+  assert(mic.getAttribute("aria-label").includes("some microphones muted"), "mixed mute state missing from the accessible label");
+  paint("unknown", "unknown");
+  assert(micState() === "—", "unknown mute state appeared known");
+
+  // Confirmed result: busy while sending, then the result, then pre-toggle
+  // samples are ignored until the stream agrees.
+  enableToggles();
+  paint("unmuted");
+  controlReply = deferredResponse({ action: "mic_mute", available: true, applied: true, state: "muted" });
+  let sent = context.sendControl("mic_mute", mic);
+  assert(mic.classList.contains("pending") && mic.getAttribute("aria-busy") === "true", "pressed mic toggle showed no busy state");
+  assert(micState() === "…", "mic toggle in flight still showed a state");
+  assert(mic.disabled === true, "mic toggle in flight accepted another tap");
+  assert(!mic.classList.contains("device-on"), "mic toggle in flight kept the on border");
+  assert(mic.getAttribute("aria-label").includes("mute state changing"), "busy state missing from the accessible label");
+  paint("unmuted");
+  assert(micState() === "…", "a reading painted over the toggle in flight");
+  controlReply.resolve();
+  await sent;
+  assert(micState() === "Off", "confirmed mute result did not show");
+  assert(!mic.classList.contains("pending") && mic.getAttribute("aria-busy") === "false", "busy state outlived the confirmed result");
+  assert(mic.disabled === false, "mic stayed disabled after the confirmed result");
+  paint("unmuted");
+  assert(micState() === "Off", "a reading from before the toggle reverted the confirmed state");
+  paint("muted");
+  paint("unmuted");
+  assert(micState() === "On", "a later change on the host did not show once the stream agreed");
+
+  // The stream can confirm before the POST answers: the result then ends the
+  // sync at once, and the next change shows immediately.
+  controlReply = deferredResponse({ action: "mic_mute", available: true, applied: true, state: "muted" });
+  sent = context.sendControl("mic_mute", mic);
+  paint("muted");
+  assert(micState() === "…", "a reading during the request ended the busy state early");
+  controlReply.resolve();
+  await sent;
+  paint("unmuted");
+  assert(micState() === "On", "a toggle the stream had already confirmed kept holding");
+
+  // A "toggled" result names no state: stay busy until the stream shows one
+  // different from the state before the toggle.
+  controlReply = deferredResponse({ action: "mic_mute", available: true, applied: true, state: "toggled" });
+  sent = context.sendControl("mic_mute", mic);
+  controlReply.resolve();
+  await sent;
+  assert(micState() === "…" && mic.disabled === true, "a toggle without a reported state stopped waiting");
+  paint("unmuted");
+  assert(micState() === "…", "the pre-toggle state ended the wait");
+  paint("muted");
+  assert(micState() === "Off" && !mic.classList.contains("pending") && mic.disabled === false, "the changed state did not end the wait");
+
+  // A failed request shows what the host reports.
+  controlReply = { promise: Promise.resolve(response({ error: "control bridge failed" }, 500)) };
+  await context.sendControl("mic_mute", mic);
+  assert(micState() === "Off" && !mic.classList.contains("pending") && mic.disabled === false, "a failed toggle left the busy state or changed the state");
+
+  // The hold has a limit: a host that keeps disagreeing wins after it.
+  controlReply = deferredResponse({ action: "mic_mute", available: true, applied: true, state: "unmuted" });
+  sent = context.sendControl("mic_mute", mic);
+  controlReply.resolve();
+  await sent;
+  paint("muted");
+  assert(micState() === "On", "the hold let a contrary reading through early");
+  runTimeouts();
+  assert(micState() === "Off", "the host's reading did not win once the hold expired");
+
+  // Camera: the busy mark, then the verified state from the result.
+  paint("muted", "unmuted", "enabled");
+  controlReply = deferredResponse({
+    action: "camera_toggle", available: true, applied: true, state: "disabled",
+    camera_control: { state: "disabled", available: true, restore_pending: true },
+  });
+  sent = context.sendControl("camera_toggle", camera);
+  assert(cameraState() === "…" && camera.classList.contains("pending"), "camera toggle in flight still showed a state");
+  paint("muted", "unmuted", "enabled");
+  assert(cameraState() === "…", "a camera reading painted over the toggle in flight");
+  controlReply.resolve();
+  await sent;
+  assert(cameraState() === "Off" && camera.getAttribute("aria-label").includes("Restore"), "confirmed camera state did not show");
+  paint("muted", "unmuted", "enabled");
+  assert(cameraState() === "Off", "a camera reading from before the toggle reverted it");
+  paint("muted", "unmuted", "disabled");
+  assert(cameraState() === "Off" && camera.disabled === false, "camera did not settle");
+
+  // Speaker: its label carries the state, so it carries the busy mark.
+  controlReply = deferredResponse({ action: "volume_mute", available: true, applied: true, state: "muted" });
+  sent = context.sendControl("volume_mute", speaker);
+  assert(speakerLabel() === "…" && speaker.classList.contains("pending"), "speaker toggle in flight still showed a state");
+  controlReply.resolve();
+  await sent;
+  assert(speakerLabel() === "Muted" && speaker.getAttribute("aria-pressed") === "true", "confirmed speaker mute did not show");
+  runTimeouts();
+
+  // A host on an older build streams no mute state, so the result alone
+  // decides, as before.
+  context.resetHostView();
+  enableToggles();
+  context.renderDeviceActivity({ microphone: { state: "idle", observed_at: at() }, camera: { state: "idle", observed_at: at() } }, at());
+  controlReply = deferredResponse({ action: "mic_mute", available: true, applied: true, state: "toggled" });
+  sent = context.sendControl("mic_mute", mic);
+  controlReply.resolve();
+  await sent;
+  assert(micState() === "Off" && !mic.classList.contains("pending"), "an older host's toggle did not show the flipped state");
+  context.renderDeviceActivity({ microphone: { state: "idle", observed_at: at() }, camera: { state: "idle", observed_at: at() } }, at());
+  assert(micState() === "Off", "a frame without mute state erased an older host's toggle result");
+
+  context.resetHostView();
+  context.fetch = savedFetch;
+}
+
 // --- Host switching -----------------------------------------------------------
 // The app stays on the agent that served it and views other hosts through that
 // agent's relay. A switch must send every host-scoped request through
@@ -2563,7 +2714,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v153" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v154" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],

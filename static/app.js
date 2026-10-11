@@ -121,7 +121,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v153";
+const dashboardBuild = "sysmon-static-v154";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -162,6 +162,21 @@ const controlActionLabels = {
 };
 const pendingControlActions = new Set();
 let lastAvailableControls = new Set();
+// Toggles whose resulting state the host reports on the stream. While one is
+// in flight its button shows a busy mark in place of a state, and once the
+// host confirms the result, readings sampled before the toggle may not paint
+// over it (see controlReadingMayPaint).
+const syncedControlActions = new Set(["mic_mute", "camera_toggle", "volume_mute"]);
+const controlSync = new Map();
+// Latest reading per synced toggle, kept even while it is not painted. A host
+// on an older build never reports one, which is how the flow tells it apart.
+const hostControlReadings = new Map();
+// How long a confirmed result outranks contrary readings. After a toggle the
+// agent resamples at once, so agreement normally arrives well inside this.
+const controlSettleMS = 4000;
+// Above the agent's 8 s control budget plus the relay's extra second: giving
+// up earlier reports "timed out" for a toggle that then lands.
+const controlRequestTimeoutMS = 10000;
 // updateDismissedKey returns the localStorage key for a per-version update
 // dismissal. Dismissing vX.Y.Z once keeps the banner quiet across reloads until
 // a newer version ships (then the new tag changes the key and the banner
@@ -1436,11 +1451,14 @@ function resetHostView() {
   renderCodexUsage({ configured: false, source: "none", rows: [], token_days: [] });
   disarmControl();
   pendingControlActions.clear();
+  for (const action of [...controlSync.keys()]) endControlSync(action);
+  hostControlReadings.clear();
   applyControlCapabilities([]);
-  microphoneMuted = null;
+  microphoneMuteState = null;
+  speakerMuteState = null;
   cameraControlState = "unavailable";
   cameraRestorePending = false;
-  setControlMuted("volume_mute", $("volumeCtl"), false);
+  paintSpeakerControl();
   setPressed($("micCtl"), false);
   setPressed($("cameraCtl"), false);
   hideUpdatePanel();
@@ -3778,7 +3796,7 @@ function applyControlCapabilities(controls) {
   for (const [action, id] of Object.entries(controlButtonIDs)) {
     const button = $(id);
     button.disabled = !available.has(action);
-    if (pendingControlActions.has(action)) button.disabled = true;
+    if (pendingControlActions.has(action) || controlBusy(action)) button.disabled = true;
   }
   lastAvailableControls = available;
 }
@@ -3806,6 +3824,7 @@ async function sendControl(action, button) {
   const generation = state.hostGeneration;
   pendingControlActions.add(action);
   button.disabled = true;
+  const sync = syncedControlActions.has(action) ? beginControlSync(action, button) : null;
   try {
     const response = await fetchWithTimeout(
       hostAPIPath("control"),
@@ -3814,7 +3833,7 @@ async function sendControl(action, button) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action }),
       },
-      auxiliaryTimeoutMS,
+      controlRequestTimeoutMS,
     );
     if (!response.ok) {
       throw new Error(await responseErrorMessage(response));
@@ -3825,12 +3844,15 @@ async function sendControl(action, button) {
     if (!isCurrentHost(generation)) {
       return;
     }
-    if (action === "camera_toggle") {
-      setCameraControlState(result.camera_control || { available: result.available, state: result.state, error: result.error || result.message });
-    }
     if (result?.applied === true) {
-      reflectControlResult(action, button, result, label);
+      if (sync) confirmControlSync(action, sync, result);
+      reflectControlResult(action, result, label);
       return;
+    }
+    // A camera toggle that failed part way still reports where it stopped.
+    if (action === "camera_toggle" && result?.camera_control && controlSync.get(action) === sync) {
+      endControlSync(action);
+      setCameraControlState(result.camera_control);
     }
     const reason = String(result?.error || result?.message || "unavailable").trim();
     showTransientStatus(`${label}: ${reason || "unavailable"}`);
@@ -3838,8 +3860,145 @@ async function sendControl(action, button) {
     showTransientStatus(`${label}: ${controlErrorText(error)}`);
   } finally {
     pendingControlActions.delete(action);
-    button.disabled = !lastAvailableControls.has(action);
+    // Still "sending" means no confirmed result: show what the host reports.
+    if (sync && sync.phase === "sending" && controlSync.get(action) === sync) {
+      endControlSync(action, { replay: true });
+    }
+    button.disabled = !lastAvailableControls.has(action) || controlBusy(action);
   }
+}
+
+// beginControlSync marks a toggle as in flight: the button stays disabled
+// without dimming, its state text becomes a busy mark, and streamed readings
+// are recorded but not painted until the host answers.
+function beginControlSync(action, button) {
+  endControlSync(action);
+  const sync = { phase: "sending", from: shownControlState(action), expected: null, timer: null };
+  controlSync.set(action, sync);
+  button.classList.add("pending");
+  button.setAttribute("aria-busy", "true");
+  repaintControl(action);
+  return sync;
+}
+
+// confirmControlSync applies the host's answer to a toggle. A result naming
+// the new state is shown at once and then outranks contrary readings for
+// controlSettleMS, since the stream can still carry a sample from before the
+// toggle. A result without one ("toggled") keeps the busy mark until the
+// stream shows the state change.
+function confirmControlSync(action, sync, result) {
+  if (controlSync.get(action) !== sync) return;
+  const reports = hostControlReadings.has(action);
+  let expected = expectedControlState(action, result);
+  if (expected === null && !reports && action !== "camera_toggle") {
+    // A host on an older build reports the state nowhere: assume the flip.
+    expected = sync.from === "muted" ? "unmuted" : "muted";
+  }
+  if (expected === null) {
+    sync.phase = "confirming";
+  } else {
+    sync.phase = "holding";
+    sync.expected = expected;
+    setControlBusyMark(action, false);
+    if (action === "camera_toggle") setCameraControlState(result.camera_control);
+    else applyMuteState(action, expected);
+    // Nothing will confirm it, or the stream already has.
+    if (!reports || controlReadingKey(action, hostControlReadings.get(action)) === expected) {
+      endControlSync(action);
+      return;
+    }
+  }
+  sync.timer = setTimeout(() => {
+    if (controlSync.get(action) === sync) endControlSync(action, { replay: true });
+  }, controlSettleMS);
+}
+
+// endControlSync clears a toggle's in-flight state. With replay it then shows
+// the host's latest reading, which is the truth once no result outranks it.
+function endControlSync(action, options = {}) {
+  const sync = controlSync.get(action);
+  if (!sync) return;
+  controlSync.delete(action);
+  if (sync.timer) clearTimeout(sync.timer);
+  setControlBusyMark(action, false);
+  const button = $(controlButtonIDs[action]);
+  if (button && !pendingControlActions.has(action)) button.disabled = !lastAvailableControls.has(action);
+  if (options.replay && hostControlReadings.has(action)) {
+    applyControlReading(action, hostControlReadings.get(action));
+  } else {
+    repaintControl(action);
+  }
+}
+
+// controlReadingMayPaint decides whether a streamed reading may replace what a
+// toggle shows. While the request is in flight none may. After the host has
+// confirmed a state, only a reading that agrees with it may, or any reading
+// once it differs from the pre-toggle state when the result named none. A
+// reading that ends the wait ends the sync; the caller then paints it.
+function controlReadingMayPaint(action, reading) {
+  const sync = controlSync.get(action);
+  if (!sync) return true;
+  if (sync.phase === "sending") return false;
+  const key = controlReadingKey(action, reading);
+  if (sync.phase === "holding" ? key !== sync.expected : key === sync.from) return false;
+  endControlSync(action);
+  return true;
+}
+
+// streamControlReading records a host-reported toggle state and paints it
+// unless a toggle in flight says otherwise.
+function streamControlReading(action, reading) {
+  hostControlReadings.set(action, reading);
+  if (controlReadingMayPaint(action, reading)) applyControlReading(action, reading);
+}
+
+function applyControlReading(action, reading) {
+  if (action === "camera_toggle") setCameraControlState(reading);
+  else applyMuteState(action, reading);
+}
+
+// controlReadingKey reduces a reading to the state a toggle flips: a mute
+// state string, or the camera control's state.
+function controlReadingKey(action, reading) {
+  if (action === "camera_toggle") {
+    const value = reading?.state;
+    return value === "enabled" || value === "disabled" || value === "mixed" ? value : null;
+  }
+  return reading ?? null;
+}
+
+function expectedControlState(action, result) {
+  if (action === "camera_toggle") return controlReadingKey(action, result?.camera_control);
+  return muteStateValue(result?.state);
+}
+
+function muteStateValue(value) {
+  const text = String(value || "").toLowerCase();
+  return text === "muted" || text === "unmuted" || text === "mixed" ? text : null;
+}
+
+function shownControlState(action) {
+  if (action === "mic_mute") return microphoneMuteState;
+  if (action === "volume_mute") return speakerMuteState;
+  return controlReadingKey(action, { state: cameraControlState });
+}
+
+function controlBusy(action) {
+  const phase = controlSync.get(action)?.phase;
+  return phase === "sending" || phase === "confirming";
+}
+
+function setControlBusyMark(action, busy) {
+  const button = $(controlButtonIDs[action]);
+  if (!button) return;
+  button.classList.toggle("pending", busy);
+  button.setAttribute("aria-busy", busy ? "true" : "false");
+}
+
+function repaintControl(action) {
+  if (action === "volume_mute") paintSpeakerControl();
+  else if (action === "mic_mute") updateDeviceControlLabel("microphone");
+  else if (action === "camera_toggle") updateDeviceControlLabel("camera");
 }
 
 // armLockControl arms the Lock Screen button for the confirm window: it flips
@@ -3877,24 +4036,17 @@ function disarmControl() {
   }
 }
 
-function reflectControlResult(action, button, result, label) {
+// reflectControlResult announces an applied control in the status strip. The
+// buttons themselves follow confirmControlSync.
+function reflectControlResult(action, result, label) {
   const resultState = String(result?.state || "").toLowerCase();
   if (action === "camera_toggle") {
     showTransientStatus(`Camera ${resultState}${result.message ? `: ${result.message}` : ""}`);
     return;
   }
   if (action === "mic_mute" || action === "volume_mute") {
-    let muted;
-    if (resultState === "muted") {
-      muted = true;
-    } else if (resultState === "unmuted") {
-      muted = false;
-    } else {
-      // Controllers that only report "toggled" (e.g. Linux): flip optimistically.
-      muted = button.getAttribute("aria-pressed") !== "true";
-    }
-    setControlMuted(action, button, muted);
-    showTransientStatus(`${label} ${muted ? "muted" : "on"}`);
+    const known = muteStateValue(resultState) || shownControlState(action);
+    showTransientStatus(known === "muted" ? `${label} muted` : known === "unmuted" ? `${label} on` : `${label} toggled`);
     return;
   }
   if (action === "media_toggle") {
@@ -3909,19 +4061,40 @@ function reflectControlResult(action, button, result, label) {
 }
 
 function setControlMuted(action, button, muted) {
-  setPressed(button, muted);
+  applyMuteState(action, muted ? "muted" : "unmuted");
+}
+
+// applyMuteState shows a mic or speaker mute state: "muted", "unmuted",
+// "mixed" (some microphones muted) or null for unknown.
+function applyMuteState(action, value) {
+  const muteState = muteStateValue(value);
   if (action === "mic_mute") {
-    microphoneMuted = muted;
+    microphoneMuteState = muteState;
+    setPressed($("micCtl"), muteState === "muted");
     updateDeviceControlLabel("microphone");
     return;
   }
   if (action === "volume_mute") {
-    $("volumeCtlGlyph").textContent = muted ? "🔇" : "🔊";
-    $("volumeCtlLabel").textContent = muted ? "Muted" : "Speaker";
+    speakerMuteState = muteState;
+    paintSpeakerControl();
   }
 }
 
-let microphoneMuted = null;
+function paintSpeakerControl() {
+  const button = $("volumeCtl");
+  if (!button) return;
+  const muted = speakerMuteState === "muted";
+  const busy = controlBusy("volume_mute");
+  setPressed(button, muted);
+  $("volumeCtlGlyph").textContent = muted ? "🔇" : "🔊";
+  $("volumeCtlLabel").textContent = busy ? "…" : muted ? "Muted" : "Speaker";
+  button.setAttribute("aria-label", busy ? "Speaker mute is changing" :
+    muted ? "Unmute speaker; currently muted" :
+    speakerMuteState === "unmuted" ? "Mute speaker; currently on" : "Mute speaker");
+}
+
+let microphoneMuteState = null;
+let speakerMuteState = null;
 let lastDeviceActivity = null;
 let cameraControlState = "unavailable";
 let cameraRestorePending = false;
@@ -3934,7 +4107,7 @@ function setCameraControlState(control) {
   if (!button) return;
   if (control.available === true) lastAvailableControls.add("camera_toggle");
   else lastAvailableControls.delete("camera_toggle");
-  button.disabled = control.available !== true || pendingControlActions.has("camera_toggle");
+  button.disabled = control.available !== true || pendingControlActions.has("camera_toggle") || controlBusy("camera_toggle");
   setPressed(button, cameraControlState === "disabled");
   const outside = control.unsupported > 0 ? `; ${control.unsupported} virtual or other cameras are not controlled` : "";
   button.title = (control.error || "Controls supported local cameras; restores only cameras disabled by Sysmon") + outside;
@@ -3947,13 +4120,19 @@ function updateDeviceControlLabel(kind) {
   const label = $(mic ? "micCtlLabel" : "cameraCtlLabel");
   if (!button || !label) return;
   const active = button.classList.contains("activity-active");
-  const muted = microphoneMuted === true;
-  const deviceState = mic ? (microphoneMuted === null ? "—" : muted ? "Off" : "On") :
+  const busy = controlBusy(mic ? "mic_mute" : "camera_toggle");
+  const muted = microphoneMuteState === "muted";
+  // While a toggle is in flight the state is neither the old one nor known
+  // to be the new one, so it shows a busy mark.
+  const deviceState = busy ? "…" : mic ?
+    (muted ? "Off" : microphoneMuteState === "unmuted" ? "On" : microphoneMuteState === "mixed" ? "Mix" : "—") :
     cameraControlState === "disabled" ? "Off" : cameraControlState === "enabled" ? "On" :
     cameraControlState === "mixed" ? "Mix" : "—";
   const idle = button.classList.contains("activity-idle");
   const activity = active ? "Busy" : idle ? "Idle" : "—";
-  const stateDescription = mic ? (microphoneMuted === null ? "mute state unknown" : muted ? "muted" : "unmuted") :
+  const stateDescription = busy ? (mic ? "mute state changing" : "camera state changing") : mic ?
+    (muted ? "muted" : microphoneMuteState === "unmuted" ? "unmuted" :
+      microphoneMuteState === "mixed" ? "some microphones muted" : "mute state unknown") :
     cameraControlState === "disabled" ? "supported cameras disabled" :
     cameraControlState === "enabled" ? "supported cameras enabled" :
     cameraControlState === "mixed" ? "supported cameras partly enabled" : "camera state unknown";
@@ -3969,7 +4148,8 @@ function updateDeviceControlLabel(kind) {
     usageLabel.title = activityDescription;
   }
   button.classList.toggle("device-on", deviceState === "On");
-  const operation = mic ? (muted ? "Unmute all microphones" : "Mute all microphones") :
+  const operation = mic ? (muted ? "Unmute all microphones" :
+    microphoneMuteState === "mixed" ? "Toggle mute on all microphones" : "Mute all microphones") :
     cameraRestorePending ? "Restore cameras disabled by Sysmon" : "Disable supported local cameras";
   const explanation = mic ? "; mute silences audio while apps can keep a capture session open" :
     "; activity may include cameras outside this control's coverage";
@@ -3993,7 +4173,11 @@ function renderDeviceActivity(activity, metricsTimestamp) {
       [kind, sampledAt - Date.parse(activity?.[kind]?.observed_at)]));
   }
   lastDeviceActivity = activity || null;
-  if (activity?.camera_control) setCameraControlState(activity.camera_control);
+  if (activity?.camera_control) streamControlReading("camera_toggle", activity.camera_control);
+  // Hosts before sysmon-static-v154 report no mute state; theirs stays as the
+  // last toggle result left it.
+  if (activity?.microphone_mute) streamControlReading("mic_mute", muteStateValue(activity.microphone_mute.state));
+  if (activity?.speaker_mute) streamControlReading("volume_mute", muteStateValue(activity.speaker_mute.state));
   for (const kind of ["microphone", "camera"]) {
     const button = $(kind === "microphone" ? "micCtl" : "cameraCtl");
     if (!button) continue;

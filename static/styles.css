@@ -2091,7 +2091,17 @@ body.host-remote .host-controls {
 .activity-active .camera-live-dot { display: inline-block; animation: camera-activity 1200ms ease-in-out infinite; }
 @keyframes mic-activity { to { transform: scaleY(1); } }
 @keyframes camera-activity { 50% { opacity: 0.35; } }
+/* A toggle in flight: the state text is a pulsing busy mark until the host
+   confirms the new state. The button is disabled against double taps yet keeps
+   full opacity and an accent border, because it is busy working. */
+.control-btn.pending { border-color: var(--accent); }
+.control-btn.pending:disabled { opacity: 1; cursor: progress; }
+.control-btn.pending .control-device-state,
+.control-btn.pending #volumeCtlLabel { color: var(--accent); animation: control-pending 700ms ease-in-out infinite alternate; }
+@keyframes control-pending { to { opacity: 0.3; } }
 @media (prefers-reduced-motion: reduce) {
   .activity-active .mic-live-bars i, .activity-active .camera-live-dot { animation: none; }
   .mic-live-bars i:nth-child(2) { transform: scaleY(0.85); }
+  .control-btn.pending .control-device-state,
+  .control-btn.pending #volumeCtlLabel { animation: none; }
 }
