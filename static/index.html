@@ -14,14 +14,18 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <main class="shell">
+  <main id="shell" class="shell">
     <header class="topbar">
       <div class="topbar-id">
         <span id="statusDot" class="status-dot"></span>
         <div class="host-identity">
-          <h1 id="hostname">Sysmon</h1>
+          <div class="host-title">
+            <h1 id="hostname">Sysmon</h1>
+            <span id="hostSwitchChevron" class="host-switch-chevron" aria-hidden="true" hidden><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
+          </div>
           <p class="eyebrow" id="platform">Loading</p>
         </div>
+        <button id="hostSwitch" class="host-switch" type="button" aria-haspopup="dialog" aria-controls="hostSheet" aria-expanded="false" aria-label="Switch host" hidden></button>
       </div>
       <div class="status-row">
         <section class="status-strip" aria-live="polite">
@@ -246,6 +250,22 @@
 
 
   </main>
+
+  <div id="hostSheet" class="host-sheet" hidden>
+    <div id="hostSheetScrim" class="host-sheet-scrim"></div>
+    <section class="host-sheet-panel" role="dialog" aria-modal="true" aria-labelledby="hostSheetTitle">
+      <div class="host-sheet-head">
+        <h2 id="hostSheetTitle">Hosts</h2>
+        <span id="hostSheetSummary" class="host-sheet-summary">--</span>
+        <button id="hostSheetClose" class="button host-sheet-close" type="button" aria-label="Close host list">×</button>
+      </div>
+      <div id="hostList" class="host-list"></div>
+      <div class="host-sheet-foot">
+        <span id="hostDiscoveryNote" class="host-discovery-note" aria-live="polite">--</span>
+        <button id="hostRescan" class="host-rescan" type="button">Rescan</button>
+      </div>
+    </section>
+  </div>
   <script src="/app.js" defer></script>
 </body>
 </html>

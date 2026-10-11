@@ -180,6 +180,22 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 		}
 		writeJSON(w, http.StatusOK, checker.Status(time.Now().UTC()))
 	})
+	// Host switching (peers.go). GET /api/hosts lists this agent plus the
+	// peers it knows; ?refresh=1 asks for a rescan (rate-limited). The
+	// /api/hosts/{id}/... routes relay to a known peer by id; the address
+	// always comes from the registry. Only the control relay mutates
+	// anything, and it gets the same same-origin check here as /api/control.
+	mux.HandleFunc("GET /api/hosts", func(w http.ResponseWriter, r *http.Request) {
+		registry := state.PeerRegistry()
+		if registry == nil {
+			writeJSON(w, http.StatusOK, localOnlyHostsResponse(false))
+			return
+		}
+		writeJSON(w, http.StatusOK, registry.Hosts(r.Context(), r.URL.Query().Get("refresh") == "1"))
+	})
+	mux.HandleFunc("GET /api/hosts/{id}/stream", withPeerRegistry(state, (*peerRegistry).serveRelayStream))
+	mux.HandleFunc("GET /api/hosts/{id}/{route}", withPeerRegistry(state, (*peerRegistry).serveRelayRead))
+	mux.HandleFunc("POST /api/hosts/{id}/control", withPeerRegistry(state, (*peerRegistry).serveRelayControl))
 	mux.HandleFunc("GET /api/settings", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, state.GetSettings())
 	})
@@ -338,6 +354,17 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 	})
 	mux.Handle("GET /", staticAssetHandler(staticSub))
 	return securityHeaders(mux), nil
+}
+
+func withPeerRegistry(state *RuntimeState, handle func(*peerRegistry, http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		registry := state.PeerRegistry()
+		if registry == nil {
+			writeUnknownHost(w)
+			return
+		}
+		handle(registry, w, r)
+	}
 }
 
 func staticAssetHandler(static fs.FS) http.Handler {

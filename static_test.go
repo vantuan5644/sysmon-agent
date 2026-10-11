@@ -132,7 +132,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v152"`,
+		`const STATIC_CACHE = "sysmon-static-v153"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -408,12 +408,15 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 5000;`,
-		`const dashboardBuild = "sysmon-static-v152";`,
+		`const dashboardBuild = "sysmon-static-v153";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
-		`fetchWithTimeout("/api/metrics", { cache: "no-store" }, metricsTimeoutMS)`,
-		`fetchWithTimeout("/api/status", { cache: "no-store" }, auxiliaryTimeoutMS)`,
+		`fetchWithTimeout(hostAPIPath("metrics"), { cache: "no-store" }, metricsTimeoutMS)`,
+		`fetchWithTimeout(hostAPIPath("status"), { cache: "no-store" }, auxiliaryTimeoutMS)`,
+		// Host-scoped routes go through hostAPIPath; for the local host it must
+		// still resolve to the plain /api/<route> the agent has always served.
+		"return state.hostID ? `/api/hosts/${encodeURIComponent(state.hostID)}/${route}` : `/api/${route}`;",
 		`fetchWithTimeout("/api/settings", { cache: "no-store" }, auxiliaryTimeoutMS)`,
 		`settingsInFlight: false,`,
 		`if (status?.settings && !state.settingsInFlight) {`,
@@ -1066,7 +1069,7 @@ func TestDashboardHostControlButtons(t *testing.T) {
 		`button.addEventListener("click", () => sendControl(action, button));`,
 		`async function sendControl(action, button) {`,
 		`fetchWithTimeout(`,
-		`"/api/control",`,
+		`hostAPIPath("control"),`,
 		`body: JSON.stringify({ action }),`,
 		`function applyControlCapabilities(controls) {`,
 		`button.disabled = !available.has(action);`,
@@ -1323,7 +1326,7 @@ func TestAIUsagePageHasBothProvidersAndTokenCharts(t *testing.T) {
 	}
 	for _, needle := range []string{
 		`fetchCodexUsage();`,
-		`fetchWithTimeout("/api/codex-usage"`,
+		`fetchWithTimeout(hostAPIPath("codex-usage")`,
 		`function renderTokenChart(`,
 		`payload.token_days`,
 		`fetchQuota();`,

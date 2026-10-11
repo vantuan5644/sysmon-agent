@@ -130,6 +130,7 @@ type RuntimeState struct {
 	updateChecker *UpdateChecker
 	quotaChecker  *QuotaChecker
 	codexChecker  *CodexUsageChecker
+	peers         *peerRegistry
 }
 
 func NewRuntimeState(settingsPath string) (*RuntimeState, error) {
@@ -227,6 +228,22 @@ func (s *RuntimeState) CodexUsageChecker() *CodexUsageChecker {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.codexChecker
+}
+
+// SetPeerRegistry wires the host list and relay behind /api/hosts. Set once
+// at startup in main.go; a bare state (unit tests) leaves it nil, and the
+// dashboard then lists only this host.
+func (s *RuntimeState) SetPeerRegistry(registry *peerRegistry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.peers = registry
+}
+
+// PeerRegistry returns the wired registry, or nil in bare test states.
+func (s *RuntimeState) PeerRegistry() *peerRegistry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.peers
 }
 
 func (s *RuntimeState) GetClientCheck() ClientCheck {

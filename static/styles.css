@@ -297,6 +297,299 @@ h2 {
   outline-offset: 2px;
 }
 
+/* Host switch. The identity block (name + platform) doubles as the button
+   that opens the host picker: it is where anyone looks to see which machine
+   this is, and it costs no header space. Like the alerts chip it sits above
+   the full-header refresh button. While there is nowhere to switch to, the
+   button is hidden and a tap on the name refreshes, as it always has. */
+.topbar-id {
+  position: relative;
+}
+
+.host-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.host-switch-chevron {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+/* Same trap as `.alerts-chip`: a class that sets `display` outranks the UA
+   `[hidden]` rule. */
+.host-switch-chevron[hidden] {
+  display: none;
+}
+
+.host-switch {
+  position: absolute;
+  inset: -4px -6px;
+  z-index: 2;
+  border: 0;
+  border-radius: 8px;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.host-switch:hover {
+  background: rgb(82 199 255 / 6%);
+}
+
+.host-switch:active {
+  background: rgb(82 199 255 / 12%);
+}
+
+.host-switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
+}
+
+/* Viewing a peer. The control row acts on that host, so the name, the
+   chevron and the control panel take the accent; the eyebrow also says
+   "via <agent>" in words (app.js), so colour is never the only cue. */
+body.host-remote #hostname,
+body.host-remote .host-switch-chevron {
+  color: var(--accent);
+}
+
+body.host-remote .host-controls {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+/* Host picker: a bottom sheet, the iOS idiom for choosing from a short list,
+   kept within thumb reach. Rows are 56px tall (44px minimum touch target);
+   offline is spelled out in each row and drawn as a hollow dot, so it never
+   rests on colour alone. Dismiss with x, a tap on the scrim, or Escape. */
+.host-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.host-sheet[hidden] {
+  display: none;
+}
+
+.host-sheet-scrim {
+  position: absolute;
+  inset: 0;
+  background: rgb(0 0 0 / 60%);
+}
+
+.host-sheet-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(100%, 520px);
+  max-height: min(78svh, 640px);
+  padding:
+    12px
+    calc(14px + env(safe-area-inset-right))
+    calc(14px + env(safe-area-inset-bottom))
+    calc(14px + env(safe-area-inset-left));
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  border-radius: 16px 16px 0 0;
+  background: var(--panel-strong);
+  box-shadow: 0 -12px 40px rgb(0 0 0 / 45%);
+  animation: host-sheet-in 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@keyframes host-sheet-in {
+  from {
+    transform: translateY(24px);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .host-sheet-panel {
+    animation: none;
+  }
+}
+
+/* A phone on its side has ~390px of height: let the sheet use nearly all of
+   it, or only two rows fit. */
+@media (orientation: landscape) and (max-height: 500px) {
+  .host-sheet-panel {
+    max-height: 94svh;
+  }
+}
+
+.host-sheet-head,
+.host-sheet-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.host-sheet-head h2 {
+  font-size: 1rem;
+}
+
+.host-sheet-summary,
+.host-discovery-note {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.host-sheet-close {
+  width: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  font-size: 1.3rem;
+  font-weight: 500;
+}
+
+.host-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.host-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  column-gap: 10px;
+  width: 100%;
+  min-height: 56px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--control-surface);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.host-row:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+}
+
+.host-row:active {
+  background: #153247;
+}
+
+.host-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.host-row.current {
+  border-color: var(--accent);
+  background: #12283a;
+}
+
+.host-row.offline .host-row-name {
+  color: var(--muted);
+}
+
+.host-row-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.host-row-dot.ok {
+  background: var(--good);
+  box-shadow: 0 0 10px rgb(70 213 138 / 55%);
+}
+
+.host-row-dot.bad {
+  border: 1.5px solid var(--muted);
+}
+
+.host-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.host-row-name,
+.host-row-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.host-row-name {
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.host-row-detail {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.host-row-badge {
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.host-row-check {
+  width: 18px;
+  height: 18px;
+  color: var(--accent);
+}
+
+.host-empty {
+  margin: 4px 2px 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.host-rescan {
+  min-height: 44px;
+  padding: 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--control-surface);
+  color: var(--text);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.host-rescan:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.host-rescan:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .status-strip {
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr);

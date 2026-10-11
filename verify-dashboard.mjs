@@ -502,7 +502,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v152",
+    dashboard_build: "sysmon-static-v153",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -520,7 +520,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v152",
+    dashboard_build: "sysmon-static-v153",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1004,7 +1004,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v152, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v153, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1052,7 +1052,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v152; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v153; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1062,7 +1062,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v152",
+    dashboard_build: "sysmon-static-v153",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1072,7 +1072,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v152",
+    dashboard_build: "sysmon-static-v153",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1207,7 +1207,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v152", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v153", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -2541,5 +2541,157 @@ assert(document.getElementById("micCtl").classList.contains("device-on"), "unmut
 assert(document.getElementById("micCtl").getAttribute("aria-label").includes("unmuted; usage unknown"), "compact labels lost accessible meaning");
 assert(document.getElementById("micCtlUsage").textContent === "—", "unmute changed usage");
 assert(!document.getElementById("micCtl").classList.contains("activity-active"), "older host retained mic animation");
+
+// --- Host switching -----------------------------------------------------------
+// The app stays on the agent that served it and views other hosts through that
+// agent's relay. A switch must send every host-scoped request through
+// /api/hosts/<id>/..., keep display settings local, blank the previous host's
+// numbers at once, and never let a response from the previous host paint over
+// the new one.
+{
+  const requested = [];
+  let localMetricsHold = null;
+  let lastControlPath = "";
+  const peerMetrics = { ...sampleMetrics(), hostname: "peerbox" };
+  // v99 is the allowlisted stale-build fixture: a peer on another build is
+  // normal and must not be taken for a stale shell of this app.
+  const peerStatus = {
+    ...sampleStatus(),
+    dashboard_build: "sysmon-static-v99",
+    controls: [{ action: "lock_screen", available: true }],
+    settings: { ...settings, thresholds: { ...defaultThresholds, cpu_warn: 90 } },
+  };
+  const hostsPayload = {
+    hosts: [
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v153" },
+      { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
+      { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
+    ],
+    discovery: { enabled: true, available: true, scanning: false, scanned_at: new Date().toISOString() },
+  };
+  context.fetch = async (path, options = {}) => {
+    requested.push(path);
+    if (path === "/api/hosts" || path === "/api/hosts?refresh=1") {
+      return response(hostsPayload);
+    }
+    if (path === "/api/metrics") {
+      return localMetricsHold ? localMetricsHold.promise : response(sampleMetrics());
+    }
+    if (path === "/api/status") {
+      return response(sampleStatus());
+    }
+    if (path === "/api/hosts/peer/metrics") {
+      return response(peerMetrics);
+    }
+    if (path === "/api/hosts/peer/status") {
+      return response(peerStatus);
+    }
+    if (path === "/api/hosts/peer/control" && options.method === "POST") {
+      lastControlPath = path;
+      return response({ action: "lock_screen", available: true, applied: true });
+    }
+    if (path === "/api/settings") {
+      return response(settings);
+    }
+    if (path === "/api/client-check" && options.method === "POST") {
+      return response({ seen: true });
+    }
+    return response({ error: "not found" }, 404);
+  };
+  const hostRows = () => document.getElementById("hostList").children.filter((child) => child.className?.startsWith("host-row"));
+  const rowDetail = (row) => row.children[1].children[1].textContent;
+  const intervalsBefore = context.totalIntervalCount();
+  const reloadsBefore = context.reloadCount();
+
+  const switchButton = document.getElementById("hostSwitch");
+  await context.fetchHosts();
+  assert(switchButton.hidden === false, "host switch stayed hidden with peers listed");
+  assert(document.getElementById("hostSwitchChevron").hidden === false, "host switch chevron stayed hidden");
+
+  await switchButton.click();
+  await flushMicrotasks();
+  assert(document.getElementById("hostSheet").hidden === false, "host sheet did not open");
+  assert(document.getElementById("shell").inert === true, "the page behind the host sheet stayed interactive");
+  assert(switchButton.getAttribute("aria-expanded") === "true", "host switch did not report the sheet open");
+  assert(requested.includes("/api/hosts?refresh=1"), "opening the host sheet did not ask for a rescan");
+  let rows = hostRows();
+  assert(rows.length === 3, `host sheet rendered ${rows.length} rows, want 3`);
+  assert(rows[0].getAttribute("aria-current") === "true", "the viewed (local) host was not marked current");
+  assert(rowDetail(rows[0]).includes("serves this app"), "local host row did not say it serves the app");
+  assert(rowDetail(rows[1]).includes("build v99"), "peer row did not show its different build");
+  assert(rowDetail(rows[2]).startsWith("Offline"), "offline host was not stated in words");
+  assert(document.getElementById("hostSheetSummary").textContent === "1/2 online", "host sheet summary miscounted peers");
+
+  // A local metrics response still in flight when the switch happens must be
+  // dropped before it can paint under the new host's name.
+  localMetricsHold = deferredResponse(sampleMetrics());
+  context.fetchMetrics();
+  requested.length = 0;
+  await rows[1].click();
+  assert(document.getElementById("hostSheet").hidden === true, "picking a host did not close the sheet");
+  assert(document.getElementById("shell").inert === false, "closing the host sheet left the page inert");
+  assert(document.getElementById("cpuValue").textContent === "--", "previous host's CPU stayed on screen after the switch");
+  assert(document.getElementById("hostname").textContent === "peer", "the switch did not name the new host at once");
+  assert(document.body.classList.contains("host-remote"), "viewing a peer did not mark the page remote");
+  assert(localStorageValues.get("sysmon:host") === "peer", "the selected host was not remembered");
+  await flushMicrotasks();
+  assert(requested.includes("/api/hosts/peer/metrics"), "peer metrics were not fetched through the relay");
+  assert(requested.includes("/api/hosts/peer/status"), "peer status was not fetched through the relay");
+  assert(!requested.includes("/api/metrics") && !requested.includes("/api/status"), "the switch still asked the local agent for host data");
+  assert(document.getElementById("hostname").textContent === "peerbox", "peer metrics did not render");
+  assert(document.getElementById("platform").textContent.startsWith("via labbox"), "remote view did not say which agent relays it");
+  localMetricsHold.resolve();
+  await flushMicrotasks();
+  assert(document.getElementById("hostname").textContent === "peerbox", "a stale local response painted over the peer");
+  localMetricsHold = null;
+
+  assert(context.reloadCount() === reloadsBefore, "a peer on another build triggered a shell reload");
+  assert(!document.getElementById("issuesList").textContent.includes("dashboard build stale"), "a peer's build was reported as a stale shell");
+  assert(context.thresholdValue("cpu_warn") === 90, "the peer's own warn threshold was not applied");
+  assert(document.getElementById("lockCtl").disabled === false, "the peer's lock capability was not applied");
+  assert(document.getElementById("micCtl").disabled === true, "a control the peer did not report stayed enabled");
+  assert(document.getElementById("agentMeta").textContent.includes("via labbox"), "status meta did not name the relaying agent");
+
+  const lock = document.getElementById("lockCtl");
+  await lock.click();
+  assert(document.getElementById("statusText").textContent === "Tap again to lock peer", "lock confirm did not name the peer it would lock");
+  await lock.click();
+  await flushMicrotasks();
+  assert(lastControlPath === "/api/hosts/peer/control", "lock did not go through the relay");
+
+  // Dim describes this display, so it stays with the local agent.
+  requested.length = 0;
+  await document.getElementById("dimBtn").click();
+  await flushMicrotasks();
+  assert(requested.includes("/api/settings"), "dim did not post to the local agent");
+  assert(!requested.some((path) => path.startsWith("/api/hosts/peer/settings")), "dim was relayed to the peer");
+  assert(context.thresholdValue("cpu_warn") === 90, "a local settings write replaced the peer's thresholds");
+
+  requested.length = 0;
+  context.selectHost("local");
+  await flushMicrotasks();
+  assert(!document.body.classList.contains("host-remote"), "switching back left the page marked remote");
+  assert(localStorageValues.get("sysmon:host") === "local", "switching back was not remembered");
+  assert(requested.includes("/api/metrics") && requested.includes("/api/status"), "switching back did not fetch from the local agent");
+  assert(document.getElementById("hostname").textContent === "labbox", "local metrics did not render after switching back");
+  assert(context.thresholdValue("cpu_warn") === (settings.thresholds?.cpu_warn ?? 70), "the peer's threshold leaked back onto the local host");
+
+  // A remembered host the agent stops listing falls back to the local host.
+  context.selectHost("peer");
+  await flushMicrotasks();
+  hostsPayload.hosts = hostsPayload.hosts.filter((host) => host.id !== "peer");
+  await context.fetchHosts();
+  await flushMicrotasks();
+  assert(localStorageValues.get("sysmon:host") === "local", "a host the agent stopped listing stayed selected");
+  assert(!document.body.classList.contains("host-remote"), "falling back left the page marked remote");
+
+  await switchButton.click();
+  await flushMicrotasks();
+  for (const callback of document.listeners.keydown || []) {
+    callback({ key: "Escape", preventDefault() {} });
+  }
+  assert(document.getElementById("hostSheet").hidden === true, "Escape did not close the host sheet");
+  assert(context.totalIntervalCount() === intervalsBefore, "host switching changed the interval inventory");
+}
 
 console.log("ok: dashboard runtime smoke test passed");
