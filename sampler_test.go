@@ -282,3 +282,27 @@ func TestSamplerSlowLaneParksWithoutDemandAndResumes(t *testing.T) {
 		return atomic.LoadInt64(&lane.slow) >= 2
 	})
 }
+
+// After a toggle the dashboard waits for the stream to confirm the new state,
+// so the device loop must publish it without waiting out its 2 s interval.
+func TestDeviceLoopPublishesAToggleWithoutWaitingOutTheInterval(t *testing.T) {
+	backend := &muteBackend{microphone: "unmuted", speaker: "unmuted"}
+	s := newSampler(&fakeLaneCollector{hostname: "test-host"}, 0, 0)
+	s.fastEvery = 20 * time.Millisecond
+	s.devices = newDeviceManager(filepath.Join(t.TempDir(), "settings.json"), backend)
+	_, unsubscribe := s.Subscribe()
+	defer unsubscribe()
+	s.Start()
+	defer s.Stop()
+	micState := func() string {
+		current, _ := s.Collect(context.Background())
+		if current.DeviceActivity == nil {
+			return ""
+		}
+		return current.DeviceActivity.MicrophoneMute.State
+	}
+	waitForCond(t, 2*time.Second, func() bool { return micState() == "unmuted" })
+	// The loop has just sampled and is now in its 2 s sleep.
+	deviceController{SystemController: muteToggleController{backend: backend}, devices: s.devices}.Apply(context.Background(), ControlMicMute)
+	waitForCond(t, time.Second, func() bool { return micState() == "muted" })
+}

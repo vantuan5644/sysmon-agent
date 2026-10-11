@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeDeviceBackend struct {
@@ -158,5 +159,101 @@ func TestCameraAlreadyDisabledDoesNotEnableUnownedDevices(t *testing.T) {
 	d.Apply(context.Background())
 	if backend.calls != 0 || backend.devices[0].Enabled {
 		t.Fatal("enabled unowned camera")
+	}
+}
+
+// muteBackend also reports mute state, which tests change the way a toggle or
+// a keyboard mute key would.
+type muteBackend struct {
+	fakeDeviceBackend
+	mu         sync.Mutex
+	microphone string
+	speaker    string
+}
+
+func (m *muteBackend) AudioMute(context.Context) (AudioMuteState, AudioMuteState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return AudioMuteState{State: m.microphone, ObservedAt: time.Now().UTC()}, AudioMuteState{State: m.speaker, ObservedAt: time.Now().UTC()}
+}
+
+func (m *muteBackend) setMicrophone(state string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.microphone = state
+}
+
+// muteToggleController mutes the backend's microphone like the real mic_mute.
+type muteToggleController struct{ backend *muteBackend }
+
+func (muteToggleController) Capabilities() []ControlCapability {
+	return capabilitiesFor(func(ControlAction) bool { return true })
+}
+
+func (c muteToggleController) Apply(_ context.Context, action ControlAction) ControlResult {
+	if action == ControlMicMute {
+		c.backend.setMicrophone("muted")
+	}
+	return ControlResult{Action: action, Available: true, Applied: true, State: "muted"}
+}
+
+func woke(d *deviceManager) bool {
+	select {
+	case <-d.wake:
+		return true
+	default:
+		return false
+	}
+}
+
+func TestDeviceSampleReportsMuteStateAndResamplesAfterAToggle(t *testing.T) {
+	ctx := context.Background()
+	backend := &muteBackend{microphone: "unmuted", speaker: "muted"}
+	d := newDeviceManager(filepath.Join(t.TempDir(), "settings.json"), backend)
+	first := d.sample(ctx)
+	if first.MicrophoneMute.State != "unmuted" || first.SpeakerMute.State != "muted" {
+		t.Fatalf("mute state not sampled: mic=%+v speaker=%+v", first.MicrophoneMute, first.SpeakerMute)
+	}
+	controller := deviceController{SystemController: muteToggleController{backend: backend}, devices: d}
+	controller.Apply(ctx, ControlMediaToggle)
+	if woke(d) {
+		t.Fatal("a control that changes no reported state woke the device loop")
+	}
+	controller.Apply(ctx, ControlMicMute)
+	if !woke(d) {
+		t.Fatal("a mute toggle did not wake the device loop")
+	}
+	// Inside the 2 s reuse window, only the requested refresh makes this read
+	// the host again.
+	if after := d.sample(ctx); after.MicrophoneMute.State != "muted" {
+		t.Fatalf("the sample after a toggle reused the pre-toggle reading: %+v", after.MicrophoneMute)
+	}
+	backend.setMicrophone("unmuted")
+	if cached := d.sample(ctx); cached.MicrophoneMute.State != "muted" {
+		t.Fatalf("an unrequested sample skipped the reuse window: %+v", cached.MicrophoneMute)
+	}
+}
+
+func TestCameraToggleRequestsAResample(t *testing.T) {
+	d := newDeviceManager(filepath.Join(t.TempDir(), "settings.json"), &fakeDeviceBackend{devices: []cameraDevice{testCamera("a", true)}})
+	d.sample(context.Background())
+	if r := d.Apply(context.Background()); !r.Applied {
+		t.Fatalf("disable: %+v", r)
+	}
+	if !woke(d) || !d.refresh.Load() {
+		t.Fatal("a camera toggle did not request a fresh sample")
+	}
+}
+
+func TestMuteStateIsUnknownWithoutAReader(t *testing.T) {
+	d := newDeviceManager(filepath.Join(t.TempDir(), "settings.json"), &fakeDeviceBackend{})
+	if warming := d.snapshot(); warming.MicrophoneMute.State != "unknown" || warming.SpeakerMute.Error == "" {
+		t.Fatalf("warming snapshot claims a mute state: %+v %+v", warming.MicrophoneMute, warming.SpeakerMute)
+	}
+	sampled := d.sample(context.Background())
+	for _, state := range []AudioMuteState{sampled.MicrophoneMute, sampled.SpeakerMute} {
+		if state.State != "unknown" || state.Error == "" || state.ObservedAt.IsZero() {
+			t.Fatalf("backend without a mute reader reported %+v", state)
+		}
 	}
 }

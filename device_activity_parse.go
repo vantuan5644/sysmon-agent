@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 func parsePulseActivity(outputs, sources []byte) (bool, error) {
@@ -88,4 +89,47 @@ func parsePipewireActivity(data []byte) (bool, bool, error) {
 		}
 	}
 	return mic, camera, nil
+}
+
+// parseWpctlMute reads `wpctl get-volume` output: "Volume: 0.40", with
+// " [MUTED]" appended when the node is muted.
+func parseWpctlMute(out string) (muted bool, ok bool) {
+	text := strings.TrimSpace(out)
+	if !strings.HasPrefix(text, "Volume:") {
+		return false, false
+	}
+	return strings.Contains(text, "[MUTED]"), true
+}
+
+// pulseMonitorSource reports whether a PulseAudio/PipeWire source is the
+// ".monitor" loopback of a playback device. The mic toggle leaves those
+// alone (parsePactlCaptureSources), so the mute reading skips them too.
+func pulseMonitorSource(name string) bool {
+	return strings.HasSuffix(name, ".monitor")
+}
+
+// parsePactlSourceMutes counts muted and unmuted microphones in
+// `pactl --format=json list sources`: every source the mic toggle changes.
+func parsePactlSourceMutes(data []byte) (muted, unmuted int, err error) {
+	var sources []struct {
+		Name string `json:"name"`
+		Mute *bool  `json:"mute"`
+	}
+	if err := json.Unmarshal(data, &sources); err != nil {
+		return 0, 0, err
+	}
+	for _, source := range sources {
+		if pulseMonitorSource(source.Name) {
+			continue
+		}
+		if source.Mute == nil {
+			return 0, 0, fmt.Errorf("source %s reports no mute state", source.Name)
+		}
+		if *source.Mute {
+			muted++
+		} else {
+			unmuted++
+		}
+	}
+	return muted, unmuted, nil
 }

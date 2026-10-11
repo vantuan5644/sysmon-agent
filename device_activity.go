@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,9 +22,54 @@ type DeviceActivity struct {
 }
 
 type DeviceActivitySet struct {
-	Microphone    DeviceActivity     `json:"microphone"`
-	Camera        DeviceActivity     `json:"camera"`
-	CameraControl CameraControlState `json:"camera_control"`
+	Microphone     DeviceActivity     `json:"microphone"`
+	Camera         DeviceActivity     `json:"camera"`
+	CameraControl  CameraControlState `json:"camera_control"`
+	MicrophoneMute AudioMuteState     `json:"microphone_mute"`
+	SpeakerMute    AudioMuteState     `json:"speaker_mute"`
+}
+
+// AudioMuteState is the host's current mute setting for what the mic_mute and
+// volume_mute toggles act on: every active microphone, and the default
+// speaker. It is read on each device sample so the dashboard shows the state
+// even when it changed outside Sysmon (a keyboard key, the OS mixer).
+type AudioMuteState struct {
+	State      string    `json:"state"` // muted, unmuted, mixed, unknown
+	ObservedAt time.Time `json:"observed_at"`
+	Error      string    `json:"error,omitempty"`
+}
+
+// audioMuteReader is implemented by backends that can read mute state.
+type audioMuteReader interface {
+	AudioMute(context.Context) (microphone, speaker AudioMuteState)
+}
+
+func unknownAudioMute(reason string) AudioMuteState {
+	return AudioMuteState{State: "unknown", ObservedAt: time.Now().UTC(), Error: reason}
+}
+
+func observedAudioMute(muted bool) AudioMuteState {
+	state := "unmuted"
+	if muted {
+		state = "muted"
+	}
+	return AudioMuteState{State: state, ObservedAt: time.Now().UTC()}
+}
+
+// aggregateAudioMute combines the endpoints a toggle acts on into one state.
+func aggregateAudioMute(muted, unmuted, failed int, none string) AudioMuteState {
+	switch {
+	case failed > 0:
+		return unknownAudioMute(fmt.Sprintf("mute state unreadable for %d of %d devices", failed, muted+unmuted+failed))
+	case muted > 0 && unmuted > 0:
+		return AudioMuteState{State: "mixed", ObservedAt: time.Now().UTC()}
+	case muted > 0:
+		return observedAudioMute(true)
+	case unmuted > 0:
+		return observedAudioMute(false)
+	default:
+		return unknownAudioMute(none)
+	}
 }
 
 type CameraControlState struct {
@@ -59,11 +105,18 @@ type deviceManager struct {
 	journalErr  error
 	latest      DeviceActivitySet
 	lastSample  time.Time
+	// refresh makes the next sample bypass the 2 s reuse window, and wake
+	// starts that sample now: after a toggle the dashboard waits on the stream
+	// to confirm the new state, so it must not wait out the loop's sleep.
+	refresh atomic.Bool
+	wake    chan struct{}
 }
 
 func newDeviceManager(settingsPath string, backend deviceBackend) *deviceManager {
-	d := &deviceManager{backend: backend}
+	d := &deviceManager{backend: backend, wake: make(chan struct{}, 1)}
 	d.latest.CameraControl = CameraControlState{State: "unavailable", Error: "camera discovery is warming up"}
+	d.latest.MicrophoneMute = unknownAudioMute("mute state is warming up")
+	d.latest.SpeakerMute = unknownAudioMute("mute state is warming up")
 	if settingsPath == "" {
 		d.journalErr = errors.New("camera control requires a persistent -settings path")
 		return d
@@ -95,14 +148,30 @@ func observedDeviceActivity(active bool, coverage string) DeviceActivity {
 	return DeviceActivity{State: state, Coverage: coverage, ObservedAt: time.Now().UTC()}
 }
 
+// requestRefresh asks the device loop for a fresh sample right away. It never
+// blocks: Apply calls it while holding d.mu.
+func (d *deviceManager) requestRefresh() {
+	d.refresh.Store(true)
+	select {
+	case d.wake <- struct{}{}:
+	default:
+	}
+}
+
 func (d *deviceManager) sample(ctx context.Context) DeviceActivitySet {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if time.Since(d.lastSample) < 2*time.Second {
+	if !d.refresh.Swap(false) && time.Since(d.lastSample) < 2*time.Second {
 		return d.snapshot()
 	}
 	latest := d.snapshot()
 	latest.Microphone, latest.Camera = d.backend.Activity(ctx)
+	if reader, ok := d.backend.(audioMuteReader); ok {
+		latest.MicrophoneMute, latest.SpeakerMute = reader.AudioMute(ctx)
+	} else {
+		latest.MicrophoneMute = unknownAudioMute("mute state is unavailable on this platform")
+		latest.SpeakerMute = latest.MicrophoneMute
+	}
 	devices, unsupported, err := d.backend.Cameras(ctx)
 	latest.CameraControl = d.cameraState(devices, unsupported, err)
 	d.cacheMu.Lock()
@@ -287,7 +356,7 @@ func (d *deviceManager) Apply(ctx context.Context) ControlResult {
 	d.cacheMu.Lock()
 	d.latest.CameraControl = control
 	d.cacheMu.Unlock()
-	d.lastSample = time.Time{} // Next slow pass refreshes activity after a toggle.
+	d.requestRefresh() // Publish the toggled state and its activity at once.
 	r.State = control.State
 	r.CameraControl = &control
 	if err != nil {
@@ -326,5 +395,10 @@ func (c deviceController) Apply(ctx context.Context, action ControlAction) Contr
 	if action == ControlCameraToggle {
 		return c.devices.Apply(ctx)
 	}
-	return c.SystemController.Apply(ctx, action)
+	result := c.SystemController.Apply(ctx, action)
+	if action == ControlMicMute || action == ControlVolumeMute {
+		// Even a failed toggle may have changed some devices; resample either way.
+		c.devices.requestRefresh()
+	}
+	return result
 }

@@ -251,6 +251,95 @@ func windowsMicActivity() DeviceActivity {
 	return observedDeviceActivity(active, "Windows Core Audio capture sessions")
 }
 
+var audioEndpointVolumeIID = windowsGUID{Data1: 0x5cdf2c82, Data2: 0x841e, Data3: 0x4546, Data4: [8]byte{0x97, 0x22, 0x0c, 0xf7, 0x40, 0x78, 0x22, 0x9a}}
+
+// windowsEndpointMuted reads IAudioEndpointVolume::GetMute (vtable slot 15)
+// for one IMMDevice. Endpoint mute is a machine-wide device property, so the
+// LocalSystem service reads the same value the user's mixer shows.
+func windowsEndpointMuted(device uintptr) (muted, ok bool) {
+	var volume uintptr
+	if deviceCOMFailed(deviceCOMCall(device, 3, uintptr(unsafe.Pointer(&audioEndpointVolumeIID)), 23, 0, uintptr(unsafe.Pointer(&volume)))) {
+		return false, false
+	}
+	defer deviceCOMCall(volume, 2)
+	var value int32 // BOOL
+	if deviceCOMFailed(deviceCOMCall(volume, 15, uintptr(unsafe.Pointer(&value)))) {
+		return false, false
+	}
+	return value != 0, true
+}
+
+// windowsAudioMute reads what control-bridge.ps1 toggles: mic_mute sets every
+// active capture endpoint, volume_mute the default multimedia render endpoint.
+// It is read-only and runs no interpreter.
+func windowsAudioMute() (AudioMuteState, AudioMuteState) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	hr, _, _ := deviceCoInitialize.Call(0, 0)
+	if deviceCOMFailed(hr) {
+		failed := unknownAudioMute("Core Audio COM initialization failed")
+		return failed, failed
+	}
+	defer deviceCoUninitialize.Call()
+	clsid := windowsGUID{Data1: 0xbcde0395, Data2: 0xe52f, Data3: 0x467c, Data4: [8]byte{0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}}
+	iid := windowsGUID{Data1: 0xa95664d2, Data2: 0x9614, Data3: 0x4f35, Data4: [8]byte{0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6}}
+	var enumerator uintptr
+	hr, _, _ = deviceCoCreate.Call(uintptr(unsafe.Pointer(&clsid)), 0, 23, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&enumerator)))
+	if deviceCOMFailed(hr) {
+		failed := unknownAudioMute("Core Audio device enumeration unavailable")
+		return failed, failed
+	}
+	defer deviceCOMCall(enumerator, 2)
+
+	microphone := unknownAudioMute("capture endpoints unavailable")
+	var collection uintptr
+	if !deviceCOMFailed(deviceCOMCall(enumerator, 3, 1, 1, uintptr(unsafe.Pointer(&collection)))) { // eCapture, DEVICE_STATE_ACTIVE
+		var count uint32
+		if !deviceCOMFailed(deviceCOMCall(collection, 3, uintptr(unsafe.Pointer(&count)))) {
+			muted, unmuted, failed := 0, 0, 0
+			for i := uint32(0); i < count; i++ {
+				var endpoint uintptr
+				if deviceCOMFailed(deviceCOMCall(collection, 4, uintptr(i), uintptr(unsafe.Pointer(&endpoint)))) {
+					failed++
+					continue
+				}
+				value, ok := windowsEndpointMuted(endpoint)
+				deviceCOMCall(endpoint, 2)
+				switch {
+				case !ok:
+					failed++
+				case value:
+					muted++
+				default:
+					unmuted++
+				}
+			}
+			microphone = aggregateAudioMute(muted, unmuted, failed, "no active microphones")
+		}
+		deviceCOMCall(collection, 2)
+	}
+
+	speaker := unknownAudioMute("no default playback device")
+	var endpoint uintptr
+	if !deviceCOMFailed(deviceCOMCall(enumerator, 4, 0, 1, uintptr(unsafe.Pointer(&endpoint)))) { // eRender, eMultimedia
+		if value, ok := windowsEndpointMuted(endpoint); ok {
+			speaker = observedAudioMute(value)
+		} else {
+			speaker = unknownAudioMute("playback mute state unreadable")
+		}
+		deviceCOMCall(endpoint, 2)
+	}
+	return microphone, speaker
+}
+
+func (windowsDeviceBackend) AudioMute(ctx context.Context) (AudioMuteState, AudioMuteState) {
+	if err := ctx.Err(); err != nil {
+		failed := unknownAudioMute(err.Error())
+		return failed, failed
+	}
+	return windowsAudioMute()
+}
+
 func registryDeviceChildren(key syscall.Handle) ([]string, error) {
 	var names []string
 	for i := uint32(0); ; i++ {
