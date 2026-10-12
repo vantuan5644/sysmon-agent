@@ -210,7 +210,10 @@ function sampleMetrics() {
     timestamp: new Date().toISOString(),
     collection_duration_ms: 142,
     cpu_name: "AMD Ryzen 9 7950X",
-    memory_name: "DDR5 · 6000 MT/s",
+    memory_name: "DDR5 · 5600 MT/s",
+    // Trained below its EXPO profile, so the RAM inner ring must be partial and
+    // amber: (5600 - 4800) / (6000 - 4800) of the JEDEC -> rated span.
+    memory_speed: { available: true, type: "DDR5", configured_mtps: 5600, jedec_mtps: 4800, rated_mtps: 6000, rated_profile: "EXPO" },
     cpu_percent: { available: true, value: 37, unit: "%" },
     cpu_power: { available: true, value: 88.5, unit: "W" },
     // AMD SMU per-rail breakdown. cpu_core_power is the cores-only rail AMD
@@ -226,6 +229,16 @@ function sampleMetrics() {
     cpu_cores: { available: true, cores: [95, 12, 88, 4, 70, 3, 2, 1], count: 8, busy: 2, busy_threshold: 80 },
     memory: { available: true, used_bytes: 8589934592, total_bytes: 17179869184, percent: 50 },
     memory_swap: { available: true, used_bytes: 2147483648, total_bytes: 8589934592, percent: 25 },
+    // A Linux host: PSI present, commit not meaningful (pressure.go).
+    memory_commit: { available: false, error: "Linux overcommits by default, so commit charge has no enforced limit; see pressure" },
+    pressure: {
+      available: true,
+      cpu_some: { available: true, value: 1.25, unit: "%" },
+      memory_some: { available: true, value: 0.4, unit: "%" },
+      memory_full: { available: true, value: 0, unit: "%" },
+      io_some: { available: true, value: 12, unit: "%" },
+      io_full: { available: true, value: 3.5, unit: "%" },
+    },
     disks: [{
       name: "root",
       mountpoint: "/",
@@ -242,6 +255,8 @@ function sampleMetrics() {
           mountpoints: ["/"],
           capacity: { available: true, used_bytes: 250, total_bytes: 1000, percent: 25 },
           temperature_celsius: { available: true, value: 46, unit: "C" },
+          read_bytes_per_second: { available: true, value: 2500000, unit: "B/s" },
+          write_bytes_per_second: { available: true, value: 125000, unit: "B/s" },
         },
         {
           name: "nvme2n1",
@@ -251,8 +266,21 @@ function sampleMetrics() {
           capacity: { available: false, error: "no mounted filesystems" },
           temperature_celsius: { available: true, value: 41, unit: "C" },
         },
+        {
+          name: "sdb",
+          model: "Realtek RTL9210 NVME",
+          size_bytes: 1000204886016,
+          mountpoints: ["/mnt/usb"],
+          capacity: { available: true, used_bytes: 100, total_bytes: 1000, percent: 10 },
+          temperature_celsius: { available: false, unit: "C", error: "USB enclosure: bridge does not expose live SMART temperature" },
+        },
       ],
     },
+    // Expected, permanent conditions the agent lists as notes, never as issues.
+    collection_notes: [
+      "storage CT4000T710SSD8 capacity: no mounted filesystems",
+      "storage Realtek RTL9210 NVME temperature: USB enclosure: bridge does not expose live SMART temperature",
+    ],
     network: {
       available: true,
       uplink: { available: true, kind: "wifi", name: "BiBi-Pro-Max" },
@@ -282,19 +310,32 @@ function sampleMetrics() {
         power_watts: { available: true, value: 112.0, unit: "W" },
         memory: { available: true, used_bytes: 2147483648, total_bytes: 8589934592, percent: 25 },
         temperature_celsius: { available: true, value: 49, unit: "C" },
+        engines: [
+          { name: "3D", usage_percent: { available: true, value: 22, unit: "%" } },
+          { name: "Video Encode", usage_percent: { available: true, value: 12, unit: "%" } },
+        ],
       }],
     },
     processes: {
       available: true,
       total: 87,
+      agent: {
+        available: true,
+        pid: 4242,
+        cpu_percent: { available: true, value: 0.21, unit: "%" },
+        cpu_cores: { available: true, value: 0.07, unit: "cores" },
+        memory_bytes: { available: true, value: 245366784, unit: "B" },
+        processes: 3,
+        members: [{ name: "sysmon-agent", count: 1 }, { name: "pwsh", count: 1 }, { name: "conhost", count: 1 }],
+      },
       apps: [
-        { name: "chrome", count: 3, cpu_percent: { available: true, value: 24, unit: "%" }, memory_bytes: { available: true, value: 1610612736, unit: "B" }, gpu_memory: { available: true, value: 536870912, unit: "B" }, disk_read: { available: true, value: 4096, unit: "B/s" }, disk_write: { available: false, unit: "B/s", error: "no process reported this field" } },
+        { name: "chrome", count: 3, members: [{ name: "chrome", count: 2 }, { name: "crashpad", count: 1 }], cpu_percent: { available: true, value: 24, unit: "%" }, memory_bytes: { available: true, value: 1610612736, unit: "B" }, gpu_memory: { available: true, value: 536870912, unit: "B" }, disk_read: { available: true, value: 4096, unit: "B/s" }, disk_write: { available: false, unit: "B/s", error: "no process reported this field" } },
         { name: "blender", count: 1, cpu_percent: { available: true, value: 60, unit: "%" }, memory_bytes: { available: true, value: 2147483648, unit: "B" }, gpu_memory: { available: true, value: 2147483648, unit: "B" }, disk_read: { available: false, unit: "B/s", error: "warming up" }, disk_write: { available: false, unit: "B/s", error: "warming up" } },
         { name: "systemd", count: 1, cpu_percent: { available: true, value: 1, unit: "%" }, memory_bytes: { available: true, value: 10485760, unit: "B" }, gpu_memory: { available: false, unit: "B", error: "not a CUDA/compute process" }, disk_read: { available: false, unit: "B/s", error: "insufficient privilege" }, disk_write: { available: false, unit: "B/s", error: "insufficient privilege" } },
       ],
       processes: [
-        { pid: 101, name: "chrome", cpu_percent: { available: true, value: 20, unit: "%" }, memory_bytes: { available: true, value: 805306368, unit: "B" }, gpu_memory: { available: true, value: 268435456, unit: "B" }, disk_read: { available: true, value: 2048, unit: "B/s" }, disk_write: { available: false, unit: "B/s", error: "warming up" } },
-        { pid: 202, name: "blender", cpu_percent: { available: true, value: 60, unit: "%" }, memory_bytes: { available: true, value: 2147483648, unit: "B" }, gpu_memory: { available: true, value: 2147483648, unit: "B" }, disk_read: { available: false, unit: "B/s", error: "warming up" }, disk_write: { available: false, unit: "B/s", error: "warming up" } },
+        { pid: 101, name: "chrome", ppid: 1, parent_name: "systemd", children: 2, launcher: "chrome", launcher_pid: 101, cpu_percent: { available: true, value: 20, unit: "%" }, memory_bytes: { available: true, value: 805306368, unit: "B" }, gpu_memory: { available: true, value: 268435456, unit: "B" }, disk_read: { available: true, value: 2048, unit: "B/s" }, disk_write: { available: false, unit: "B/s", error: "warming up" } },
+        { pid: 202, name: "blender", ppid: 150, parent_name: "zsh", children: 0, launcher: "kitty-session", launcher_pid: 140, cpu_percent: { available: true, value: 60, unit: "%" }, memory_bytes: { available: true, value: 2147483648, unit: "B" }, gpu_memory: { available: true, value: 2147483648, unit: "B" }, disk_read: { available: false, unit: "B/s", error: "warming up" }, disk_write: { available: false, unit: "B/s", error: "warming up" } },
       ],
     },
   };
@@ -502,7 +543,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v156",
+    dashboard_build: "sysmon-static-v165",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -520,7 +561,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v156",
+    dashboard_build: "sysmon-static-v165",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -664,6 +705,23 @@ const document = new Document(html);
 let settings = defaultSettings();
 let fakeNow = 1000;
 let metricsRequests = 0;
+let historyRequests = 0;
+// sampleHistory is an /api/history body aligned to the real clock the sample
+// metrics stamp themselves with: three closed 5 s buckets before the current
+// one, the oldest carrying a CPU spike and a GPU gap (slow lane parked).
+function sampleHistory() {
+  const now = Date.now();
+  const bucket = now - (now % 5000);
+  return {
+    step_seconds: 5,
+    retention_seconds: 900,
+    points: [
+      { t: bucket - 15000, cpu: 95, mem: 40, gpu: null, net_rx: 2048, net_tx: 10, disk: null },
+      { t: bucket - 10000, cpu: 20, mem: 41, gpu: 30, net_rx: 1024, net_tx: 10, disk: 1048576 },
+      { t: bucket - 5000, cpu: 18, mem: 42, gpu: 31, net_rx: 512, net_tx: 10, disk: 4096 },
+    ],
+  };
+}
 let statusRequests = 0;
 let quotaRequests = 0;
 // quotaMode steers the main fetch stub's /api/quota branch: "rows" (default,
@@ -784,6 +842,10 @@ const context = {
       statusRequests += 1;
       return response(sampleStatus());
     }
+    if (path === "/api/history") {
+      historyRequests += 1;
+      return response(sampleHistory());
+    }
     if (path === "/api/quota") {
       quotaRequests += 1;
       if (quotaMode === "404") {
@@ -855,6 +917,34 @@ await flushMicrotasks();
 const initialPassiveClientCheck = { ...lastClientCheck };
 const initialClientCheckRequestCount = clientCheckRequests;
 
+// History: the agent's buckets seed the card sparklines and the History panel
+// on the first paint, so a reopened app shows what happened while it was away.
+assert(historyRequests === 1, `initial load fetched /api/history ${historyRequests} times, want 1`);
+assert(document.getElementById("historyPanel").hidden === false, "history panel stayed hidden with agent history available");
+assert(document.getElementById("historySummary").textContent === "last 1 min · peaks", "history summary did not describe the covered window");
+{
+  const rows = document.getElementById("historyList").children;
+  assert(rows.length === 5, "history panel did not render one row per metric");
+  assert(rows[0].children[0].textContent === "CPU", "history panel first row is not CPU");
+  assert(rows[0].children[1].children.length === 90, "history strip did not render 90 slots");
+  assert(rows[0].children[2].textContent === "95%", "history panel did not report the CPU spike as the window peak");
+  assert(rows[3].children[2].textContent === "2.0K/s", "history panel did not report the network peak rate");
+  // DISK is log-scaled and never warning-coloured; its peak includes the live
+  // frame (2.5M/s + 125K/s on nvme0n1), which outranks the agent's buckets.
+  assert(rows[4].children[0].textContent === "DISK", "history panel last row is not DISK");
+  assert(rows[4].children[2].textContent === "2.6M/s", `history disk peak = ${rows[4].children[2].textContent}`);
+  const diskBars = rows[4].children[1].children;
+  const lastDisk = diskBars[diskBars.length - 1];
+  assert(lastDisk.style.values.get("--c") === "var(--accent)", "disk history bar was not drawn in the neutral accent colour");
+  // Bucket -15 s sits three slots before the newest, live one (four if the
+  // live frame crossed a 5 s boundary after the history was built), so find
+  // it by value and check its neighbours by position.
+  const seeded = sparklineBars("memTrend").findIndex((bar) => bar.style.values.get("--h") === "40%");
+  assert(seeded >= 19 && seeded <= 20, `memory sparkline was not seeded from agent history (slot ${seeded})`);
+  assert(sparklineBars("gpuTrend")[seeded].classList.contains("unavailable"), "a gap in agent history did not render as a muted bar");
+  assert(sparklineBars("gpuTrend")[seeded + 1].style.values.get("--h") === "30%", "GPU sparkline was not seeded from agent history");
+}
+
 assert(document.getElementById("hostname").textContent === "labbox", "hostname did not render");
 assert(document.getElementById("cpuValue").textContent === "37%", "CPU gauge did not render");
 assert(document.getElementById("cpuSub").textContent === "3.6/5.2GHz", "CPU gauge sub did not render live/boost clock pair");
@@ -866,7 +956,29 @@ assert(document.getElementById("cpuCores").children[0].textContent === "Busy Thr
 assert(document.getElementById("cpuCores").children[1].children.length === 8, "CPU core grid did not render one bar per core");
 assert(document.getElementById("memValue").textContent === "50%", "memory gauge did not render");
 assert(document.getElementById("memSub").textContent === "8.0/16G", "memory gauge sub did not render used/total");
-assert(document.getElementById("memDetail").textContent === "⇅ 2.0 GB swap", "memory card detail did not render live swap used");
+assert(!document.getElementById("memGauge").classList.contains("hide-inner"), "available RAM speed did not show the inner ring");
+assert(document.getElementById("memGauge").style.values.get("--inner-p") === String((5600 - 4800) / (6000 - 4800) * 100), "RAM speed inner ring did not scale JEDEC -> rated");
+assert(document.getElementById("memGauge").style.values.get("--inner-c") === "var(--warn)", "RAM running below its rated profile did not warn");
+assert(document.getElementById("memDetail").textContent === "⇅ 2.0 GB swap · stall 0.4%", "memory card detail did not render swap and memory pressure");
+assert(document.getElementById("memDetail").title === "Pressure stall, 10 s average. CPU: some 1.3%. Memory: some 0.4%, full 0.0%. IO: some 12%, full 3.5%.", `memory pressure title = ${document.getElementById("memDetail").title}`);
+{
+  // A Windows host: no PSI, so the card shows commit charge, and commit near
+  // its limit raises an alert.
+  const windowsHost = sampleMetrics();
+  windowsHost.pressure = { available: false, error: "Windows keeps no pressure stall accounting; see memory_commit" };
+  windowsHost.memory_commit = { available: true, used_bytes: 60129542144, total_bytes: 64424509440, percent: 93.33 };
+  context.render(windowsHost);
+  assert(document.getElementById("memDetail").textContent === "⇅ 2.0 GB swap · commit 93%", "memory card detail did not fall back to commit charge");
+  assert(document.getElementById("memDetail").title === "Committed 56 GB of the 60 GB commit limit (RAM plus page files)", `commit title = ${document.getElementById("memDetail").title}`);
+  assert(document.getElementById("alertsChip").hidden === false, "commit near its limit did not raise an alert");
+  assert(document.getElementById("alertsList").children[0].textContent === "RAM commit 93% over 90%", `commit alert = ${document.getElementById("alertsList").children[0]?.textContent}`);
+  const stalled = sampleMetrics();
+  stalled.pressure.memory_full = { available: true, value: 14.2, unit: "%" };
+  context.render(stalled);
+  assert(document.getElementById("alertsList").children[0].textContent === "Memory stall 14% over 10%", "a full memory stall did not raise an alert");
+  context.render(sampleMetrics());
+  assert(document.getElementById("alertsChip").hidden === true, "pressure alerts did not clear");
+}
 assert(document.getElementById("gpuValue").textContent === "25%", "GPU gauge did not render");
 assert(document.getElementById("gpuSub").textContent === "2.0/8.0G", "GPU gauge sub did not render VRAM used/total");
 assert(document.getElementById("gpuDetail").textContent === "49°C · 112 W", "GPU card detail did not render temp + power");
@@ -885,23 +997,31 @@ assert(document.getElementById("netValue").textContent.includes("2.0K"), "NET ga
 assert(document.getElementById("netSub").textContent.includes("1.0K"), "NET gauge sub did not render upload rate");
 assert(document.getElementById("cpuName").textContent === "AMD Ryzen 9 7950X", "CPU identity line did not render the CPU model");
 assert(document.getElementById("gpuName").textContent === "GPU 0", "GPU identity line did not render the GPU model");
-assert(document.getElementById("memName").textContent === "DDR5 · 6000 MT/s", "RAM identity line did not render type + speed");
+assert(document.getElementById("memName").textContent === "DDR5 · 5600/6000 EXPO", "RAM identity line did not render type + running/rated speed");
+assert(document.getElementById("memGauge").title === "Running 5600 MT/s, rated 6000 MT/s (EXPO), JEDEC 4800 MT/s", "RAM gauge tooltip did not spell out the speed comparison");
 assert(document.getElementById("netName").textContent === "📶 BiBi-Pro-Max", "NET identity line did not render the Wi-Fi glyph + SSID");
 assert(document.getElementById("storagePanel").hidden === false, "storage panel did not show for available devices");
-assert(document.getElementById("storageSummary").textContent === "2 drives", "storage panel summary did not render drive count");
+assert(document.getElementById("storageSummary").textContent === "3 drives", "storage panel summary did not render drive count");
 {
   const storageRows = document.getElementById("storageList").children;
-  assert(storageRows.length === 2, "storage panel did not render one row per device");
+  assert(storageRows.length === 3, "storage panel did not render one row per device");
   assert(storageRows[0].className === "storage-row", "storage row class did not render");
   // First device: model · name · size identity, mountpoint caption, used/total.
   assert(storageRows[0].children[0].children[0].textContent === "CT4000T705SSD3 · nvme0n1 · 3.6 TB", "storage row 0 identity did not render model · name · size");
   assert(storageRows[0].children[0].children[1].textContent === "46°C", "storage row 0 temperature did not render");
   assert(storageRows[0].children[2].children[0].textContent === "/", "storage row 0 mountpoint caption did not render");
   assert(storageRows[0].children[2].children[1].textContent === "250 B / 1000 B", "storage row 0 capacity did not render used/total");
+  assert(storageRows[0].children[3]?.className === "storage-io", "storage row 0 did not render its throughput");
+  assert(storageRows[0].children[3].textContent === "read 2.5M/s · write 125K/s", `storage row 0 throughput = ${storageRows[0].children[3].textContent}`);
   // Second device: unmounted -> "no mounted filesystems" caption + em dash.
   assert(storageRows[1].children[0].children[1].textContent === "41°C", "storage row 1 temperature did not render");
   assert(storageRows[1].children[2].children[0].textContent === "no mounted filesystems", "storage row 1 did not render the unmounted caption");
   assert(storageRows[1].children[2].children[1].textContent === "—", "storage row 1 unmounted capacity did not render em dash");
+  assert(storageRows[1].children.length === 3, "storage row with a temperature grew a note");
+  // Third device: a USB bridge hides the temperature; the row says why, in place.
+  assert(storageRows[2].children[0].children[1].textContent === "--", "storage row 2 did not render a missing temperature as --");
+  assert(storageRows[2].children[3]?.className === "storage-note", "storage row 2 did not render its temperature note");
+  assert(storageRows[2].children[3].textContent === "No temperature: USB enclosure: bridge does not expose live SMART temperature", "storage row 2 note did not name the reason");
 }
 assert(document.getElementById("netDetail").textContent === "Tailscale", "NET card detail did not render the Tailscale label");
 {
@@ -1013,7 +1133,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v156, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v165, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1061,7 +1181,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v156; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v165; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1071,7 +1191,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v156",
+    dashboard_build: "sysmon-static-v165",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1081,7 +1201,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v156",
+    dashboard_build: "sysmon-static-v165",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1216,7 +1336,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v156", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v165", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -1545,9 +1665,11 @@ assert(beaconRequests === beaconsBeforeHiddenPause + 1, "hidden visibility chang
 assert(lastBeaconPath === "/api/client-check", "hidden client check beacon used wrong path");
 assert(JSON.parse(await lastBeaconBody.text()).visibility === "hidden", "hidden client check beacon did not capture hidden visibility");
 assert(context.totalIntervalCount() === 0, "hidden dashboard kept polling timers active");
+const historyBeforeResume = historyRequests;
 document.visibilityState = "visible";
 document.dispatch("visibilitychange");
 await flushMicrotasks();
+assert(historyRequests === historyBeforeResume + 1, "resuming the app did not refetch the agent's history");
 assert(metricsRequests === metricsBeforePausedStatusTap + 1, "visible visibility change fetched metrics while paused");
 assert(statusRequests === statusBeforePausedStatusTap + 2, "visible visibility change did not refresh status while paused");
 assert(context.totalIntervalCount() === 3, "visible paused dashboard did not restore non-metrics timers");
@@ -2075,6 +2197,19 @@ context.fetch = async (path, options = {}) => {
   return response({ error: "not found" }, 404);
 };
 
+// At its rated profile the RAM ring is the goal state: full and green, never
+// the red a full load ring means.
+context.render({ ...sampleMetrics(), memory_speed: { available: true, type: "DDR5", configured_mtps: 6000, jedec_mtps: 4800, rated_mtps: 6000, rated_profile: "EXPO" } });
+assert(document.getElementById("memGauge").style.values.get("--inner-p") === "100", "RAM at its rated profile did not fill the inner ring");
+assert(document.getElementById("memGauge").style.values.get("--inner-c") === "var(--good)", "RAM at its rated profile did not use the good color");
+assert(document.getElementById("memName").textContent === "DDR5 · 6000/6000 EXPO", "RAM identity line did not render the rated pair");
+
+// Without the DMI snapshot unit the running speed is unknown: no ring, and
+// the identity line falls back to memory_name.
+context.render({ ...sampleMetrics(), memory_speed: { available: false, jedec_mtps: 4800, rated_mtps: 6000, rated_profile: "EXPO", error: "dmidecode needs root" } });
+assert(document.getElementById("memGauge").classList.contains("hide-inner"), "unknown running RAM speed did not hide the inner ring");
+assert(document.getElementById("memName").textContent === "DDR5 · 5600 MT/s", "RAM identity line did not fall back to memory_name");
+
 context.render(warmingNetworkMetrics());
 assert(document.getElementById("netValue").textContent === "NA", "warming network rates did not mute the NET gauge");
 assert(document.getElementById("netGauge").classList.contains("unavailable"), "warming network did not mark the NET gauge unavailable");
@@ -2112,8 +2247,15 @@ assert(document.getElementById("gpuGauge").classList.contains("unavailable"), "p
 assert(document.getElementById("gpuSub").textContent === "--", "partial GPU fallback did not blank the VRAM sub");
 assert(document.getElementById("gpuDetail").textContent === "--", "partial GPU fallback did not blank the GPU detail line");
 
-context.render(degradedMetrics());
+{
+  // Sparkline slots are 5 s peak buckets now, so a degraded frame only blanks
+  // the newest bar once it lands in a bucket of its own.
+  const degraded = degradedMetrics();
+  degraded.timestamp = new Date(Date.parse(degraded.timestamp) + 10_000).toISOString();
+  context.render(degraded);
+}
 assert(document.getElementById("gpuValue").textContent === "NA", "unavailable GPU gauge did not render as NA");
+assert(document.getElementById("gpuEnginesPanel").hidden === true, "GPU engines panel stayed visible with no GPU");
 assert(document.getElementById("netValue").textContent === "NA", "unavailable network did not mute the NET gauge");
 assert(!document.getElementById("cpuGauge").classList.contains("hide-inner"), "unavailable CPU temperature wrongly hid the clock-driven inner ring");
 assert(lastSparklineBar("gpuTrend").classList.contains("unavailable"), "unavailable GPU sample did not render muted sparkline bar");
@@ -2270,6 +2412,18 @@ context.AbortController = originalAbortController;
 // selectors).
 context.render(sampleMetrics());
 assert(document.getElementById("processesSummary").textContent === "87 processes", "process page header did not render total process count");
+assert(document.getElementById("agentCost").hidden === false, "the agent's own cost stayed hidden");
+// GPU engines panel ("More status" page): the primary GPU's engines.
+assert(document.getElementById("gpuEnginesPanel").hidden === false, "GPU engines panel stayed hidden with engines reported");
+assert(document.getElementById("gpuEnginesSummary").textContent === "GPU 0", "GPU engines panel did not name the GPU");
+{
+  const engineRows = document.getElementById("gpuEnginesList").children;
+  assert(engineRows.length === 2, "GPU engines panel did not render one row per engine");
+  assert(engineRows[0].children[0].textContent === "3D" && engineRows[0].children[2].textContent === "22%", "GPU engine row did not render name and usage");
+  assert(engineRows[1].children[1].children[0].style.values.get("--w") === "12%", "GPU engine bar did not scale to its usage");
+}
+assert(document.getElementById("agentCost").textContent === "This agent: 0.2% CPU · 0.07 cores · 234 MB · 3 processes", `agent cost line = ${document.getElementById("agentCost").textContent}`);
+assert(document.getElementById("agentCost").title === "Includes sysmon-agent, pwsh, conhost", "agent cost did not name its processes");
 assert(document.getElementById("processesPanel").classList.contains("processes-unavailable") === false, "available process set still flagged unavailable");
 let procRows = document.getElementById("processesBody").children;
 assert(procRows.length === 3, "apps view did not render one row per app group");
@@ -2280,11 +2434,38 @@ assert(procRows[2].children[0].textContent === "systemd", "apps view third row n
 // Unavailable GPU cell renders an em dash for the non-CUDA app.
 assert(procRows[2].children[3].textContent === "—", "unavailable GPU memory cell did not render em dash");
 assert(procRows[2].children[3].classList.contains("unavailable") === true, "unavailable GPU cell missing unavailable class");
+// Tapping an app row opens what it merged; tapping again closes it, and the
+// open row survives the next frame's re-render.
+assert(procRows[1].children.length === 5, "a closed app row rendered a detail line");
+await procRows[1].click();
+procRows = document.getElementById("processesBody").children;
+assert(procRows[1].children[5]?.className === "processes-detail", "tapping an app row did not open its detail line");
+assert(procRows[1].children[5].textContent === "3 processes: chrome ×2 · crashpad", "app row detail did not list its members");
+assert(procRows[1].getAttribute("aria-expanded") === "true", "open app row did not report aria-expanded");
+context.render(sampleMetrics());
+procRows = document.getElementById("processesBody").children;
+assert(procRows[1].children[5]?.textContent === "3 processes: chrome ×2 · crashpad", "open app row closed on the next frame");
+await procRows[1].click();
+procRows = document.getElementById("processesBody").children;
+assert(procRows[1].children.length === 5, "a second tap did not close the app row");
+// An agent older than the process tree sends no members: the count stands alone.
+await procRows[0].click();
+procRows = document.getElementById("processesBody").children;
+assert(procRows[0].children[5].textContent === "1 process", "app row without members did not fall back to the count");
+await procRows[0].click();
 // Toggle to the Processes view.
 context.setProcessesView("processes");
 procRows = document.getElementById("processesBody").children;
 assert(procRows.length === 2, "processes view did not render one row per PID");
 assert(procRows[0].children[0].textContent === "blender · 202", "processes view did not sort by CPU desc or render PID label");
+await procRows[0].click();
+procRows = document.getElementById("processesBody").children;
+assert(procRows[0].children[5]?.textContent === "parent zsh · 150 · 0 children · under kitty-session · 140", "process row detail did not place the PID in its tree");
+await procRows[1].click();
+procRows = document.getElementById("processesBody").children;
+assert(procRows[0].children.length === 5, "opening a second row left the first one open");
+assert(procRows[1].children[5]?.textContent === "parent systemd · 1 · 2 children", "a process that is its own launcher named itself as its launcher");
+await procRows[1].click();
 assert(document.getElementById("processesViewProcs").getAttribute("aria-selected") === "true", "processes toggle did not mark the Processes tab selected");
 assert(document.getElementById("processesViewApps").getAttribute("aria-selected") === "false", "processes toggle did not clear the Apps tab selection");
 // Re-sort by memory: first tap defaults to descending, so blender(2GB) comes
@@ -2307,6 +2488,27 @@ assert(procRows[0].children[0].textContent === "blender · 202", "name sort asc 
 context.setProcSort("name");
 procRows = document.getElementById("processesBody").children;
 assert(procRows[0].children[0].textContent === "chrome · 101", "name sort desc did not order lexicographically");
+// A host that reports per-process GPU utilization (Windows) switches the GPU
+// column from memory to percent, and the detail line names the busiest engine
+// and carries the memory the column no longer shows.
+{
+  const withGPU = sampleMetrics();
+  withGPU.processes.processes[0].gpu_percent = { available: true, value: 41.6, unit: "%" };
+  withGPU.processes.processes[0].gpu_engine = "Video Encode";
+  withGPU.processes.processes[1].gpu_percent = { available: true, value: 0, unit: "%" };
+  context.render(withGPU);
+  procRows = document.getElementById("processesBody").children;
+  assert(procRows[0].children[0].textContent === "chrome · 101", "GPU fixture did not keep the name-desc order");
+  assert(procRows[0].children[3].textContent === "42%", `GPU column = ${procRows[0].children[3].textContent}, want utilization`);
+  assert(procRows[1].children[3].textContent === "0%", "an idle process did not read 0% GPU");
+  await procRows[0].click();
+  procRows = document.getElementById("processesBody").children;
+  assert(procRows[0].children[5]?.textContent === "parent systemd · 1 · 2 children · GPU 42% Video Encode · VRAM 256 MB", `GPU detail = ${procRows[0].children[5]?.textContent}`);
+  await procRows[0].click();
+  context.render(sampleMetrics());
+  procRows = document.getElementById("processesBody").children;
+  assert(procRows[0].children[3].textContent === "256 MB", "GPU column did not fall back to memory without utilization");
+}
 // Back to apps view + default sort for the rest of the suite.
 context.setProcessesView("apps");
 context.setProcSort("cpu");
@@ -2314,6 +2516,7 @@ context.setProcSort("cpu");
 context.render({ ...sampleMetrics(), processes: { available: false, error: "per-process metrics not supported on this platform" } });
 assert(document.getElementById("processesSummary").textContent === "unavailable", "unavailable process set did not render summary");
 assert(document.getElementById("processesBody").children.length === 1, "unavailable process set did not render a message row");
+assert(document.getElementById("agentCost").hidden === true, "agent cost stayed visible with no process set");
 assert(document.getElementById("processesPanel").classList.contains("processes-unavailable") === true, "unavailable process set did not flag the panel");
 context.render(sampleMetrics());
 
@@ -2723,7 +2926,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v156" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v165" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],

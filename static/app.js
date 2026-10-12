@@ -65,12 +65,17 @@ const state = {
   // whether any update UI is shown at all.
   agentVersion: "",
   agentChannel: "",
-  history: {
-    cpu: [],
-    mem: [],
-    gpu: [],
-    net: [],
-  },
+  // Host metrics history in the agent's 5 s peak buckets ({t, cpu, mem, gpu,
+  // net_rx, net_tx}, oldest first). Seeded from /api/history on load, resume
+  // and host switch, then extended by every rendered frame.
+  historyPoints: [],
+  historyStepMS: 5000,
+  historyRetentionMS: 900000,
+  // Latches off on a 404 (an agent older than the route) until a host switch.
+  historySupported: true,
+  historyInFlight: false,
+  historyRenderedAtMS: 0,
+  historyRenderedBucket: 0,
   // quotaSupported starts true (unknown) and latches false on the first
   // /api/quota response that says the host is unconfigured (or 404s). An
   // unconfigured host -- every public-release user -- then stops asking
@@ -121,7 +126,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v156";
+const dashboardBuild = "sysmon-static-v165";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -217,11 +222,23 @@ const clientCheckDebounceMS = 500;
 // not linger but long enough to land the confirming second tap.
 const controlArmWindowMS = 3000;
 const collapsedIssueLimit = 5;
+// Memory pressure (pressure.go) has no gauge, so it alerts from fixed limits a
+// healthy host never reaches: commit charge near its limit is when Windows
+// allocations start failing, and "full" memory pressure means no task made
+// progress for that share of the last 10 s. Fixed so neither can become an
+// alert that never clears on a host that simply runs warm.
+const commitAlertPercent = 90;
+const memoryStallAlertPercent = 10;
 // Index of the "More status" page, which owns the Alerts + Storage + Issues
 // panels. Never conditional (only the AI usage page is), so a static index
 // is safe here -- pagerGoTo still resolves it through the VISIBLE dot set.
 const statusPageIndex = 1;
 const sparklineSampleLimit = 24;
+// The history panel on the "More status" page: 15 minutes as 90 bars of two
+// 5 s buckets each. Each bar is the peak inside it, like the buckets.
+const historyPanelSlots = 90;
+const historyPanelSpan = 2;
+const historyKeys = ["cpu", "mem", "gpu", "net_rx", "net_tx", "disk"];
 const wakePreferenceKey = "sysmon:wake-wanted";
 const hostPreferenceKey = "sysmon:host";
 // Mirrors localHostID in peers.go.
@@ -251,6 +268,13 @@ let pagerGoTo = null;
 // is "apps" (grouped by executable) or "processes" (one row per PID); procSort
 // drives the client-side re-sort within the server-sent top-N rows.
 let appsView = "apps";
+// The one row whose detail line is open on the App details page: "app:<name>"
+// or "pid:<pid>". Survives re-renders, which happen on every frame.
+let expandedProcessKey = "";
+// Whether the App details GPU column shows engine utilization (a host that
+// reports gpu_percent, i.e. Windows) or GPU memory. Decided per render from
+// the rows, so one column never mixes the two units.
+let gpuColumnPercent = false;
 let procSort = { col: "cpu", dir: "desc" };
 
 const $ = (id) => document.getElementById(id);
@@ -316,6 +340,7 @@ document.addEventListener("DOMContentLoaded", () => {
   fetchHosts();
   syncVisibleTimers();
   fetchMetrics();
+  fetchHistory();
   sendClientCheck();
 });
 
@@ -757,6 +782,9 @@ function refreshVisibleDashboard() {
   // age the agent measured at that long-past fetch.
   fetchQuota();
   fetchCodexUsage();
+  // The agent kept sampling while this app was in the background; its history
+  // is the only record of what happened meanwhile.
+  fetchHistory();
   if (!state.paused) {
     fetchMetrics();
   }
@@ -1429,6 +1457,7 @@ function selectHost(id) {
   fetchQuota();
   fetchCodexUsage();
   fetchMetrics();
+  fetchHistory();
 }
 
 // resetHostView drops everything the previous host left on screen. A switch
@@ -1449,6 +1478,9 @@ function resetHostView() {
   state.quotaInFlight = false;
   state.codexUsageSupported = true;
   state.codexUsageInFlight = false;
+  state.historySupported = true;
+  state.historyInFlight = false;
+  state.historyPoints = [];
   renderQuota({ configured: false, source: "none", rows: [] });
   renderCodexUsage({ configured: false, source: "none", rows: [], token_days: [] });
   renderAgentVersion(null);
@@ -1472,7 +1504,6 @@ function resetHostView() {
   for (const id of ["cpuValue", "gpuValue", "memValue", "netValue"]) {
     $(id).textContent = "--";
   }
-  state.history = { cpu: [], mem: [], gpu: [], net: [] };
   state.lastMetricsAtMS = 0;
   setConnectionState("loading", "Connecting");
 }
@@ -2152,11 +2183,12 @@ function render(metrics) {
   const gpuMetric = primaryGPU ? metricPercent(primaryGPU.usage_percent) : unavailable();
   const net = networkTotals(metrics.network);
 
-  appendPrimaryMetricHistory({
+  recordHistoryFrame(metrics.timestamp, {
     cpu: cpuMetric,
     mem: memoryMetric,
     gpu: gpuMetric,
-    net: net.available ? { available: true, value: netRingPercent(net.rx) } : unavailable(),
+    net,
+    disk: storageThroughput(metrics.storage),
   });
 
   // CPU: outer ring = utilization, inner ring = core clock (filled against the
@@ -2181,8 +2213,10 @@ function render(metrics) {
     ? (formatGibPair(gpuVram.usedBytes, gpuVram.totalBytes) || "--")
     : "--");
 
-  // RAM: single ring (utilization), center = util %, sub = used/total bytes.
+  // RAM: outer ring = utilization, inner ring = running speed against the
+  // rated EXPO/XMP profile, center = util %, sub = used/total bytes.
   setGauge("memGauge", "memValue", memoryMetric, "%", thresholdValue("memory_warn"));
+  setInnerRing("memGauge", memorySpeedRingMetric(metrics.memory_speed));
   setGaugeSub("memSub", memoryMetric.available
     ? (formatBytesPair(memoryMetric.usedBytes, memoryMetric.totalBytes) || "--")
     : "--");
@@ -2195,6 +2229,59 @@ function render(metrics) {
   state.lastProcesses = metrics.processes || { available: false };
   renderApps(metrics.processes);
   renderStorage(metrics.storage);
+  renderGPUEngines(primaryGPU);
+}
+
+// renderGPUEngines lists the primary GPU's engines on the "More status" page
+// (gpu_engines.go): which part of the GPU is busy, which the single usage
+// figure on the card cannot say. Windows reports every engine; Linux NVIDIA
+// reports the video encoder and decoder. Hidden when the host reports none.
+const gpuEngineRowLimit = 6;
+function renderGPUEngines(gpu) {
+  const panel = $("gpuEnginesPanel");
+  const list = $("gpuEnginesList");
+  const summary = $("gpuEnginesSummary");
+  if (!panel || !list || !summary) {
+    return;
+  }
+  const engines = Array.isArray(gpu?.engines) ? gpu.engines.filter((engine) => nonEmptyText(engine?.name)) : [];
+  const wasHidden = panel.hidden;
+  panel.hidden = engines.length === 0;
+  list.textContent = "";
+  if (engines.length === 0) {
+    summary.textContent = "--";
+    if (!wasHidden) {
+      syncPagerAfterRender();
+    }
+    return;
+  }
+  summary.textContent = nonEmptyText(gpu.name) || "GPU";
+  const warn = thresholdValue("gpu_warn");
+  for (const engine of engines.slice(0, gpuEngineRowLimit)) {
+    const usage = numberMetric(engine.usage_percent);
+    const row = document.createElement("div");
+    row.className = "engine-row";
+    const name = document.createElement("span");
+    name.className = "engine-name";
+    name.textContent = engine.name;
+    const bar = document.createElement("span");
+    bar.className = "engine-bar";
+    const fill = document.createElement("span");
+    fill.className = "engine-bar-fill";
+    if (usage.available) {
+      fill.style.setProperty("--w", `${clamp(usage.value, 0, 100)}%`);
+      fill.style.setProperty("--c", colorFor(usage.value, warn));
+    }
+    bar.append(fill);
+    const value = document.createElement("span");
+    value.className = "engine-value";
+    value.textContent = usage.available ? formatProcPercent(usage.value) : "--";
+    row.append(name, bar, value);
+    list.append(row);
+  }
+  if (wasHidden) {
+    syncPagerAfterRender();
+  }
 }
 
 // networkTotals sums RX/TX byte rates across every interface into one aggregate
@@ -2301,6 +2388,66 @@ function clockRingMetric(clockMetric, maxClockMetric, baseClockMetric) {
     value = (clock.value / clockRingReferenceMHz) * 100; // last-resort fixed reference
   }
   return { available: true, value: clamp(Math.max(5, value), 0, 100), color: "var(--accent)" };
+}
+
+// memorySpeedRingMetric fills the RAM inner ring with how much of the rated
+// overclock the memory is actually running. Unlike the load rings, full is the
+// goal here: a full green ring means the EXPO/XMP profile is active, and a
+// partial amber one means the board trained below it (profile off in BIOS, or a
+// failed training that fell back). It scales JEDEC -> rated, like the CPU clock
+// ring scales base -> max, so a kit stuck at JEDEC reads as nearly empty rather
+// than 80% full. The same ~5% floor keeps a sliver visible.
+function memorySpeedRingMetric(speed) {
+  const current = finiteNumber(speed?.configured_mtps);
+  const rated = finiteNumber(speed?.rated_mtps);
+  if (!speed?.available || current === null || current <= 0 || rated === null || rated <= 0) {
+    return { available: false };
+  }
+  if (current >= rated) {
+    return { available: true, value: 100, color: "var(--good)" };
+  }
+  const jedec = finiteNumber(speed.jedec_mtps);
+  const value = jedec !== null && jedec > 0 && rated > jedec
+    ? ((current - jedec) / (rated - jedec)) * 100
+    : (current / rated) * 100;
+  return { available: true, value: clamp(Math.max(5, value), 0, 100), color: "var(--warn)" };
+}
+
+// memorySpeedLabel renders the RAM card identity line as running/rated, e.g.
+// "DDR5 · 6000/6000 EXPO", so the inner ring's fill has a readable scale. MT/s
+// is left implied (that is how DDR speeds are quoted) to keep the line within a
+// phone card. Returns "" when the running speed is unknown, so the caller falls
+// back to memory_name.
+function memorySpeedLabel(speed) {
+  const current = finiteNumber(speed?.configured_mtps);
+  if (!speed?.available || current === null || current <= 0) {
+    return "";
+  }
+  const rated = finiteNumber(speed.rated_mtps);
+  const profile = nonEmptyText(speed.rated_profile);
+  const type = nonEmptyText(speed.type);
+  const pair = rated !== null && rated > 0
+    ? `${current}/${rated}${profile ? ` ${profile}` : ""}`
+    : `${current} MT/s`;
+  return type ? `${type} · ${pair}` : pair;
+}
+
+// memorySpeedTitle spells the comparison out in full for the gauge tooltip.
+function memorySpeedTitle(speed) {
+  if (!speed) {
+    return "";
+  }
+  if (!speed.available) {
+    return nonEmptyText(speed.error) ? `RAM speed unavailable: ${speed.error}` : "";
+  }
+  const parts = [`Running ${speed.configured_mtps} MT/s`];
+  if (speed.rated_mtps > 0) {
+    parts.push(`rated ${speed.rated_mtps} MT/s${speed.rated_profile ? ` (${speed.rated_profile})` : ""}`);
+  }
+  if (speed.jedec_mtps > 0 && speed.rated_profile !== "JEDEC") {
+    parts.push(`JEDEC ${speed.jedec_mtps} MT/s`);
+  }
+  return parts.join(", ");
 }
 
 function renderCollectionErrors(errors) {
@@ -2487,6 +2634,8 @@ function metricAlertMessages(metrics) {
     }
     addTemperatureAlert(messages, sensor.name || "sensor", numberMetric(sensor.celsius), thresholdValue("temp_warn_c"));
   }
+  addPercentAlert(messages, "RAM commit", capacityPercent(metrics?.memory_commit), commitAlertPercent);
+  addPercentAlert(messages, "Memory stall", numberMetric(metrics?.pressure?.memory_full), memoryStallAlertPercent);
   return messages;
 }
 
@@ -2669,24 +2818,259 @@ function setGauge(gaugeId, valueId, metric, unit, warnThreshold = defaultThresho
   value.textContent = metric.available ? `${Math.round(metric.value)}${unit}` : "NA";
 }
 
-function appendPrimaryMetricHistory(metrics) {
-  appendMetricHistory("cpu", metrics.cpu);
-  appendMetricHistory("mem", metrics.mem);
-  appendMetricHistory("gpu", metrics.gpu);
-  appendMetricHistory("net", metrics.net);
-  // CPU's trend sparkline is replaced by the per-core grid (renderCoreGrid).
-  renderSparkline("memTrend", state.history.mem, thresholdValue("memory_warn"));
-  renderSparkline("gpuTrend", state.history.gpu, thresholdValue("gpu_warn"));
-  renderSparkline("netTrend", state.history.net, netRingWarnPercent);
+// Host metrics history. The agent keeps the last 15 minutes in 5 s buckets,
+// each the PEAK of every snapshot inside it (history.go). The dashboard seeds
+// from /api/history whenever it loads, resumes or switches host, then folds
+// each rendered frame into the same buckets, keyed by the host's own
+// timestamps so the two sources line up. Before the agent kept this, the
+// sparklines held 24 frames -- about five seconds at the stream's rate -- and
+// a PWA reopened after hours in the background showed nothing of what happened
+// while it was away.
+async function fetchHistory() {
+  if (!state.historySupported || state.historyInFlight) {
+    return;
+  }
+  state.historyInFlight = true;
+  const generation = state.hostGeneration;
+  try {
+    const response = await fetchWithTimeout(hostAPIPath("history"), { cache: "no-store" }, auxiliaryTimeoutMS);
+    if (!isCurrentHost(generation)) {
+      return;
+    }
+    if (!response.ok) {
+      // 404: an agent older than the route. The sparklines still fill from
+      // live frames, exactly as they always did.
+      if (response.status === 404) {
+        state.historySupported = false;
+      }
+      return;
+    }
+    const payload = await response.json();
+    if (!isCurrentHost(generation)) {
+      return;
+    }
+    applyHistoryPayload(payload);
+  } catch {
+    // Transient failure: the next resume or host switch asks again.
+  } finally {
+    if (isCurrentHost(generation)) {
+      state.historyInFlight = false;
+    }
+  }
 }
 
-function appendMetricHistory(key, metric) {
-  const samples = state.history[key] || [];
-  samples.push(metric?.available ? clamp(metric.value, 0, 100) : null);
-  if (samples.length > sparklineSampleLimit) {
-    samples.splice(0, samples.length - sparklineSampleLimit);
+function applyHistoryPayload(payload) {
+  const stepSeconds = positiveInteger(payload?.step_seconds);
+  const retentionSeconds = positiveInteger(payload?.retention_seconds);
+  if (stepSeconds && stepSeconds * 1000 !== state.historyStepMS) {
+    // Buckets of another width cannot be merged, and the agent's are the
+    // ones with the past in them.
+    state.historyStepMS = stepSeconds * 1000;
+    state.historyPoints = [];
   }
-  state.history[key] = samples;
+  if (retentionSeconds) {
+    state.historyRetentionMS = retentionSeconds * 1000;
+  }
+  const byTime = new Map(state.historyPoints.map((point) => [point.t, point]));
+  for (const raw of Array.isArray(payload?.points) ? payload.points : []) {
+    const t = safeIntegerNumber(raw?.t);
+    if (t === null) {
+      continue;
+    }
+    const point = byTime.get(t) || { t };
+    for (const key of historyKeys) {
+      peakHistory(point, key, historyNumber(raw[key]));
+    }
+    byTime.set(t, point);
+  }
+  state.historyPoints = [...byTime.values()].sort((a, b) => a.t - b.t);
+  trimHistory();
+  renderHistoryViews(true);
+}
+
+// historyNumber reads one JSON field: null is a gap, and must not become 0.
+function historyNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function recordHistoryFrame(timestamp, frame) {
+  const at = Date.parse(timestamp || "");
+  if (Number.isFinite(at)) {
+    const point = historyPointFor(at - (at % state.historyStepMS));
+    peakHistory(point, "cpu", frame.cpu?.available ? frame.cpu.value : null);
+    peakHistory(point, "mem", frame.mem?.available ? frame.mem.value : null);
+    peakHistory(point, "gpu", frame.gpu?.available ? frame.gpu.value : null);
+    peakHistory(point, "net_rx", frame.net?.available ? frame.net.rx : null);
+    peakHistory(point, "net_tx", frame.net?.available ? frame.net.tx : null);
+    peakHistory(point, "disk", frame.disk?.available ? frame.disk.value : null);
+  }
+  renderHistoryViews();
+}
+
+// historyPointFor returns the bucket a live frame belongs to. Frames carry the
+// host's current time, so one older than the newest bucket that is not already
+// in the list means the host clock stepped backwards: start over, as the agent
+// does, instead of parking new readings behind stale ones.
+function historyPointFor(bucket) {
+  const points = state.historyPoints;
+  const last = points[points.length - 1];
+  if (last && last.t === bucket) {
+    return last;
+  }
+  if (last && bucket < last.t) {
+    const existing = points.find((point) => point.t === bucket);
+    if (existing) {
+      return existing;
+    }
+    state.historyPoints = [];
+  }
+  const point = { t: bucket };
+  state.historyPoints.push(point);
+  trimHistory();
+  return point;
+}
+
+function peakHistory(point, key, value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return;
+  }
+  const current = point[key];
+  point[key] = typeof current === "number" && Number.isFinite(current) ? Math.max(current, value) : value;
+}
+
+function trimHistory() {
+  const points = state.historyPoints;
+  if (points.length === 0) {
+    return;
+  }
+  const oldest = points[points.length - 1].t - state.historyRetentionMS;
+  const keepFrom = points.findIndex((point) => point.t > oldest);
+  if (keepFrom > 0) {
+    points.splice(0, keepFrom);
+  }
+}
+
+// historySeries returns `count` values, oldest first, ending at endBucket. Each
+// value is the peak over `span` consecutive buckets, or null when none of them
+// holds a reading. Slots are placed by time, so a stretch the agent did not
+// record shows as a gap instead of squeezing the bars together.
+function historySeries(key, endBucket, count, span = 1) {
+  if (!endBucket) {
+    return Array(count).fill(null);
+  }
+  const byTime = new Map(state.historyPoints.map((point) => [point.t, point]));
+  const step = state.historyStepMS;
+  const series = [];
+  for (let slot = count - 1; slot >= 0; slot -= 1) {
+    let value = null;
+    for (let i = span - 1; i >= 0; i -= 1) {
+      const sample = byTime.get(endBucket - (slot * span + i) * step)?.[key];
+      if (typeof sample === "number" && Number.isFinite(sample)) {
+        value = value === null ? sample : Math.max(value, sample);
+      }
+    }
+    series.push(value);
+  }
+  return series;
+}
+
+function netRingSample(value) {
+  return value === null ? null : netRingPercent(value);
+}
+
+function renderHistoryViews(force = false) {
+  const newest = state.historyPoints[state.historyPoints.length - 1];
+  const endBucket = newest ? newest.t : 0;
+  // The card sparklines are the last two minutes; CPU's slot holds the
+  // per-core grid instead (renderCoreGrid).
+  renderSparkline("memTrend", historySeries("mem", endBucket, sparklineSampleLimit), thresholdValue("memory_warn"));
+  renderSparkline("gpuTrend", historySeries("gpu", endBucket, sparklineSampleLimit), thresholdValue("gpu_warn"));
+  renderSparkline("netTrend", historySeries("net_rx", endBucket, sparklineSampleLimit).map(netRingSample), netRingWarnPercent);
+  // The panel's 360 bars are rebuilt at most once a second, or when a new
+  // bucket opens, instead of on every 5 Hz frame.
+  const now = nowMS();
+  if (force || endBucket !== state.historyRenderedBucket || now - state.historyRenderedAtMS >= 1000) {
+    state.historyRenderedBucket = endBucket;
+    state.historyRenderedAtMS = now;
+    renderHistoryPanel(endBucket);
+  }
+}
+
+const historyPanelRows = [
+  { key: "cpu", label: "CPU", warn: () => thresholdValue("cpu_warn"), scale: (v) => v, format: (v) => `${Math.round(v)}%` },
+  { key: "mem", label: "RAM", warn: () => thresholdValue("memory_warn"), scale: (v) => v, format: (v) => `${Math.round(v)}%` },
+  { key: "gpu", label: "GPU", warn: () => thresholdValue("gpu_warn"), scale: (v) => v, format: (v) => `${Math.round(v)}%` },
+  { key: "net_rx", label: "NET ↓", warn: () => netRingWarnPercent, scale: netRingPercent, format: (v) => `${formatRateCompact(v)}/s` },
+  // Disk throughput spans six orders of magnitude, so its bars are log-scaled
+  // (diskActivityPercent) and drawn in the accent colour: a busy disk is not a
+  // warning in itself.
+  { key: "disk", label: "DISK", warn: () => null, neutral: true, scale: diskActivityPercent, format: (v) => `${formatRateCompact(v)}/s` },
+];
+
+// diskActivityPercent maps a byte rate onto a 0-100 bar on a log scale: 1 KB/s
+// is about a sixth of the bar, 1 MB/s half, 1 GB/s full.
+function diskActivityPercent(bytesPerSecond) {
+  const value = finiteNumber(bytesPerSecond);
+  if (value === null || value <= 0) {
+    return 0;
+  }
+  return clamp((Math.log10(1 + value / 1000) / 6) * 100, 0, 100);
+}
+
+// renderHistoryPanel draws the last 15 minutes on the "More status" page: one
+// strip per metric with the window's peak beside it. Hidden until the agent
+// (or the live stream) has produced a single bucket.
+function renderHistoryPanel(endBucket) {
+  const panel = $("historyPanel");
+  const list = $("historyList");
+  const summary = $("historySummary");
+  if (!panel || !list || !summary) {
+    return;
+  }
+  const points = state.historyPoints;
+  const wasHidden = panel.hidden;
+  panel.hidden = points.length === 0;
+  list.textContent = "";
+  if (points.length === 0) {
+    summary.textContent = "--";
+    if (!wasHidden) {
+      syncPagerAfterRender();
+    }
+    return;
+  }
+  const coveredMS = points[points.length - 1].t - points[0].t + state.historyStepMS;
+  const minutes = Math.max(1, Math.round(coveredMS / 60000));
+  summary.textContent = `last ${minutes} min · peaks`;
+  for (const row of historyPanelRows) {
+    const series = historySeries(row.key, endBucket, historyPanelSlots, historyPanelSpan);
+    const element = document.createElement("div");
+    element.className = "history-row";
+    const label = document.createElement("span");
+    label.className = "history-label";
+    label.textContent = row.label;
+    const strip = document.createElement("span");
+    strip.className = "history-strip";
+    const warn = row.warn();
+    let windowPeak = null;
+    for (const value of series) {
+      if (value !== null) {
+        windowPeak = windowPeak === null ? value : Math.max(windowPeak, value);
+      }
+      const bar = sparklineBar(value === null ? null : row.scale(value), warn);
+      if (row.neutral && value !== null) {
+        bar.style.setProperty("--c", "var(--accent)");
+      }
+      strip.append(bar);
+    }
+    const peakText = document.createElement("span");
+    peakText.className = "history-peak";
+    peakText.textContent = windowPeak === null ? "--" : row.format(windowPeak);
+    element.append(label, strip, peakText);
+    list.append(element);
+  }
+  if (wasHidden) {
+    syncPagerAfterRender();
+  }
 }
 
 function renderSparkline(id, samples, warnThreshold) {
@@ -2790,13 +3174,51 @@ function renderPrimaryCardDetails(metrics, primaryGPU) {
     $("gpuDetail").append(hotspot);
   }
 
-  const memory = capacityPercent(metrics.memory);
   const swap = capacityPercent(metrics.memory_swap);
-  setCardDetail("memDetail", swap.available
-    ? `⇅ ${formatBytes(swap.usedBytes)} swap`
-    : "no swap", null, null);
+  setCardDetail("memDetail", joinDetail([
+    swap.available ? `⇅ ${formatBytes(swap.usedBytes)} swap` : "no swap",
+    memoryPressureDetail(metrics),
+  ]), null, null);
+  $("memDetail").title = memoryPressureTitle(metrics);
 
   renderNetDetail(metrics.tailscale);
+}
+
+// memoryPressureDetail is the RAM card's answer to "is anything short of
+// memory" (pressure.go): Linux PSI "some" (share of the last 10 s in which at
+// least one task waited on memory), or on Windows the commit charge against
+// the commit limit. Empty when the host reports neither.
+function memoryPressureDetail(metrics) {
+  const stall = numberMetric(metrics?.pressure?.memory_some);
+  if (stall.available) {
+    return `stall ${formatPressure(stall.value)}`;
+  }
+  const commit = capacityPercent(metrics?.memory_commit);
+  if (commit.available) {
+    return `commit ${Math.round(commit.value)}%`;
+  }
+  return "";
+}
+
+function memoryPressureTitle(metrics) {
+  const pressure = metrics?.pressure;
+  if (pressure?.available) {
+    const pair = (some, full) => {
+      const s = numberMetric(some);
+      const f = numberMetric(full);
+      return [s.available ? `some ${formatPressure(s.value)}` : "", f.available ? `full ${formatPressure(f.value)}` : ""].filter(Boolean).join(", ") || "--";
+    };
+    return `Pressure stall, 10 s average. CPU: ${pair(pressure.cpu_some)}. Memory: ${pair(pressure.memory_some, pressure.memory_full)}. IO: ${pair(pressure.io_some, pressure.io_full)}.`;
+  }
+  const commit = capacityPercent(metrics?.memory_commit);
+  if (commit.available) {
+    return `Committed ${formatBytes(commit.usedBytes)} of the ${formatBytes(commit.totalBytes)} commit limit (RAM plus page files)`;
+  }
+  return "";
+}
+
+function formatPressure(value) {
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)}%`;
 }
 
 // renderApps drives the App details page: the Apps view (processes grouped by
@@ -2814,6 +3236,7 @@ function renderApps(processes) {
   }
   body.textContent = "";
   if (!processes || !processes.available) {
+    renderAgentCost(null);
     summary.textContent = processes?.error ? "unavailable" : "--";
     if (panel) {
       panel.classList.add("processes-unavailable");
@@ -2826,12 +3249,15 @@ function renderApps(processes) {
     panel.classList.remove("processes-unavailable");
   }
   summary.textContent = `${processes.total || 0} process${processes.total === 1 ? "" : "es"}`;
+  renderAgentCost(processes.agent);
   const rows = appsView === "processes" ? processes.processes || [] : processes.apps || [];
   if (rows.length === 0) {
     body.append(processesMessage("no processes reported"));
     syncPagerAfterRender();
     return;
   }
+  gpuColumnPercent = rows.some((row) => numberMetric(row.gpu_percent).available);
+  reflectGPUColumn();
   const sorted = sortProcessRows(rows, procSort);
   for (const row of sorted) {
     body.append(processRow(row, appsView));
@@ -2850,6 +3276,7 @@ function setProcessesView(view) {
     return;
   }
   appsView = view;
+  expandedProcessKey = "";
   $("processesViewApps").classList.toggle("active", view === "apps");
   $("processesViewApps").setAttribute("aria-selected", view === "apps" ? "true" : "false");
   $("processesViewProcs").classList.toggle("active", view === "processes");
@@ -2885,6 +3312,23 @@ function renderStorage(storage) {
     list.append(storageRow(device, diskWarn, tempWarn));
   }
   syncPagerAfterRender();
+}
+
+// storageThroughput sums every drive's read+write rate, matching the agent's
+// history field; unavailable until some drive reports a rate.
+function storageThroughput(storage) {
+  let total = 0;
+  let available = false;
+  for (const device of storage?.available ? storage.devices || [] : []) {
+    for (const metric of [device?.read_bytes_per_second, device?.write_bytes_per_second]) {
+      const rate = numberMetric(metric);
+      if (rate.available) {
+        total += rate.value;
+        available = true;
+      }
+    }
+  }
+  return available ? { available: true, value: total } : unavailable();
 }
 
 function storageRow(device, diskWarn, tempWarn) {
@@ -2932,6 +3376,27 @@ function storageRow(device, diskWarn, tempWarn) {
     : "\u2014";
   foot.append(left, capText);
   row.append(foot);
+
+  // Throughput over the last slow-lane pass (storage_rates.go). Absent while
+  // the counters warm up, so a fresh page does not flash zeros.
+  const read = numberMetric(device.read_bytes_per_second);
+  const write = numberMetric(device.write_bytes_per_second);
+  if (read.available || write.available) {
+    const io = document.createElement("div");
+    io.className = "storage-io";
+    io.textContent = `read ${read.available ? formatRateCompact(read.value) : "--"}/s · write ${write.available ? formatRateCompact(write.value) : "--"}/s`;
+    row.append(io);
+  }
+
+  // A drive with no temperature says why on its own row. For the expected
+  // cases (USB bridge, virtual disk) this is the only place the reason shows:
+  // the agent lists them under collection_notes and the issues panel skips them.
+  if (!temp.available && temp.error) {
+    const note = document.createElement("div");
+    note.className = "storage-note";
+    note.textContent = `No temperature: ${temp.error}`;
+    row.append(note);
+  }
 
   return row;
 }
@@ -3472,7 +3937,7 @@ function procRowValue(row, key) {
     case "memory":
       return procMagnitude(row.memory_bytes);
     case "gpu":
-      return procMagnitude(row.gpu_memory);
+      return procMagnitude(gpuColumnPercent ? row.gpu_percent : row.gpu_memory);
     case "disk":
       return procMagnitude(row.disk_read) + procMagnitude(row.disk_write);
     default:
@@ -3490,8 +3955,21 @@ function procMagnitude(metric) {
 // trailing cells carry CPU/RAM/GPU/Disk with per-cell heat colour.
 function processRow(row, view) {
   const el = document.createElement("div");
-  el.className = "processes-row";
+  el.className = "processes-row expandable";
   el.setAttribute("role", "row");
+  // A tap opens the row's place in the process tree (process_tree.go): what an
+  // app row merged, or a process's parent, children and launcher.
+  const key = view === "apps" ? `app:${row.name}` : `pid:${row.pid}`;
+  const expanded = expandedProcessKey === key;
+  el.tabIndex = 0;
+  el.setAttribute("aria-expanded", expanded ? "true" : "false");
+  el.addEventListener("click", () => toggleProcessRow(key));
+  el.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault?.();
+      toggleProcessRow(key);
+    }
+  });
 
   const name = document.createElement("div");
   name.className = "processes-cell processes-name";
@@ -3499,7 +3977,9 @@ function processRow(row, view) {
   el.append(name);
   el.append(procCell(row.cpu_percent, formatProcPercent, thresholdValue("cpu_warn"), "cpu"));
   el.append(procCell(row.memory_bytes, (v) => formatBytes(v), null, "memory"));
-  el.append(procCell(row.gpu_memory, (v) => formatBytes(v), null, "gpu"));
+  el.append(gpuColumnPercent
+    ? procCell(row.gpu_percent, formatProcPercent, thresholdValue("gpu_warn"), "gpu")
+    : procCell(row.gpu_memory, (v) => formatBytes(v), null, "gpu"));
   const diskRead = numberMetric(row.disk_read);
   const diskWrite = numberMetric(row.disk_write);
   const diskValue = (diskRead.available ? diskRead.value : 0) + (diskWrite.available ? diskWrite.value : 0);
@@ -3508,7 +3988,110 @@ function processRow(row, view) {
     value: diskValue,
     unit: "B/s",
   }, formatRateCompact, null, "disk"));
+  if (expanded) {
+    el.classList.add("expanded");
+    const detail = document.createElement("div");
+    detail.className = "processes-detail";
+    detail.textContent = view === "apps" ? appRowDetail(row) : processRowDetail(row);
+    el.append(detail);
+  }
   return el;
+}
+
+// renderAgentCost shows what the agent itself costs (agent_cost.go): its own
+// process, its live children, and children that exited since the last pass.
+// Cores is the figure that compares across hosts with different core counts.
+function renderAgentCost(agent) {
+  const el = $("agentCost");
+  if (!el) {
+    return;
+  }
+  if (!agent || !agent.available) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  const cpu = numberMetric(agent.cpu_percent);
+  const cores = numberMetric(agent.cpu_cores);
+  const memory = numberMetric(agent.memory_bytes);
+  const count = positiveInteger(agent.processes) || 1;
+  const parts = [
+    cpu.available ? `${cpu.value < 10 ? cpu.value.toFixed(1) : Math.round(cpu.value)}% CPU` : "CPU warming up",
+    cores.available ? `${cores.value.toFixed(2)} cores` : "",
+    memory.available ? formatBytes(memory.value) : "",
+    `${count} process${count === 1 ? "" : "es"}`,
+  ];
+  el.hidden = false;
+  el.textContent = `This agent: ${joinDetail(parts)}`;
+  const members = Array.isArray(agent.members) ? agent.members.map((member) => member?.name).filter(Boolean) : [];
+  el.title = members.length ? `Includes ${members.join(", ")}` : "";
+}
+
+// reflectGPUColumn names the GPU column after what it shows. A no-op in the
+// layout-less verifier, whose querySelectorAll returns nothing here.
+function reflectGPUColumn() {
+  for (const button of document.querySelectorAll(".processes-sort")) {
+    if (button.dataset.procSort !== "gpu") {
+      continue;
+    }
+    button.textContent = gpuColumnPercent ? "GPU" : "VRAM";
+    button.setAttribute("aria-label", gpuColumnPercent ? "Sort by GPU utilization" : "Sort by GPU memory");
+  }
+}
+
+function toggleProcessRow(key) {
+  expandedProcessKey = expandedProcessKey === key ? "" : key;
+  renderApps(lastProcessSet());
+}
+
+// appRowDetail says what an app row merged: "14 processes: node ×6 · bash ×5"
+// (members, most numerous first). An agent older than the process tree sends
+// no members, so the line falls back to the count.
+function appRowDetail(row) {
+  const count = positiveInteger(row.count) || 1;
+  const head = `${count} process${count === 1 ? "" : "es"}`;
+  const members = Array.isArray(row.members) ? row.members.filter((member) => nonEmptyText(member?.name)) : [];
+  if (members.length === 0) {
+    return head;
+  }
+  let listed = 0;
+  const parts = members.map((member) => {
+    const n = positiveInteger(member.count) || 1;
+    listed += n;
+    return n > 1 ? `${member.name} \u00d7${n}` : member.name;
+  });
+  if (count > listed) {
+    parts.push(`+${count - listed} more`);
+  }
+  return `${head}: ${parts.join(" \u00b7 ")}`;
+}
+
+// processRowDetail places one PID in the tree: its parent, how many children
+// it has, and which program the Apps view counts it under when that is not
+// the process itself.
+function processRowDetail(row) {
+  const parts = [];
+  const ppid = positiveInteger(row.ppid);
+  parts.push(ppid ? `parent ${nonEmptyText(row.parent_name) || "?"} \u00b7 ${ppid}` : "no live parent");
+  const children = Number.isInteger(row.children) ? row.children : null;
+  if (children !== null) {
+    parts.push(`${children} child${children === 1 ? "" : "ren"}`);
+  }
+  const launcherPID = positiveInteger(row.launcher_pid);
+  if (launcherPID && launcherPID !== row.pid && nonEmptyText(row.launcher)) {
+    parts.push(`under ${row.launcher} \u00b7 ${launcherPID}`);
+  }
+  // The GPU column shows one of utilization and memory; the detail line
+  // carries whichever is not on screen, plus the busiest engine's name.
+  const gpu = numberMetric(row.gpu_percent);
+  if (gpu.available && gpu.value > 0) {
+    parts.push(`GPU ${formatProcPercent(gpu.value)}${nonEmptyText(row.gpu_engine) ? ` ${row.gpu_engine}` : ""}`);
+  }
+  const vram = numberMetric(row.gpu_memory);
+  if (vram.available && gpuColumnPercent) {
+    parts.push(`VRAM ${formatBytes(vram.value)}`);
+  }
+  return parts.join(" \u00b7 ");
 }
 
 function procAppLabel(row) {
@@ -3538,7 +4121,7 @@ function procCell(metric, format, warnThreshold, column) {
   }
   cell.textContent = format(value.value);
   if (warnThreshold !== null) {
-    const pct = column === "cpu" ? value.value : null;
+    const pct = column === "cpu" || column === "gpu" ? value.value : null;
     if (pct !== null) {
       cell.style.setProperty("--c", colorFor(pct, warnThreshold));
     }
@@ -3558,8 +4141,9 @@ function processesMessage(text) {
 }
 
 // renderCardIdentities fills each card's identity line: CPU model, GPU model,
-// RAM type+speed (falling back to total size when the type/speed isn't readable,
-// e.g. a non-root user-session service), and the active network (Wi-Fi SSID or
+// RAM type + running/rated speed (falling back to memory_name, then to total
+// size when the speed isn't readable, e.g. a user-session service without the
+// DMI snapshot unit), and the active network (Wi-Fi SSID or
 // wired link). Missing values leave the line blank; its reserved height keeps all
 // four cards aligned.
 function renderCardIdentities(metrics, primaryGPU) {
@@ -3567,9 +4151,12 @@ function renderCardIdentities(metrics, primaryGPU) {
   setCardId("gpuName", primaryGPU ? primaryGPU.name : "");
 
   const memory = capacityPercent(metrics.memory);
-  const memName = nonEmptyText(metrics.memory_name)
+  const memName = memorySpeedLabel(metrics.memory_speed)
+    || nonEmptyText(metrics.memory_name)
     || (memory.available ? formatBytes(memory.totalBytes) : "");
   setCardId("memName", memName);
+  const memGauge = $("memGauge");
+  if (memGauge) { memGauge.title = memorySpeedTitle(metrics.memory_speed); }
 
   const uplink = metrics.network && metrics.network.uplink;
   setCardId("netName", uplinkDisplay(uplink));

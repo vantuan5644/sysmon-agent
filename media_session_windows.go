@@ -66,7 +66,7 @@ func emitMediaSessionControl() error {
 	cmd.Stdin = strings.NewReader("")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	output, err := cmd.Output()
+	output, err := trackedOutput(cmd)
 	if err != nil {
 		return fmt.Errorf("Windows media session helper: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}

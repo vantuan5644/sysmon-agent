@@ -144,6 +144,15 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 			}
 		})
 	}
+	// Agent-side history (history.go): the last 15 minutes in 5 s peak
+	// buckets, so a dashboard reopened after being backgrounded can draw what
+	// happened while it was away. Registered only for the resident sampler,
+	// which is what records it; reading it registers no demand.
+	if source, ok := collector.(historySource); ok {
+		mux.HandleFunc("GET /api/history", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, source.History())
+		})
+	}
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, newAgentStatus(state, controller.Capabilities(), time.Now().UTC()))
 	})

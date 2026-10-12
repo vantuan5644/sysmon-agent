@@ -622,6 +622,18 @@ func TestWindowsStorageTemperatureExplainsAUSBEnclosure(t *testing.T) {
 	}
 }
 
+// TestWindowsStorageTemperatureNamesAVirtualDiskEvenWithTheBridgeDown: a VHDX
+// has no sensor at all, so its reason must not depend on the bridge - blaming a
+// down bridge for it would put it back among the issues.
+func TestWindowsStorageTemperatureNamesAVirtualDiskEvenWithTheBridgeDown(t *testing.T) {
+	for _, bridge := range []lhmBridgeResult{{}, {Available: true}} {
+		got := windowsStorageTemperatureForModel("Msft Virtual Disk", storageBusTypeFileBackedVirtual, bridge, nil)
+		if got.Available || got.Error != virtualDiskTemperatureReason {
+			t.Fatalf("virtual disk (bridge available=%t) = %+v, want %q", bridge.Available, got, virtualDiskTemperatureReason)
+		}
+	}
+}
+
 // TestWindowsStorageScriptEmitsEveryPhysicalDisk pins the defect that made the
 // dashboard report one SSD on a two-SSD host.
 //

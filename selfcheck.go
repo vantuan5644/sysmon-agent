@@ -213,6 +213,22 @@ func validateMetricsShape(metrics Metrics) error {
 	// memory_swap is optional -- many hosts run without swap or use zram, and the
 	// warming snapshot leaves it unset -- so an unavailable value (even with an
 	// empty error) is always accepted. Only validate its shape when present.
+	if metrics.MemoryCommit.Available {
+		if err := validateCapacityMetric("memory_commit", metrics.MemoryCommit, false); err != nil {
+			return err
+		}
+	}
+	for name, metric := range map[string]NumberMetric{
+		"pressure.cpu_some":    metrics.Pressure.CPUSome,
+		"pressure.memory_some": metrics.Pressure.MemorySome,
+		"pressure.memory_full": metrics.Pressure.MemoryFull,
+		"pressure.io_some":     metrics.Pressure.IOSome,
+		"pressure.io_full":     metrics.Pressure.IOFull,
+	} {
+		if metric.Available && (!isFinite(metric.Value) || metric.Value < 0 || metric.Value > 100) {
+			return fmt.Errorf("%s out of range: %v", name, metric.Value)
+		}
+	}
 	if metrics.MemorySwap.Available {
 		if err := validateCapacityMetric("memory_swap", metrics.MemorySwap, false); err != nil {
 			return err
@@ -249,6 +265,11 @@ func validateMetricsShape(metrics Metrics) error {
 	}
 	if err := validateCollectionErrors(metrics.CollectionErrors); err != nil {
 		return err
+	}
+	for i, message := range metrics.CollectionNotes {
+		if strings.TrimSpace(message) == "" {
+			return fmt.Errorf("collection_notes[%d] is empty", i)
+		}
 	}
 	return nil
 }
@@ -614,7 +635,7 @@ func checkClientCheck(handler http.Handler) error {
 		return fmt.Errorf("GET /api/client-checks was not empty before dashboard POST")
 	}
 
-	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v156","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
+	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v165","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
 	if post.Code != http.StatusOK {
 		return fmt.Errorf("POST /api/client-check returned %d: %s", post.Code, strings.TrimSpace(post.Body.String()))
 	}

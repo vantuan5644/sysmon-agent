@@ -31,6 +31,8 @@ func (c unsupportedCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.CPUTemperature = unavailableNumber("C", "unsupported operating system")
 	metrics.PSUOutputPower = unavailableNumber("W", "unsupported operating system")
 	metrics.Memory = unavailableCapacity("unsupported operating system")
+	metrics.MemoryCommit = unavailableCapacity("unsupported operating system")
+	metrics.Pressure = unavailablePressure("unsupported operating system")
 	metrics.Disks = unavailableDisk("unsupported operating system")
 	metrics.Storage = unavailableStorage("storage device metrics not supported on this platform")
 	metrics.Network = NetworkSet{Available: false, Error: "unsupported operating system"}

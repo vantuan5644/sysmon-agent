@@ -91,6 +91,9 @@ type GPUMetric struct {
 	Power              NumberMetric   `json:"power_watts"`
 	Memory             CapacityMetric `json:"memory"`
 	Temperature        NumberMetric   `json:"temperature_celsius"`
+	// Engines is each engine type's utilization, busiest first (gpu_engines.go).
+	// Absent when the platform reports none for this device.
+	Engines []GPUEngine `json:"engines,omitempty"`
 }
 
 type GPUSet struct {
@@ -113,6 +116,10 @@ type StorageDevice struct {
 	Mountpoints []string       `json:"mountpoints,omitempty"` // mounted filesystems backing this device
 	Capacity    CapacityMetric `json:"capacity"`              // aggregated over MOUNTED filesystems
 	Temperature NumberMetric   `json:"temperature_celsius"`
+	// Read/write throughput from the OS's per-disk byte counters
+	// (storage_rates.go), bytes per second over the last slow-lane pass.
+	ReadBytesPerSecond  NumberMetric `json:"read_bytes_per_second"`
+	WriteBytesPerSecond NumberMetric `json:"write_bytes_per_second"`
 }
 
 // StorageSet is the per-drive storage view served to the dashboard's storage
@@ -131,28 +138,53 @@ type StorageSet struct {
 // rates. Each numeric field degrades independently per the core invariant, so
 // a process the agent lacks privilege to read (e.g. another user's PID under a
 // --user service) degrades just the unread fields rather than the row.
+//
+// PPID through LauncherPID describe where the process sits in the tree (see
+// process_tree.go). PPID is 0 when the parent is not in the same enumeration
+// pass (it exited, or never existed, as for PID 1); Launcher is the program
+// the process is counted under in the Apps view.
 type ProcessMetric struct {
-	PID       int          `json:"pid"`
-	Name      string       `json:"name"`
-	CPU       NumberMetric `json:"cpu_percent"`  // whole-host %, 0..100
-	Memory    NumberMetric `json:"memory_bytes"` // RSS/WorkingSet, unit "B"
-	GPUMemory NumberMetric `json:"gpu_memory"`   // bytes; unavailable for non-CUDA processes
-	DiskRead  NumberMetric `json:"disk_read"`    // bytes/sec
-	DiskWrite NumberMetric `json:"disk_write"`   // bytes/sec
+	PID         int          `json:"pid"`
+	Name        string       `json:"name"`
+	PPID        int          `json:"ppid"`
+	ParentName  string       `json:"parent_name,omitempty"`
+	Children    int          `json:"children"`
+	Launcher    string       `json:"launcher,omitempty"`
+	LauncherPID int          `json:"launcher_pid,omitempty"`
+	CPU         NumberMetric `json:"cpu_percent"`  // whole-host %, 0..100
+	Memory      NumberMetric `json:"memory_bytes"` // RSS/WorkingSet, unit "B"
+	GPUMemory   NumberMetric `json:"gpu_memory"`   // bytes; unavailable for non-CUDA processes
+	// GPU is the process's busiest GPU engine in percent, and GPUEngine names
+	// that engine (gpu_engines.go). Windows only.
+	GPU       NumberMetric `json:"gpu_percent"`
+	GPUEngine string       `json:"gpu_engine,omitempty"`
+	DiskRead  NumberMetric `json:"disk_read"`  // bytes/sec
+	DiskWrite NumberMetric `json:"disk_write"` // bytes/sec
 }
 
 // AppMetric is the Task-Manager-style aggregate of every ProcessMetric that
-// shares an executable (grouped by the lowercased base name, with a .exe suffix
-// stripped). Count is the number of PIDs merged. Each summed field is available
-// if at least one contributing PID reported it.
+// shares a launcher (process_tree.go): the program plus everything it started,
+// grouped by the launcher's lowercased base name with a .exe suffix stripped.
+// Count is the number of PIDs merged and Members says which executables those
+// are. Each summed field is available if at least one contributing PID
+// reported it.
 type AppMetric struct {
 	Name      string       `json:"name"`
 	Count     int          `json:"count"`
+	Members   []AppMember  `json:"members,omitempty"`
 	CPU       NumberMetric `json:"cpu_percent"`
 	Memory    NumberMetric `json:"memory_bytes"`
+	GPU       NumberMetric `json:"gpu_percent"`
 	GPUMemory NumberMetric `json:"gpu_memory"`
 	DiskRead  NumberMetric `json:"disk_read"`
 	DiskWrite NumberMetric `json:"disk_write"`
+}
+
+// AppMember is one executable inside an app row and how many of its
+// processes the row merged.
+type AppMember struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
 }
 
 // ProcessSet is the per-process view served to the new dashboard page. It
@@ -170,7 +202,10 @@ type ProcessSet struct {
 	Total     int             `json:"total"`
 	Apps      []AppMetric     `json:"apps,omitempty"`
 	Processes []ProcessMetric `json:"processes,omitempty"`
-	Error     string          `json:"error,omitempty"`
+	// Agent is this agent's own cost (agent_cost.go), measured from the same
+	// enumeration. Absent when the set could not be enumerated.
+	Agent *AgentCost `json:"agent,omitempty"`
+	Error string     `json:"error,omitempty"`
 }
 
 // TailscaleStatus reports the host's Tailscale daemon state: whether the node
@@ -184,6 +219,25 @@ type TailscaleStatus struct {
 	Error           string `json:"error,omitempty"`
 }
 
+// MemorySpeed compares the RAM's running data rate with what the modules are
+// rated for. ConfiguredMTps is the speed the memory controller trained to
+// (dmidecode "Configured Memory Speed", root-only on Linux). JEDECMTps and
+// RatedMTps come from the modules' own SPD EEPROM: the JEDEC default every
+// board falls back to, and the fastest XMP/EXPO overclock profile, which only
+// runs when that profile is enabled in the BIOS. RatedProfile names the
+// profile ("EXPO", "XMP"), or "JEDEC" when the module has no profile or the
+// rating came from SMBIOS (Windows, hosts without spd5118), which only knows
+// the JEDEC speed. Identity data, so it is never rolled into collection_errors.
+type MemorySpeed struct {
+	Available      bool   `json:"available"`
+	Type           string `json:"type,omitempty"`
+	ConfiguredMTps int    `json:"configured_mtps,omitempty"`
+	JEDECMTps      int    `json:"jedec_mtps,omitempty"`
+	RatedMTps      int    `json:"rated_mtps,omitempty"`
+	RatedProfile   string `json:"rated_profile,omitempty"`
+	Error          string `json:"error,omitempty"`
+}
+
 type Metrics struct {
 	DeviceActivity *DeviceActivitySet `json:"device_activity,omitempty"`
 	Hostname       string             `json:"hostname"`
@@ -193,6 +247,7 @@ type Metrics struct {
 	Timestamp      time.Time          `json:"timestamp"`
 	CPUName        string             `json:"cpu_name,omitempty"`
 	MemoryName     string             `json:"memory_name,omitempty"`
+	MemorySpeed    MemorySpeed        `json:"memory_speed"`
 	CPU            NumberMetric       `json:"cpu_percent"`
 	// CPUPower is whole-socket power. CPUCorePower/CPUSocPower/CPUMiscPower are
 	// its per-rail breakdown, currently AMD-only (read from the SMU power table
@@ -234,11 +289,16 @@ type Metrics struct {
 	// CPUTemperatureSensor names the sensor CPUTemperature was read from, so a
 	// reading is self-describing and two hosts can be checked for comparability
 	// instead of assumed comparable. Empty when no sensor was resolved.
-	CPUTemperatureSensor string          `json:"cpu_temperature_sensor,omitempty"`
-	CPUCores             CPUCoreSet      `json:"cpu_cores"`
-	PSUOutputPower       NumberMetric    `json:"psu_output_power"`
-	Memory               CapacityMetric  `json:"memory"`
-	MemorySwap           CapacityMetric  `json:"memory_swap"`
+	CPUTemperatureSensor string         `json:"cpu_temperature_sensor,omitempty"`
+	CPUCores             CPUCoreSet     `json:"cpu_cores"`
+	PSUOutputPower       NumberMetric   `json:"psu_output_power"`
+	Memory               CapacityMetric `json:"memory"`
+	MemorySwap           CapacityMetric `json:"memory_swap"`
+	// MemoryCommit is Windows commit charge against the commit limit, and
+	// Pressure is Linux pressure stall information; each platform reports the
+	// other's as unavailable (pressure.go explains why).
+	MemoryCommit         CapacityMetric  `json:"memory_commit"`
+	Pressure             PressureSet     `json:"pressure"`
 	Disks                []DiskMetric    `json:"disks"`
 	Storage              StorageSet      `json:"storage"`
 	Network              NetworkSet      `json:"network"`
@@ -248,6 +308,11 @@ type Metrics struct {
 	Processes            ProcessSet      `json:"processes"`
 	CollectionDurationMS int64           `json:"collection_duration_ms"`
 	CollectionErrors     []string        `json:"collection_errors,omitempty"`
+	// CollectionNotes lists degraded fields whose cause is expected and
+	// permanent (see isExpectedStorageCondition): same "<field>: <reason>" shape
+	// as CollectionErrors, kept out of it so the issues panel only carries
+	// things that can change.
+	CollectionNotes []string `json:"collection_notes,omitempty"`
 }
 
 // pickCPUTemperature returns the canonical whole-CPU die reading from a
@@ -643,6 +708,9 @@ func summarizeCollectionErrors(metrics Metrics) []string {
 		metrics.MemorySwap.Error != "no swap configured" {
 		add("swap", metrics.MemorySwap.Error)
 	}
+	// MemoryCommit and Pressure are never rolled up: each is permanently
+	// unavailable on one platform by design (pressure.go), and the PSI files
+	// are absent on any kernel built without CONFIG_PSI.
 	for _, disk := range metrics.Disks {
 		if disk.Capacity.Available {
 			continue
@@ -654,15 +722,17 @@ func summarizeCollectionErrors(metrics Metrics) []string {
 	// device (a drive with no mounted filesystem degrades only its capacity, not
 	// its temperature). Roll every degraded field up so a missing storage sensor
 	// is visible in collection_errors -- otherwise the panel silently shows gaps.
+	// The expected conditions are the exception: they go to collection_notes
+	// (summarizeCollectionNotes) and the storage row explains them in place.
 	if !metrics.Storage.Available {
 		add("storage", metrics.Storage.Error)
 	} else {
 		for _, device := range metrics.Storage.Devices {
 			label := firstNonEmpty(device.Model, device.Name, "unknown")
-			if !device.Capacity.Available {
+			if !device.Capacity.Available && !isExpectedStorageCondition(device.Capacity.Error) {
 				add("storage "+label+" capacity", device.Capacity.Error)
 			}
-			if !device.Temperature.Available {
+			if !device.Temperature.Available && !isExpectedStorageCondition(device.Temperature.Error) {
 				add("storage "+label+" temperature", device.Temperature.Error)
 			}
 		}
@@ -715,9 +785,30 @@ func summarizeCollectionErrors(metrics Metrics) []string {
 	return errors
 }
 
+// summarizeCollectionNotes lists the degraded fields summarizeCollectionErrors
+// leaves out because their cause is expected, labelled the same way so a
+// consumer can still see every gap the response carries.
+func summarizeCollectionNotes(metrics Metrics) []string {
+	if !metrics.Storage.Available {
+		return nil
+	}
+	var notes []string
+	for _, device := range metrics.Storage.Devices {
+		label := firstNonEmpty(device.Model, device.Name, "unknown")
+		if !device.Capacity.Available && isExpectedStorageCondition(device.Capacity.Error) {
+			notes = append(notes, "storage "+label+" capacity: "+strings.TrimSpace(device.Capacity.Error))
+		}
+		if !device.Temperature.Available && isExpectedStorageCondition(device.Temperature.Error) {
+			notes = append(notes, "storage "+label+" temperature: "+strings.TrimSpace(device.Temperature.Error))
+		}
+	}
+	return notes
+}
+
 func finishMetrics(metrics Metrics, started time.Time) Metrics {
 	metrics.CollectionDurationMS = collectionDurationMS(started)
 	metrics.CollectionErrors = summarizeCollectionErrors(metrics)
+	metrics.CollectionNotes = summarizeCollectionNotes(metrics)
 	return metrics
 }
 

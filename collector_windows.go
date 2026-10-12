@@ -76,12 +76,22 @@ type systemCollector struct {
 	// derive per-process CPU% as a delta. It is replaced wholesale each slow
 	// pass, so dead PIDs are pruned automatically. Guarded by mu.
 	prevProc map[int]procSample
+	// agentCost measures the agent's own footprint from each process pass.
+	// Carries its own lock.
+	agentCost agentCostTracker
+	// diskRates turns IOCTL_DISK_PERFORMANCE counters into per-drive
+	// throughput. Carries its own lock.
+	diskRates diskRateTracker
+	// gpuEngines holds the GPU Engine PDH query and the DXGI adapter list.
+	// Carries its own lock.
+	gpuEngines gpuEngineSampler
 	// hardwareOnce resolves the static identity strings (CPU model, RAM
 	// type/speed/channel) exactly once -- they never change at runtime and the
 	// lookups spawn CIM queries, so this keeps the cost off every slow pass.
 	hardwareOnce sync.Once
 	cpuName      string
 	memoryName   string
+	memorySpeed  MemorySpeed
 	// clockBase is static firmware identity. Resolving it once keeps the
 	// Win32_Processor CIM query off every active slow pass.
 	clockBaseOnce sync.Once
@@ -173,6 +183,7 @@ func (c *systemCollector) EnablePersistentBridge() {
 // inner collector on graceful shutdown, sending stdin EOF (clean pwsh exit) and
 // best-effort-killing any lingering process so a service stop leaves no orphan.
 func (c *systemCollector) Close() error {
+	c.gpuEngines.close()
 	c.lhmMu.Lock()
 	daemon := c.daemon
 	c.lhmMu.Unlock()
@@ -188,7 +199,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.Platform = c.platformCache.Get(func() string {
 		return windowsPlatform(ctx)
 	})
-	metrics.CPUName, metrics.MemoryName = c.resolveHardwareNames(ctx)
+	metrics.CPUName, metrics.MemoryName, metrics.MemorySpeed = c.resolveHardwareNames(ctx)
 
 	var wg sync.WaitGroup
 	var cpu NumberMetric
@@ -217,6 +228,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	// Computer.Open() calls, so the bridge runs once per sample behind a
 	// collector-scoped mutex and feeds both CPU power and temperatures.
 	bridgeResult, bridgeErr := c.fetchLhmBridge(ctx)
+	engines := c.gpuEngines.warmSummary()
 	collectMetricAsync(&wg, &cpuPower, func() NumberMetric {
 		return windowsCPUPowerFromBridge(bridgeResult, bridgeErr)
 	}, func(recovered any) NumberMetric {
@@ -243,9 +255,13 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	}, func(recovered any) cpuClockSet {
 		return degradedCPUClockSet(fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
 	})
+	var commit CapacityMetric
 	collectMetricAsync(&wg, &memory, func() CapacityMetric {
-		return windowsMemoryFast()
+		physical, committed := windowsMemoryStatusFast()
+		commit = committed
+		return physical
 	}, func(recovered any) CapacityMetric {
+		commit = unavailableCapacity(fmt.Sprintf("Windows memory collector panicked: %v", recovered))
 		return unavailableCapacity(fmt.Sprintf("Windows memory collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &swap, func() CapacityMetric {
@@ -259,7 +275,9 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return unavailableDisk(fmt.Sprintf("Windows disk collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &storage, func() StorageSet {
-		return c.cachedWindowsStorage(ctx, bridgeResult, bridgeErr)
+		set := c.cachedWindowsStorage(ctx, bridgeResult, bridgeErr)
+		c.applyWindowsStorageRates(&set)
+		return set
 	}, func(recovered any) StorageSet {
 		return unavailableStorage(fmt.Sprintf("Windows storage collector panicked: %v", recovered))
 	})
@@ -284,11 +302,14 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Windows Tailscale collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &processes, func() ProcessSet {
-		return c.collectProcesses(ctx)
+		return c.collectProcesses(ctx, engines)
 	}, func(recovered any) ProcessSet {
 		return unavailableProcessSet(fmt.Sprintf("Windows process collector panicked: %v", recovered))
 	})
 	wg.Wait()
+	if engines.Available {
+		gpu = attachGPUEngines(gpu, c.gpuEngines.dxgiAdapters(), engines)
+	}
 
 	metrics.CPU = cpu
 	metrics.CPUCores = c.windowsCPUCores(ctx)
@@ -301,6 +322,8 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.PSUOutputPower = psuOutputPower
 	metrics.Memory = memory
 	metrics.MemorySwap = swap
+	metrics.MemoryCommit = commit
+	metrics.Pressure = unavailablePressure(windowsNoPressureMessage)
 	metrics.Disks = disks
 	metrics.Storage = storage
 	metrics.Network = network
@@ -483,7 +506,7 @@ func windowsStorageFromRows(rows []windowsPhysicalDisk, bridge lhmBridgeResult, 
 		if row.TotalBytes > 0 {
 			capacity = availableCapacity(row.UsedBytes, row.TotalBytes)
 		} else {
-			capacity = unavailableCapacity("no mounted filesystems")
+			capacity = unavailableCapacity(noMountedFilesystemsReason)
 		}
 		devices = append(devices, StorageDevice{
 			Name:        row.Name,
@@ -514,6 +537,11 @@ func windowsStorageFromRows(rows []windowsPhysicalDisk, bridge lhmBridgeResult, 
 // name-matched sensor on a 0-Composite drive is its static 79 C warning
 // threshold. See usbEnclosureTemperatureReason.
 func windowsStorageTemperatureForModel(model string, busType uint16, bridge lhmBridgeResult, bridgeErr error) NumberMetric {
+	// A virtual disk has no sensor whatever the bridge's state, so say so even
+	// while the bridge is down rather than blaming the bridge for it.
+	if busType == storageBusTypeVirtual || busType == storageBusTypeFileBackedVirtual {
+		return unavailableNumber("C", virtualDiskTemperatureReason)
+	}
 	if bridgeErr != nil || !bridge.Available {
 		return unavailableNumber("C", "storage temperature unavailable")
 	}
@@ -699,7 +727,7 @@ func runLhmBridgeOnce(ctx context.Context) (lhmBridgeResult, error) {
 	cmd.Stdin = strings.NewReader("")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	stdout, err := cmd.Output()
+	stdout, err := trackedOutput(cmd)
 	if err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" && len(stdout) > 0 {
@@ -1218,7 +1246,7 @@ func runPowerShellWithTimeout(ctx context.Context, script string, timeout time.D
 	// surfaced when the command actually fails or produces no JSON.
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, err := trackedOutput(cmd)
 	if err != nil {
 		// Name a deadline kill instead of passing its exit status along. Go
 		// kills a timed-out child with TerminateProcess(handle, 1), so a query

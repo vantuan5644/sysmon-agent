@@ -800,9 +800,10 @@ assert_header_contains "${LOCAL_BASE_URL}/" "Cache-Control" "no-cache"
 assert_header_contains "${LOCAL_BASE_URL}/" "X-Content-Type-Options" "nosniff"
 report "headers=pass"
 
-echo "Checking deployed API schema..."
-node verify-api.mjs "$LOCAL_BASE_URL"
+echo "Checking deployed API schema and the agent's own CPU cost..."
+node verify-api.mjs "$LOCAL_BASE_URL" --agent-budget
 report "api_schema=pass"
+report "agent_cost=pass"
 
 echo "Checking deployed dashboard/PWA install assets..."
 check_pwa_install_assets "$LOCAL_BASE_URL"
