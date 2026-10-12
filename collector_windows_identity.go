@@ -13,12 +13,18 @@ import (
 // caching the result. They never change at runtime and the lookups spawn CIM
 // queries, so this keeps the cost off every slow pass and degrades to empty
 // strings when a value cannot be read. It mirrors the Linux resolveHardwareNames.
-func (c *systemCollector) resolveHardwareNames(ctx context.Context) (cpuName, memoryName string) {
+func (c *systemCollector) resolveHardwareNames(ctx context.Context) (cpuName, memoryName string, memorySpeed MemorySpeed) {
 	c.hardwareOnce.Do(func() {
+		// The result is cached for the life of the process, so the caller's
+		// cancellation must not reach it: the first caller can be a /readyz
+		// request whose client has already given up, and a lookup that fails on
+		// a canceled context would stay failed until restart. Each lookup
+		// carries its own timeout.
+		ctx := context.WithoutCancel(ctx)
 		c.cpuName = windowsCPUModelName(ctx)
-		c.memoryName = windowsMemoryName(ctx)
+		c.memoryName, c.memorySpeed = windowsMemoryIdentity(ctx)
 	})
-	return c.cpuName, c.memoryName
+	return c.cpuName, c.memoryName, c.memorySpeed
 }
 
 // windowsCPUModelName returns a cleaned CPU model from Win32_Processor.Name
@@ -47,21 +53,42 @@ type windowsMemoryModule struct {
 	BankLabel            string
 }
 
-// windowsMemoryName returns the RAM identity ("DDR5 · 6000 MT/s · Dual Channel")
-// from Win32_PhysicalMemory, or "" when it cannot be read. Unlike Linux's
-// dmidecode (root-only), this class is readable by standard users, so even a
+// windowsMemoryIdentity returns the RAM identity ("DDR5 · 6000 MT/s · Dual
+// Channel") and the running-vs-rated speed from Win32_PhysicalMemory, or "" and
+// an unavailable speed when it cannot be read. Unlike Linux's dmidecode
+// (root-only), this class is readable by standard users, so even a
 // user-session service populates it; on failure the dashboard falls back to the
-// total size.
-func windowsMemoryName(ctx context.Context) string {
+// total size. Windows exposes no SPD, so the rating is the SMBIOS Speed field,
+// which is the JEDEC speed: an EXPO kit running its profile reads "6000/4800
+// JEDEC", and the EXPO number itself is not available here.
+func windowsMemoryIdentity(ctx context.Context) (string, MemorySpeed) {
 	var rows []windowsMemoryModule
 	if err := runPowerShellJSONArray(ctx, `Get-CimInstance Win32_PhysicalMemory | Select-Object Capacity,Speed,ConfiguredClockSpeed,SMBIOSMemoryType,DeviceLocator,BankLabel`, &rows); err != nil {
-		return ""
+		return "", MemorySpeed{Error: "Win32_PhysicalMemory query failed"}
 	}
 	modules := make([]memoryModuleInfo, 0, len(rows))
+	configured, rated := 0, 0
 	for _, row := range rows {
 		modules = append(modules, windowsMemoryModuleInfo(row))
+		if row.Capacity == nil || *row.Capacity == 0 {
+			continue
+		}
+		if configured == 0 && row.ConfiguredClockSpeed != nil {
+			configured = *row.ConfiguredClockSpeed
+		}
+		if rated == 0 && row.Speed != nil {
+			rated = *row.Speed
+		}
 	}
-	return buildMemoryName(modules)
+	memType := ""
+	for _, module := range modules {
+		if module.CapacityBytes > 0 {
+			memType = smbiosMemoryTypeLabel(module.SMBIOSType)
+			break
+		}
+	}
+	speed := buildMemorySpeed(memType, configured, rated, memoryRating{}, "Win32_PhysicalMemory reports no configured speed")
+	return buildMemoryName(modules), speed
 }
 
 // windowsMemoryModuleInfo converts a decoded CIM row into the platform-neutral

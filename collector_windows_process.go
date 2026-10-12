@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime"
 	"syscall"
 	"time"
@@ -70,6 +71,7 @@ type processIOCounters struct {
 
 type windowsNativeProcessRow struct {
 	pid         int
+	ppid        int
 	name        string
 	created     uint64
 	cpuSeconds  float64
@@ -87,7 +89,7 @@ type windowsNativeProcessRow struct {
 // collectProcesses builds process and app metrics without creating child
 // processes. Inaccessible and short-lived PIDs remain visible by name while
 // their protected fields degrade independently.
-func (c *systemCollector) collectProcesses(ctx context.Context) ProcessSet {
+func (c *systemCollector) collectProcesses(ctx context.Context, engines gpuEngineSummary) ProcessSet {
 	rows, err := readWindowsProcesses(ctx)
 	if err != nil {
 		return unavailableProcessSet("native Windows process enumeration failed: " + err.Error())
@@ -103,10 +105,15 @@ func (c *systemCollector) collectProcesses(ctx context.Context) ProcessSet {
 	previous := c.prevProc
 	c.mu.Unlock()
 
+	created := make(map[int]uint64, len(rows))
+	for _, row := range rows {
+		created[row.pid] = row.created
+	}
+
 	current := make(map[int]procSample, len(rows))
 	raw := make([]ProcessMetric, 0, len(rows))
 	for _, row := range rows {
-		pm := ProcessMetric{PID: row.pid, Name: row.name}
+		pm := ProcessMetric{PID: row.pid, PPID: windowsLiveParent(row, created), Name: row.name}
 		if row.memoryOK {
 			pm.Memory = availableNumber(float64(row.workingSet), "B")
 		} else {
@@ -149,7 +156,33 @@ func (c *systemCollector) collectProcesses(ctx context.Context) ProcessSet {
 	c.mu.Lock()
 	c.prevProc = current
 	c.mu.Unlock()
-	return buildProcessSet(raw, len(raw))
+	applyProcessGPUUsage(raw, engines)
+	set := buildProcessSet(raw, len(raw))
+	agent := c.agentCost.measure(raw, os.Getpid(), now, numCPU)
+	set.Agent = &agent
+	return set
+}
+
+// windowsLiveParent returns the row's parent PID only if it still names the
+// process that started it. Windows never reparents and does reuse PIDs, so
+// th32ParentProcessID of a process whose parent exited can name an unrelated,
+// newer process that inherited the number - and charging a child to it would
+// put one program's work under another's name. A parent cannot be younger than
+// its child; that is the check. When either creation time is unreadable
+// (protected system processes), the link is kept: those are long-lived system
+// processes, the case where reuse is least likely.
+func windowsLiveParent(row windowsNativeProcessRow, created map[int]uint64) int {
+	if row.ppid == 0 || row.ppid == row.pid {
+		return 0
+	}
+	parentCreated, ok := created[row.ppid]
+	if !ok {
+		return 0
+	}
+	if parentCreated != 0 && row.created != 0 && parentCreated > row.created {
+		return 0
+	}
+	return row.ppid
 }
 
 func sameWindowsProcess(prev procSample, hadPrev bool, row windowsNativeProcessRow) bool {
@@ -202,7 +235,9 @@ func readWindowsProcesses(ctx context.Context) ([]windowsNativeProcessRow, error
 			if name == "" {
 				name = fmt.Sprintf("pid %d", pid)
 			}
-			rows = append(rows, readWindowsProcess(pid, name))
+			row := readWindowsProcess(pid, name)
+			row.ppid = int(entry.ParentProcessID)
+			rows = append(rows, row)
 		}
 
 		entry.Size = uint32(unsafe.Sizeof(entry))

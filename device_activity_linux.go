@@ -165,7 +165,7 @@ func (b linuxDeviceBackend) Activity(ctx context.Context) (DeviceActivity, Devic
 	camera := unknownDeviceActivity("capture session is inaccessible")
 	graphCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	if data, err := exec.CommandContext(graphCtx, "pw-dump").Output(); err == nil {
+	if data, err := trackedOutput(exec.CommandContext(graphCtx, "pw-dump")); err == nil {
 		m, c, err := parsePipewireActivity(data)
 		if err == nil {
 			mic = observedDeviceActivity(m, "PipeWire recording streams in the agent's session")
@@ -176,8 +176,8 @@ func (b linuxDeviceBackend) Activity(ctx context.Context) (DeviceActivity, Devic
 		}
 	}
 	if mic.State == "unknown" && graphCtx.Err() == nil {
-		if data, err := exec.CommandContext(graphCtx, "pactl", "--format=json", "list", "source-outputs").Output(); err == nil {
-			if sources, err := exec.CommandContext(graphCtx, "pactl", "--format=json", "list", "sources").Output(); err == nil {
+		if data, err := trackedOutput(exec.CommandContext(graphCtx, "pactl", "--format=json", "list", "source-outputs")); err == nil {
+			if sources, err := trackedOutput(exec.CommandContext(graphCtx, "pactl", "--format=json", "list", "sources")); err == nil {
 				if active, err := parsePulseActivity(data, sources); err == nil {
 					mic = observedDeviceActivity(active, "PulseAudio microphone recording streams in the agent's session")
 				}

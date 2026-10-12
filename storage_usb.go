@@ -34,8 +34,11 @@ const storageBusTypeUSB = 7
 // (not in collector_windows.go) so the branch is unit-tested on every platform,
 // the same reason update_swap.go carries no build tag.
 func storageTemperatureUnavailableReason(busType uint16) string {
-	if busType == storageBusTypeUSB {
+	switch busType {
+	case storageBusTypeUSB:
 		return usbEnclosureTemperatureReason
+	case storageBusTypeVirtual, storageBusTypeFileBackedVirtual:
+		return virtualDiskTemperatureReason
 	}
 	return "no storage temperature sensor reported"
 }

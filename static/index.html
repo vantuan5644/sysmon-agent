@@ -160,6 +160,20 @@
           </div>
           <div id="alertsList" class="rows"></div>
         </section>
+        <section id="historyPanel" class="panel history-panel" role="region" aria-label="Recent history" hidden>
+          <div class="section-head">
+            <h2>History</h2>
+            <span id="historySummary" class="muted">--</span>
+          </div>
+          <div id="historyList" class="history-list"></div>
+        </section>
+        <section id="gpuEnginesPanel" class="panel gpu-engines-panel" role="region" aria-label="GPU engines" hidden>
+          <div class="section-head">
+            <h2>GPU engines</h2>
+            <span id="gpuEnginesSummary" class="muted">--</span>
+          </div>
+          <div id="gpuEnginesList" class="engine-list"></div>
+        </section>
         <section id="storagePanel" class="panel storage-panel" role="region" aria-label="Storage devices" aria-live="polite" hidden>
           <div class="section-head">
             <h2>Storage</h2>
@@ -190,6 +204,7 @@
             <button id="processesViewApps" class="processes-tab active" type="button" role="tab" aria-selected="true" aria-controls="processesBody">Apps</button>
             <button id="processesViewProcs" class="processes-tab" type="button" role="tab" aria-selected="false" aria-controls="processesBody">Processes</button>
           </div>
+          <div id="agentCost" class="agent-cost" aria-live="polite" hidden></div>
           <div class="processes-head" role="row" aria-label="Sort processes">
             <button class="processes-cell processes-name processes-sort" type="button" data-proc-sort="name" aria-label="Sort by name">Name</button>
             <button class="processes-cell processes-sort" type="button" data-proc-sort="cpu" aria-label="Sort by CPU">CPU</button>

@@ -73,6 +73,7 @@ var peerRelayRoutes = map[string]string{
 	"status":      "/api/status",
 	"quota":       "/api/quota",
 	"codex-usage": "/api/codex-usage",
+	"history":     "/api/history",
 }
 
 // agentInstanceID identifies this agent process. Discovery uses it to drop an

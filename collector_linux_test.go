@@ -867,3 +867,115 @@ func TestLinuxStorageTemperaturePrefersARealReadingOverTheUSBExplanation(t *test
 		t.Fatalf("hwmon reading = %+v, want 38C", got)
 	}
 }
+
+// TestLinuxStorageTemperatureNamesAVirtioDisk: a guest's vda sits behind a
+// virtio node and has no sensor to read, which is expected rather than a fault.
+// A segment that merely starts with "virtio" must not count.
+func TestLinuxStorageTemperatureNamesAVirtioDisk(t *testing.T) {
+	root := t.TempDir()
+	blockRoot := filepath.Join(root, "block")
+	if err := os.MkdirAll(blockRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../devices/pci0000:00/0000:00:04.0/virtio2/block/vda", filepath.Join(blockRoot, "vda")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../devices/pci0000:00/0000:00:05.0/virtio-blk-x/block/vdb", filepath.Join(blockRoot, "vdb")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := linuxStorageTemperature("vda", root)
+	if got.Available || got.Error != virtualDiskTemperatureReason {
+		t.Fatalf("virtio disk = %+v, want %q", got, virtualDiskTemperatureReason)
+	}
+	if linuxBlockDeviceIsVirtual("vdb", blockRoot) {
+		t.Fatal(`"virtio-blk-x" segment wrongly matched as a virtio node`)
+	}
+}
+
+func TestParseDmidecodeSpeedsSkipsEmptySlots(t *testing.T) {
+	out := `Memory Device
+	Size: No Module Installed
+	Type: Unknown
+	Speed: Unknown
+	Configured Memory Speed: Unknown
+
+Memory Device
+	Size: 32 GB
+	Type: DDR5
+	Speed: 4800 MT/s
+	Part Number: KF560C36-32
+	Configured Memory Speed: 6000 MT/s
+`
+	memType, configured, rated := parseDmidecodeSpeeds(out)
+	if memType != "DDR5" || configured != 6000 || rated != 4800 {
+		t.Fatalf("got %q %d %d", memType, configured, rated)
+	}
+	if parseDmiHasSpeed("# dmidecode 3.6\n/sys/firmware/dmi/tables/smbios_entry_point: Permission denied\n") {
+		t.Fatal("permission-denied output must not count as a speed")
+	}
+}
+
+func TestRunDmidecodeMemoryReadsBootSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	previous := dmiMemorySnapshotPath
+	t.Cleanup(func() { dmiMemorySnapshotPath = previous })
+
+	dmiMemorySnapshotPath = filepath.Join(dir, "memory.txt")
+	snapshot := "Memory Device\n\tSize: 32 GB\n\tType: DDR5\n\tSpeed: 4800 MT/s\n\tConfigured Memory Speed: 6000 MT/s\n"
+	if err := os.WriteFile(dmiMemorySnapshotPath, []byte(snapshot), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, reason := runDmidecodeMemory(context.Background())
+	if out != snapshot || reason != "" {
+		t.Fatalf("snapshot not used: out=%q reason=%q", out, reason)
+	}
+
+	// An empty snapshot (the unit failed mid-write) must not count as a read.
+	if err := os.WriteFile(dmiMemorySnapshotPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() != 0 {
+		if out, reason := runDmidecodeMemory(context.Background()); out != "" || reason == "" {
+			t.Fatalf("empty snapshot read as success: out=%q reason=%q", out, reason)
+		}
+	}
+}
+
+// TestParseLinuxProcStatPPIDSkipsAHostileComm: the comm field may contain
+// spaces and parentheses, so field 4 is counted from the last ')'.
+func TestParseLinuxProcStatPPIDSkipsAHostileComm(t *testing.T) {
+	stat := "4242 (evil) 1 2 (x)) S 777 4242 4242 0 -1 4194304 1 0 0 0 5 6 0 0 20 0 1 0 100 0 0"
+	if got := parseLinuxProcStatPPID(stat); got != 777 {
+		t.Fatalf("ppid = %d, want 777", got)
+	}
+	if got := parseLinuxProcStatPPID("garbage"); got != 0 {
+		t.Fatalf("unparseable stat ppid = %d, want 0", got)
+	}
+	if got := parseLinuxProcStatPPID(""); got != 0 {
+		t.Fatalf("empty stat ppid = %d, want 0", got)
+	}
+}
+
+// TestLinuxPressureFromTheRealKernel reads this host's /proc/pressure when it
+// exists; WSL2 and most distro kernels ship PSI.
+func TestLinuxPressureFromTheRealKernel(t *testing.T) {
+	if _, err := os.Stat(pressureRoot); err != nil {
+		t.Skipf("no %s on this kernel", pressureRoot)
+	}
+	set := collectPressureFrom(pressureRoot)
+	if !set.Available || !set.MemorySome.Available {
+		t.Fatalf("pressure = %+v", set)
+	}
+}
+
+// TestLinuxDiskstatsFromTheRealKernel: /proc/diskstats exists on every Linux.
+func TestLinuxDiskstatsFromTheRealKernel(t *testing.T) {
+	data, err := os.ReadFile("/proc/diskstats")
+	if err != nil {
+		t.Skip(err)
+	}
+	if len(parseLinuxDiskstats(string(data))) == 0 {
+		t.Fatalf("no devices parsed from:\n%s", data)
+	}
+}

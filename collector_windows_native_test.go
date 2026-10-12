@@ -198,3 +198,147 @@ func TestWindowsStorageRetriesFailuresBeforeTheSuccessTTL(t *testing.T) {
 		t.Fatalf("past the retry window no fresh pass ran: %v", err)
 	}
 }
+
+// TestWindowsLiveParentRejectsAReusedPID: Windows never reparents, so a child
+// whose parent exited still reports the old PID, and a newer process may hold
+// it now. A parent younger than its child is that case and must be dropped;
+// an unreadable creation time keeps the link.
+func TestWindowsLiveParentRejectsAReusedPID(t *testing.T) {
+	created := map[int]uint64{100: 1_000, 200: 5_000, 300: 0}
+	cases := []struct {
+		name string
+		row  windowsNativeProcessRow
+		want int
+	}{
+		{"older parent", windowsNativeProcessRow{pid: 400, ppid: 100, created: 2_000}, 100},
+		{"parent younger than child", windowsNativeProcessRow{pid: 401, ppid: 200, created: 2_000}, 0},
+		{"parent creation unreadable", windowsNativeProcessRow{pid: 402, ppid: 300, created: 2_000}, 300},
+		{"child creation unreadable", windowsNativeProcessRow{pid: 403, ppid: 200, created: 0}, 200},
+		{"parent not in this pass", windowsNativeProcessRow{pid: 404, ppid: 999, created: 2_000}, 0},
+		{"self-parented", windowsNativeProcessRow{pid: 100, ppid: 100, created: 1_000}, 0},
+	}
+	for _, tc := range cases {
+		if got := windowsLiveParent(tc.row, created); got != tc.want {
+			t.Fatalf("%s: windowsLiveParent = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestReadWindowsProcessesReportsParents: the live Toolhelp walk must carry a
+// parent for this test process, which some process necessarily started.
+func TestReadWindowsProcessesReportsParents(t *testing.T) {
+	rows, err := readWindowsProcesses(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := os.Getpid()
+	for _, row := range rows {
+		if row.pid == self {
+			if row.ppid != os.Getppid() {
+				t.Fatalf("own ppid = %d, want %d", row.ppid, os.Getppid())
+			}
+			return
+		}
+	}
+	t.Fatalf("own pid %d not enumerated", self)
+}
+
+// TestWindowsProcessSetReportsTheAgentsOwnCost runs the real enumeration twice
+// (CPU needs a delta) and expects the test binary to find itself.
+func TestWindowsProcessSetReportsTheAgentsOwnCost(t *testing.T) {
+	c := NewSystemCollector().(*systemCollector)
+	c.collectProcesses(context.Background(), unavailableGPUEngineSummary("not sampled in this test"))
+	time.Sleep(300 * time.Millisecond)
+	set := c.collectProcesses(context.Background(), unavailableGPUEngineSummary("not sampled in this test"))
+	if set.Agent == nil || !set.Agent.Available {
+		t.Fatalf("agent cost = %+v", set.Agent)
+	}
+	if set.Agent.PID != os.Getpid() || set.Agent.Processes < 1 {
+		t.Fatalf("agent cost = %+v, want this test process", set.Agent)
+	}
+	if !set.Agent.Memory.Available || set.Agent.Memory.Value <= 0 {
+		t.Fatalf("agent memory = %+v", set.Agent.Memory)
+	}
+}
+
+// TestWindowsMemoryStatusFastReportsCommitCharge: the commit limit is RAM plus
+// page files, so it sits near or above physical memory and is never tiny.
+func TestWindowsMemoryStatusFastReportsCommitCharge(t *testing.T) {
+	memory, commit := windowsMemoryStatusFast()
+	if !memory.Available || !commit.Available {
+		t.Fatalf("memory=%+v commit=%+v", memory, commit)
+	}
+	if commit.TotalBytes < memory.TotalBytes/2 || commit.UsedBytes == 0 {
+		t.Fatalf("commit %+v is implausible next to RAM %+v", commit, memory)
+	}
+}
+
+// TestReadWindowsDiskPerformanceReadsPhysicalDrive0: every Windows machine has
+// a PhysicalDrive0, and the counters are cumulative since boot.
+func TestReadWindowsDiskPerformanceReadsPhysicalDrive0(t *testing.T) {
+	counter, err := readWindowsDiskPerformance("PhysicalDrive0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counter.read == 0 && counter.write == 0 {
+		t.Fatalf("PhysicalDrive0 reports no I/O since boot: %+v", counter)
+	}
+	if _, err := readWindowsDiskPerformance("C:"); err == nil {
+		t.Fatal("a volume name was accepted as a physical drive")
+	}
+}
+
+// TestGPUEngineSamplerReadsTheLiveCounters: the first collection only primes
+// the rate counter; the second returns instances. A machine without GPU
+// Engine counters (a VM with no GPU driver) skips.
+func TestGPUEngineSamplerReadsTheLiveCounters(t *testing.T) {
+	var sampler gpuEngineSampler
+	defer sampler.close()
+	first := sampler.summary()
+	if !first.Available && strings.Contains(first.Error, "no GPU Engine performance counters") {
+		t.Skip(first.Error)
+	}
+	if first.Available || first.Error != errGPUEnginesWarming.Error() {
+		t.Fatalf("first summary = %+v, want warming up", first)
+	}
+	time.Sleep(300 * time.Millisecond)
+	second := sampler.summary()
+	if !second.Available || len(second.Instances) == 0 {
+		t.Fatalf("second summary = %+v", second)
+	}
+}
+
+// TestEnumerateDXGIAdaptersListsTheSoftwareRenderer: every Windows install
+// has the Microsoft Basic Render Driver, flagged as a software adapter.
+func TestEnumerateDXGIAdaptersListsTheSoftwareRenderer(t *testing.T) {
+	adapters, err := enumerateDXGIAdapters()
+	if err != nil {
+		t.Fatal(err)
+	}
+	software := false
+	for _, adapter := range adapters {
+		if adapter.Name == "" || !strings.HasPrefix(adapter.LUID, "0x") {
+			t.Fatalf("malformed adapter %+v", adapter)
+		}
+		software = software || adapter.Software
+	}
+	if !software {
+		t.Fatalf("no software adapter among %+v", adapters)
+	}
+}
+
+// TestGPUEngineWarmSummaryNeverOpensTheQuery: the direct Collect path must not
+// pay the one-time PDH open.
+func TestGPUEngineWarmSummaryNeverOpensTheQuery(t *testing.T) {
+	var sampler gpuEngineSampler
+	defer sampler.close()
+	if got := sampler.warmSummary(); got.Available || got.Error != errGPUEnginesWarming.Error() {
+		t.Fatalf("warm summary on a fresh sampler = %+v", got)
+	}
+	sampler.mu.Lock()
+	opened := sampler.opened
+	sampler.mu.Unlock()
+	if opened {
+		t.Fatal("warmSummary opened the PDH query")
+	}
+}
