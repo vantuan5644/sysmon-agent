@@ -39,7 +39,11 @@ $spot.Name = 'GPU Hotspot'
 $hw.HardwareType = 'GpuAmd'
 if (@(Get-NvidiaHotspot $hw).Count -ne 0) { throw 'non-NVIDIA accepted' }
 `
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			// The budget is for pwsh's cold start, not the fixture, which runs in
+			// well under a second. A fresh CI runner took longer than the 10 s
+			// this used to allow (release repo PR #8, 2026-10-22) and the test
+			// failed on a slow start rather than a wrong sensor.
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 			out, err := exec.CommandContext(ctx, pwsh, "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
 			if err != nil {
