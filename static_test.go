@@ -132,7 +132,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v156"`,
+		`const STATIC_CACHE = "sysmon-static-v165"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -412,7 +412,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 5000;`,
-		`const dashboardBuild = "sysmon-static-v156";`,
+		`const dashboardBuild = "sysmon-static-v165";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -1458,14 +1458,12 @@ func TestDashboardRendersPrimaryMetricSparklines(t *testing.T) {
 	}
 	appJS := string(app)
 	for _, needle := range []string{
-		`history: {`,
+		`historyPoints: [],`,
 		`const sparklineSampleLimit = 24;`,
-		`appendPrimaryMetricHistory({`,
-		`net: net.available ? { available: true, value: netRingPercent(net.rx) } : unavailable(),`,
-		`function appendPrimaryMetricHistory(metrics) {`,
-		`renderSparkline("netTrend", state.history.net, netRingWarnPercent);`,
-		`function appendMetricHistory(key, metric) {`,
-		`metric?.available ? clamp(metric.value, 0, 100) : null`,
+		`recordHistoryFrame(metrics.timestamp, {`,
+		`function recordHistoryFrame(timestamp, frame) {`,
+		`renderSparkline("netTrend", historySeries("net_rx", endBucket, sparklineSampleLimit).map(netRingSample), netRingWarnPercent);`,
+		`function historySeries(key, endBucket, count, span = 1) {`,
 		`function renderSparkline(id, samples, warnThreshold) {`,
 		`Array(Math.max(0, sparklineSampleLimit - recentSamples.length)).fill(null)`,
 		`function sparklineBar(sample, warnThreshold) {`,

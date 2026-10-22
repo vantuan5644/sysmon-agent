@@ -537,7 +537,7 @@ func TestLhmDaemonScriptHandlesTheRescanRequest(t *testing.T) {
 	}
 }
 
-func TestLhmDaemonRescanScriptRebuildsOnlyPsuAndSyncsStorage(t *testing.T) {
+func TestLhmDaemonRescanScriptRebuildsOnlyPsu(t *testing.T) {
 	shell, err := exec.LookPath("pwsh")
 	if err != nil {
 		t.Skip("pwsh unavailable")
@@ -546,37 +546,22 @@ func TestLhmDaemonRescanScriptRebuildsOnlyPsuAndSyncsStorage(t *testing.T) {
 $ErrorActionPreference = 'Stop'
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'lhm-bridge-daemon.ps1'),[ref]$tokens,[ref]$errors)
-foreach ($name in @('Test-StorageNode','Sync-StorageNodes','Update-HotPluggedHardware')) {
-    $function=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)
-    . ([scriptblock]::Create($function.Extent.Text))
-}
-function New-TestHardware($id,$type) { [pscustomobject]@{Identifier=$id;HardwareType=$type;Name=$id} }
-function New-TestComputer($hardware,[bool]$psuThrows) {
-    $c=[pscustomobject]@{Hardware=$hardware;Sets=(New-Object System.Collections.Generic.List[string]);PsuThrows=$psuThrows;Psu=$true}
+$function=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Update-HotPluggedHardware'},$true)
+. ([scriptblock]::Create($function.Extent.Text))
+function New-TestComputer([bool]$psuThrows) {
+    $c=[pscustomobject]@{Sets=(New-Object System.Collections.Generic.List[string]);PsuThrows=$psuThrows;Psu=$true}
     $c | Add-Member ScriptProperty IsPsuEnabled { $this.Psu } { param($v) $this.Sets.Add([string]$v); if ($v -and $this.PsuThrows) { throw 'PSU held exclusively' }; $this.Psu=$v }
     return $c
 }
-$script:StorageNodes=New-Object System.Collections.Generic.List[object]
-$script:StorageTemps=@{}
-$gone=New-TestHardware '/nvme/3' 'Storage'
-$kept=New-TestHardware '/nvme/0' 'Storage'
-$new=New-TestHardware '/nvme/4' 'Storage'
-$cpu=New-TestHardware '/amdcpu/0' 'Cpu'
-$script:StorageNodes.Add($gone); $script:StorageNodes.Add($kept)
-$script:StorageTemps['/nvme/3']=@(@{name='gone';value=40}); $script:StorageTemps['/nvme/0']=@(@{name='kept';value=35})
 
-$computer=New-TestComputer @($cpu,$kept,$new) $false
+$computer=New-TestComputer $false
 Update-HotPluggedHardware $computer
 if (($computer.Sets -join ',') -ne 'False,True') { throw "PSU toggles: $($computer.Sets -join ',')" }
 if (-not $computer.IsPsuEnabled) { throw 'PSU left disabled after a clean rescan' }
-if ((($script:StorageNodes | ForEach-Object Identifier) -join ',') -ne '/nvme/0,/nvme/4') { throw "storage nodes: $(($script:StorageNodes | ForEach-Object Identifier) -join ',')" }
-if ($script:StorageTemps.ContainsKey('/nvme/3')) { throw 'a removed drive kept its cached temperature' }
-if (-not $script:StorageTemps.ContainsKey('/nvme/0')) { throw 'a present drive lost its cached temperature' }
 
-$held=New-TestComputer @($cpu,$kept) $true
+$held=New-TestComputer $true
 Update-HotPluggedHardware $held
 if ($held.IsPsuEnabled) { throw 'PSU reported enabled although re-adding it threw' }
-if ((($script:StorageNodes | ForEach-Object Identifier) -join ',') -ne '/nvme/0') { throw 'storage not synced after a PSU failure' }
 Write-Output 'PASS'
 `
 	output, err := exec.Command(shell, "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
@@ -584,7 +569,6 @@ Write-Output 'PASS'
 		t.Fatalf("rescan fixture: %v\n%s", err, output)
 	}
 }
-
 func TestLhmDaemonCloseKillsAndDisables(t *testing.T) {
 	fake := &fakeDaemonProcess{}
 	installFakeDaemon(t, fake)
@@ -693,13 +677,13 @@ func waitUntilBackoffElapsed(t *testing.T) {
 	time.Sleep(lhmDaemonRestartBackoff + 5*time.Millisecond)
 }
 
-// TestLhmDaemonDeadlinesCoverTheMeasuredReadCost keeps the Go-side budgets above
-// what the daemon actually costs on a many-drive host. The warm read must clear
-// a read that carries a drive refresh (~0.5 s walk + up to 2.7 s for one drive),
-// and the cold read must clear Computer.Open() (measured 8.6 s with four NVMe
-// drives) plus the prime pass and first read (measured ~11 s end to end).
+// TestLhmDaemonDeadlinesCoverTheMeasuredReadCost keeps the Go-side budgets at
+// the headroom they were sized to while LHM still read drives: a warm read
+// carrying a drive refresh (~0.5 s walk + up to 2.7 s for one drive) and a cold
+// read paying Computer.Open() with four NVMe drives (8.6 s; ~11 s to the first
+// answer). The storage group is off now, so real reads are well inside both.
 //
-// Sizing the warm budget to the median walk instead is the bug this replaced.
+// Sizing the warm budget to the median walk is the bug these replaced.
 func TestLhmDaemonDeadlinesCoverTheMeasuredReadCost(t *testing.T) {
 	if lhmDaemonWarmReadTimeout < 5*time.Second {
 		t.Errorf("lhmDaemonWarmReadTimeout = %s, too tight for a read carrying a drive refresh (~0.5 s walk + up to 2.7 s for one drive)", lhmDaemonWarmReadTimeout)

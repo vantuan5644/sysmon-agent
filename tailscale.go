@@ -24,7 +24,7 @@ func tailscaleStatusOutput(ctx context.Context) ([]byte, error) {
 	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	out, err := exec.CommandContext(callCtx, "tailscale", "status", "--json").Output()
+	out, err := trackedOutput(exec.CommandContext(callCtx, "tailscale", "status", "--json"))
 	if err != nil {
 		return nil, fmt.Errorf("tailscale status failed: %w", err)
 	}

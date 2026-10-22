@@ -25,19 +25,40 @@ import (
 // be checked rather than guessed at.
 const usbEnclosureTemperatureReason = "USB enclosure: bridge does not expose live SMART temperature"
 
-// storageBusTypeUSB is MSFT_PhysicalDisk.BusType 7, the USB member of the
-// Windows storage BusType enumeration (17 is NVMe, 11 SATA, 3 ATA, 10 SAS).
-const storageBusTypeUSB = 7
+// Members of the Windows STORAGE_BUS_TYPE enumeration (also
+// MSFT_PhysicalDisk.BusType): 3 ATA, 7 USB, 11 SATA, 17 NVMe; 10 is SAS. A
+// drive in a USB4/Thunderbolt enclosure is tunnelled PCIe and reports 17.
+const (
+	storageBusTypeATA  = 3
+	storageBusTypeUSB  = 7
+	storageBusTypeSATA = 11
+	storageBusTypeNVMe = 17
+)
 
-// storageTemperatureUnavailableReason picks the explanation for a physical disk
-// the LibreHardwareMonitor bridge reported no usable temperature for. Untagged
-// (not in collector_windows.go) so the branch is unit-tested on every platform,
-// the same reason update_swap.go carries no build tag.
-func storageTemperatureUnavailableReason(busType uint16) string {
-	if busType == storageBusTypeUSB {
-		return usbEnclosureTemperatureReason
+// driveTemperatureReadable reports whether Windows is asked for a drive's
+// temperature (windowsDriveTemperature): NVMe, SATA and parallel-ATA drives,
+// which its own drivers answer with a standard command. A USB drive cannot
+// pass SMART through its bridge and a virtual one has no sensor.
+func driveTemperatureReadable(busType uint16) bool {
+	switch busType {
+	case storageBusTypeNVMe, storageBusTypeSATA, storageBusTypeATA:
+		return true
 	}
-	return "no storage temperature sensor reported"
+	return false
+}
+
+// storageTemperatureUnavailableReason explains why a Windows drive whose
+// temperature is not read (driveTemperatureReadable) has none. Untagged (not
+// in collector_windows.go) so the branch is unit-tested on every platform, the
+// same reason update_swap.go carries no build tag.
+func storageTemperatureUnavailableReason(busType uint16) string {
+	switch busType {
+	case storageBusTypeUSB:
+		return usbEnclosureTemperatureReason
+	case storageBusTypeVirtual, storageBusTypeFileBackedVirtual:
+		return virtualDiskTemperatureReason
+	}
+	return unreadBusTemperatureReason
 }
 
 // linuxBlockDeviceIsUSB reports whether <blockRoot>/<disk> resolves through a

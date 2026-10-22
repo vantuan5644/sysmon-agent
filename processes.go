@@ -33,6 +33,7 @@ func buildProcessSet(raw []ProcessMetric, total int) ProcessSet {
 	if len(raw) == 0 {
 		return ProcessSet{Available: true, Total: total}
 	}
+	annotateProcessTree(raw)
 	apps := aggregateByApp(raw)
 	return ProcessSet{
 		Available: true,
@@ -42,19 +43,29 @@ func buildProcessSet(raw []ProcessMetric, total int) ProcessSet {
 	}
 }
 
-// aggregateByApp groups raw processes by their executable (lowercased base
-// name with a .exe suffix stripped), sums the numeric fields (a summed field is
-// available if at least one contributing PID reported it), and records the PID
-// count. CPU% values are whole-host-normalized per process, so summing them
-// yields the app's whole-host %, directly comparable to the aggregated CPU
-// gauge. Order is preserved by first appearance for stable output.
+// aggregateByApp groups raw processes by their launcher (process_tree.go; the
+// process's own name when annotateProcessTree has not run), normalized to the
+// lowercased base name with a .exe suffix stripped. It sums the numeric fields
+// (a summed field is available if at least one contributing PID reported it)
+// and records the PID count and member executables. CPU% values are
+// whole-host-normalized per process, so summing them yields the app's
+// whole-host %, directly comparable to the aggregated CPU gauge. Order is
+// preserved by first appearance for stable output.
 func aggregateByApp(raw []ProcessMetric) []AppMetric {
 	groups := map[string][]ProcessMetric{}
+	display := map[string]string{}
 	order := make([]string, 0, len(raw))
 	for _, p := range raw {
-		key := appKey(p.Name)
+		launcher := p.Launcher
+		if strings.TrimSpace(launcher) == "" {
+			launcher = p.Name
+		}
+		key := appKey(launcher)
 		if _, ok := groups[key]; !ok {
 			order = append(order, key)
+		}
+		if display[key] == "" {
+			display[key] = stripExe(strings.TrimSpace(launcher))
 		}
 		groups[key] = append(groups[key], p)
 	}
@@ -62,10 +73,14 @@ func aggregateByApp(raw []ProcessMetric) []AppMetric {
 	for _, key := range order {
 		procs := groups[key]
 		apps = append(apps, AppMetric{
-			Name:      appDisplayName(procs, key),
-			Count:     len(procs),
-			CPU:       clampPercent(sumProcessField(procs, func(p ProcessMetric) NumberMetric { return p.CPU }, "%")),
-			Memory:    sumProcessField(procs, func(p ProcessMetric) NumberMetric { return p.Memory }, "B"),
+			Name:    firstNonEmpty(display[key], key),
+			Count:   len(procs),
+			Members: appMembers(procs),
+			CPU:     clampPercent(sumProcessField(procs, func(p ProcessMetric) NumberMetric { return p.CPU }, "%")),
+			Memory:  sumProcessField(procs, func(p ProcessMetric) NumberMetric { return p.Memory }, "B"),
+			// Engine utilization sums across an app's processes the way it
+			// sums across processes into one engine; capped like CPU.
+			GPU:       clampPercent(sumProcessField(procs, func(p ProcessMetric) NumberMetric { return p.GPU }, "%")),
 			GPUMemory: sumProcessField(procs, func(p ProcessMetric) NumberMetric { return p.GPUMemory }, "B"),
 			DiskRead:  sumProcessField(procs, func(p ProcessMetric) NumberMetric { return p.DiskRead }, "B/s"),
 			DiskWrite: sumProcessField(procs, func(p ProcessMetric) NumberMetric { return p.DiskWrite }, "B/s"),
@@ -120,18 +135,6 @@ func appKey(name string) string {
 	return key
 }
 
-// appDisplayName picks the display name for an app group: the first-seen
-// process name with its .exe suffix stripped (preserving the original casing),
-// falling back to the normalized key when none of the names carry a value.
-func appDisplayName(procs []ProcessMetric, key string) string {
-	for _, p := range procs {
-		if display := stripExe(strings.TrimSpace(p.Name)); display != "" {
-			return display
-		}
-	}
-	return key
-}
-
 // stripExe removes a trailing .exe (case-insensitive) from a process name. It
 // leaves other names untouched.
 func stripExe(name string) string {
@@ -172,6 +175,7 @@ func selectTopProcesses(raw []ProcessMetric, n int) []ProcessMetric {
 	consider(func(a, b ProcessMetric) bool { return metricValueOrZero(a.CPU) > metricValueOrZero(b.CPU) })
 	consider(func(a, b ProcessMetric) bool { return metricValueOrZero(a.Memory) > metricValueOrZero(b.Memory) })
 	consider(func(a, b ProcessMetric) bool { return metricValueOrZero(a.GPUMemory) > metricValueOrZero(b.GPUMemory) })
+	consider(func(a, b ProcessMetric) bool { return metricValueOrZero(a.GPU) > metricValueOrZero(b.GPU) })
 	consider(func(a, b ProcessMetric) bool { return processDiskTotal(a) > processDiskTotal(b) })
 	out := make([]ProcessMetric, 0, len(picked))
 	for _, p := range picked {
@@ -208,6 +212,7 @@ func selectTopApps(apps []AppMetric, n int) []AppMetric {
 	consider(func(a, b AppMetric) bool { return metricValueOrZero(a.CPU) > metricValueOrZero(b.CPU) })
 	consider(func(a, b AppMetric) bool { return metricValueOrZero(a.Memory) > metricValueOrZero(b.Memory) })
 	consider(func(a, b AppMetric) bool { return metricValueOrZero(a.GPUMemory) > metricValueOrZero(b.GPUMemory) })
+	consider(func(a, b AppMetric) bool { return metricValueOrZero(a.GPU) > metricValueOrZero(b.GPU) })
 	consider(func(a, b AppMetric) bool { return appDiskTotal(a) > appDiskTotal(b) })
 	out := make([]AppMetric, 0, len(picked))
 	for _, a := range picked {

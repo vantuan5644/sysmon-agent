@@ -1331,6 +1331,105 @@ body.host-remote .host-controls {
   font-variant-numeric: tabular-nums;
 }
 
+/* History panel ("More status" page): the agent's last 15 minutes, one strip
+   of 90 peak bars per metric with the window's peak beside it. The bars reuse
+   .sparkline-bar so colours and the unavailable look match the cards. */
+.history-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.history-row {
+  display: grid;
+  grid-template-columns: 3.6em minmax(0, 1fr) 5.4em;
+  align-items: end;
+  gap: 6px;
+  font-size: 0.74rem;
+}
+
+.history-label {
+  color: var(--muted);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.history-strip {
+  display: grid;
+  grid-template-columns: repeat(90, minmax(0, 1fr));
+  align-items: end;
+  gap: 1px;
+  height: 22px;
+  background: linear-gradient(to top, var(--line) 1px, transparent 1px);
+}
+
+.history-strip .sparkline-bar {
+  border-radius: 1px 1px 0 0;
+}
+
+.history-peak {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* GPU engines panel: one bar per engine type of the primary GPU. */
+.engine-list {
+  display: grid;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.engine-row {
+  display: grid;
+  grid-template-columns: 8.5em minmax(0, 1fr) 3.4em;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.74rem;
+}
+
+.engine-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.engine-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-strong);
+  overflow: hidden;
+}
+
+.engine-bar-fill {
+  display: block;
+  height: 100%;
+  width: var(--w, 0%);
+  background: var(--c, var(--accent));
+  border-radius: 3px;
+}
+
+.engine-value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-io {
+  margin-top: 2px;
+  font-size: 0.7rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-note {
+  margin-top: 2px;
+  font-size: 0.7rem;
+  color: var(--muted);
+  opacity: 0.8;
+}
+
 /* AI usage page (fourth pager page): provider quota rows plus local transcript
    token history. Provider sections stack on a phone and share the row in a wide
    viewport so the page stays useful in both portrait and StandBy landscape. */
@@ -1794,8 +1893,36 @@ body.host-remote .host-controls {
   color: var(--muted);
 }
 
-.processes-cpu {
+.processes-cpu,
+.processes-gpu {
   color: var(--c, var(--text));
+}
+
+/* The agent's own footprint, above the table it was measured from. */
+.agent-cost {
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.processes-row.expandable {
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.processes-row.expanded {
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+/* The tapped row's place in the process tree, on its own grid line. */
+.processes-detail {
+  grid-column: 1 / -1;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 400;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .processes-message {

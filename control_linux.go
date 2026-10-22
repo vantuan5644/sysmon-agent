@@ -83,7 +83,7 @@ func (linuxController) Capabilities() []ControlCapability {
 var runLinuxControl = func(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Env = linuxControlEnv()
-	out, err := cmd.CombinedOutput()
+	out, err := trackedCombinedOutput(cmd)
 	return strings.TrimSpace(string(out)), err
 }
 
@@ -95,7 +95,7 @@ var readLinuxControl = func(ctx context.Context, args ...string) (string, error)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Env = linuxControlEnv()
-	out, err := cmd.Output()
+	out, err := trackedOutput(cmd)
 	return strings.TrimSpace(string(out)), err
 }
 

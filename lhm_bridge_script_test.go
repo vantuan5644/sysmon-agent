@@ -106,19 +106,10 @@ func sliceFunction(t *testing.T, script, name string) string {
 // reading - measured 79-88 C against real drive temps of 29-50 C. They are
 // constants, not readings.
 //
-// Emitting them is not merely noisy. windowsStorageTemperatureForModel takes the
-// FIRST bridge temperature whose name contains the drive model, so on a drive
-// whose Composite channel reads 0 (unpopulated, and dropped by
-// Test-PlausibleTemperature) the next match is the warning threshold, publishing
-// a static limit as that drive's live temperature. That is the same class of
-// defect as picking the wrong CPU die sensor: one field name carrying a
-// different physical quantity depending on the host.
-//
-// A latent hazard rather than an observed failure: the only drive here whose
-// Composite reads 0 sits in a USB enclosure and is spared by an unrelated name
-// mismatch (LHM names it by the drive inside, Windows by the enclosure), so
-// nothing matches it. An internal drive that stopped reporting Composite would
-// hit it.
+// Drive sensors no longer come through LHM (TestLhmBridgeScriptsNeverEnableStorage),
+// but the filter stays: publishing a configured limit as a live reading is the
+// same class of defect as picking the wrong CPU die sensor, and other hardware
+// can name a limit the same way.
 func TestLhmBridgeScriptsRejectStaticSmartThresholds(t *testing.T) {
 	// Each fragment is matched as a substring by the script, so they must be
 	// unmistakable - the trap documented for cpuDieTemperatureRank. None of
@@ -136,53 +127,19 @@ func TestLhmBridgeScriptsRejectStaticSmartThresholds(t *testing.T) {
 	}
 }
 
-// TestLhmBridgeScriptsKeepStorageOffTheSensorWalk guards the fix for the daemon
-// restart loop. A storage node's Update() issues a per-drive SMART health-log
-// ioctl costing 0.7-2.7 s, against single-digit milliseconds for every other
-// sensor in the walk. Measured on a 4-NVMe host: the walk took 4.8-6.4 s with
-// storage in it and 0.39 s without.
-//
-// With storage on the hot path every daemon read exceeded its deadline, so the
-// agent killed and respawned the daemon on every sample and CPU power, CPU
-// temperature and PSU power were never reported at all - reading drive temps
-// cost the dashboard the metrics it exists to show. Both scripts must therefore
-// classify storage nodes and skip them in their main sensor walk, reading them
-// on a slower cadence instead.
-func TestLhmBridgeScriptsKeepStorageOffTheSensorWalk(t *testing.T) {
+// TestLhmBridgeScriptsNeverEnableStorage pins the decision to take drive
+// temperatures from Windows instead of LibreHardwareMonitor. Enabling LHM's
+// storage group runs DiskInfoToolkit's detection, which sends vendor
+// pass-through commands to every USB disk it cannot identify, at Open() and on
+// every hot-plug, with no way to exclude a drive. It USB-reset an SD card
+// reader mid-write (2026-10-09) and, against an in-development recorder that
+// let each command time out, kept Computer.Open() running past 5 minutes so
+// the daemon never answered (2026-10-22). NVMe and SATA temperatures come from
+// readWindowsDriveTemperature now.
+func TestLhmBridgeScriptsNeverEnableStorage(t *testing.T) {
 	for _, name := range lhmBridgeScriptFiles {
-		script := readLhmBridgeScript(t, name)
-		if !strings.Contains(script, "function Test-StorageNode") {
-			t.Errorf("%s: no Test-StorageNode helper; storage nodes cannot be kept off the per-read sensor walk", name)
-			continue
+		if script := readLhmBridgeScript(t, name); strings.Contains(script, "IsStorageEnabled = $true") {
+			t.Errorf("%s enables LHM's storage group, which sends vendor pass-through commands to USB disks", name)
 		}
-		if !strings.Contains(script, "'Storage'") {
-			t.Errorf("%s: Test-StorageNode does not match the 'Storage' HardwareType", name)
-		}
-		if !strings.Contains(script, "if (Test-StorageNode $hw) { continue }") {
-			t.Errorf("%s: the main sensor walk does not skip storage nodes; a per-drive SMART ioctl back on the hot path re-breaks the read deadline", name)
-		}
-	}
-}
-
-// TestLhmBridgeDaemonRefreshesStorageOnItsOwnCadence pins the daemon's storage
-// rotation: at most one drive per read, gated on an interval, with the readings
-// cached and re-emitted in between so the JSON contract is unchanged.
-func TestLhmBridgeDaemonRefreshesStorageOnItsOwnCadence(t *testing.T) {
-	script := readLhmBridgeScript(t, "lhm-bridge-daemon.ps1")
-	for _, want := range []string{
-		"$StorageRefreshIntervalMs = 15000",
-		"SYSMON_LHM_STORAGE_MS",
-		"function Update-StorageTemperatures",
-		"$script:StorageTemps",
-		"$script:StorageCursor",
-	} {
-		if !strings.Contains(script, want) {
-			t.Errorf("lhm-bridge-daemon.ps1: missing %q from the storage refresh cadence", want)
-		}
-	}
-	// The cadence is worthless if the startup prime walks storage anyway: that
-	// pass alone cost ~5 s of the cold path on a 4-NVMe host.
-	if !strings.Contains(script, "$script:StorageNodes.Add($hw)") {
-		t.Error("lhm-bridge-daemon.ps1: the startup prime does not collect storage nodes for out-of-band refresh")
 	}
 }

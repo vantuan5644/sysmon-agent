@@ -3,11 +3,13 @@
 package main
 
 import (
-	"context"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 )
 
@@ -578,105 +580,64 @@ func TestWindowsClockMHz(t *testing.T) {
 	}
 }
 
-// TestWindowsStorageTemperatureExplainsAUSBEnclosure covers the drive that
-// prompted this: PhysicalDrive3 on BBLWIN is a WD SN550 inside a ROG ESD-S1CL
-// USB enclosure. Windows names it after the enclosure and LHM after the drive
-// inside, so the model match never connects them - and matching by index would
-// not help either, because LHM reports that drive's Composite Temperature as 0.
-// The reading stays unavailable; it just has to say why.
-func TestWindowsStorageTemperatureExplainsAUSBEnclosure(t *testing.T) {
-	bridge := lhmBridgeResult{
-		Available: true,
-		Temperatures: []lhmBridgeTemp{
-			{Name: "WDC WDS100T2B0C-00PXH0 Temperature", Value: 0},
-			{Name: "Samsung SSD 990 PRO 2TB Temperature", Value: 42},
-		},
+// TestWindowsDriveTemperatureReadsNVMeAndSATA: NVMe and SATA drives are asked
+// for a temperature. A USB drive (the ROG ESD-S1CL enclosure on BBLWIN, whose
+// bridge does not pass SMART through), a VHDX and a SAS drive each say why
+// they have none, without a read.
+func TestWindowsDriveTemperatureReadsNVMeAndSATA(t *testing.T) {
+	var reads atomic.Int32
+	c := &systemCollector{readDriveTemp: func(string) (float64, error) {
+		reads.Add(1)
+		return 41, nil
+	}}
+	for busType, want := range map[uint16]string{
+		storageBusTypeUSB:               usbEnclosureTemperatureReason,
+		storageBusTypeFileBackedVirtual: virtualDiskTemperatureReason,
+		10:                              unreadBusTemperatureReason,
+	} {
+		got := c.windowsDriveTemperature(windowsPhysicalDisk{Name: "PhysicalDrive9", BusType: busType})
+		if got.Available || got.Error != want {
+			t.Fatalf("bus type %d = %+v, want %q", busType, got, want)
+		}
+	}
+	if n := reads.Load(); n != 0 {
+		t.Fatalf("%d temperature reads for drives that are not read", n)
 	}
 
-	got := windowsStorageTemperatureForModel("ROG ESD-S1CL", storageBusTypeUSB, bridge, nil)
-	if got.Available {
-		t.Fatalf("USB enclosure reported a temperature: %+v", got)
+	for _, drive := range []windowsPhysicalDisk{
+		{Name: "PhysicalDrive1", BusType: storageBusTypeNVMe},
+		{Name: "PhysicalDrive2", BusType: storageBusTypeSATA},
+	} {
+		if got := c.windowsDriveTemperature(drive); !got.Available || got.Value != 41 {
+			t.Fatalf("bus type %d = %+v, want 41 C", drive.BusType, got)
+		}
+		c.windowsDriveTemperature(drive)
 	}
-	if got.Error != usbEnclosureTemperatureReason {
-		t.Fatalf("error = %q, want %q", got.Error, usbEnclosureTemperatureReason)
-	}
-
-	// An internal drive that misses is genuinely unexplained - do not blame a
-	// bridge it does not have. 17 is the NVMe BusType.
-	internal := windowsStorageTemperatureForModel("Crucial T705 4TB", 17, bridge, nil)
-	if internal.Error == usbEnclosureTemperatureReason {
-		t.Fatalf("internal NVMe blamed on a USB enclosure: %+v", internal)
-	}
-
-	// A USB drive LHM *can* read still reports the reading, not the excuse.
-	matched := windowsStorageTemperatureForModel("Samsung SSD 990 PRO 2TB", storageBusTypeUSB, bridge, nil)
-	if !matched.Available || matched.Value != 42 {
-		t.Fatalf("matched USB drive = %+v, want 42C", matched)
-	}
-
-	// A dead bridge keeps its own message: that is a transport failure, not a
-	// diagnosis of the enclosure.
-	down := windowsStorageTemperatureForModel("ROG ESD-S1CL", storageBusTypeUSB, lhmBridgeResult{}, nil)
-	if down.Error == usbEnclosureTemperatureReason {
-		t.Fatalf("bridge-down miss reported as a USB enclosure limit: %+v", down)
+	if n := reads.Load(); n != 2 {
+		t.Fatalf("%d reads for two drives inside the reuse window, want 2", n)
 	}
 }
 
-// TestWindowsStorageScriptEmitsEveryPhysicalDisk pins the defect that made the
-// dashboard report one SSD on a two-SSD host.
-//
-// The per-disk hashtable used to cast [uint16]$d.BusType. That is safe only
-// until the first Get-Volume in the loop autoloads the Storage module, whose
-// types.ps1xml re-projects BusType on every already-materialized
-// MSFT_PhysicalDisk as a friendly string ("NVMe"). The cast then throws, and a
-// non-terminating error while evaluating the hashtable emits nothing at all - so
-// the disk disappears from the array. PowerShell still exits 0 with valid JSON
-// for the survivors, so runPowerShell reports success and the whole set looks
-// healthy while silently short a drive. It is the same silent-truncation shape
-// as the 8 KB bash argument limit: no error anywhere, just less data.
-//
-// Counting is therefore the assertion. Any non-terminating error introduced into
-// that loop fails this, not just a BusType regression.
-func TestWindowsStorageScriptEmitsEveryPhysicalDisk(t *testing.T) {
-	ctx := context.Background()
-
-	// Ground truth, taken with a query that cannot itself drop a row.
-	var ids []string
-	const countScript = `@(Get-CimInstance -Namespace root/Microsoft/Windows/Storage ` +
-		`-ClassName MSFT_PhysicalDisk -ErrorAction Stop | ForEach-Object { [string]$_.DeviceId })`
-	if err := runPowerShellJSONArray(ctx, countScript, &ids); err != nil {
-		t.Skipf("MSFT_PhysicalDisk unavailable on this host: %v", err)
+// TestWindowsDriveTemperatureReportsAFailedRead: a SATA drive that has no
+// temperature to give is an expected note, while an NVMe drive failing the
+// same way, or a SATA drive failing for any other reason, reports the error.
+func TestWindowsDriveTemperatureReportsAFailedRead(t *testing.T) {
+	unsupported := fmt.Errorf("drive temperature query on PhysicalDrive4: %w", syscall.Errno(50))
+	cases := []struct {
+		busType uint16
+		err     error
+		want    string
+	}{
+		{storageBusTypeSATA, unsupported, noDriveTemperatureReason},
+		{storageBusTypeSATA, errNoTemperatureSensors, noDriveTemperatureReason},
+		{storageBusTypeNVMe, unsupported, unsupported.Error()},
+		{storageBusTypeSATA, errors.New("drive reported an implausible 200 C"), "drive reported an implausible 200 C"},
 	}
-	if len(ids) == 0 {
-		t.Skip("host reports no physical disks")
-	}
-
-	// A deliberately absent bridge: temperatures degrade per-field, which is
-	// irrelevant here - this test is about the device list, not the sensors.
-	set := windowsStorage(ctx, lhmBridgeResult{}, errors.New("bridge not used by this test"))
-	if !set.Available {
-		t.Fatalf("storage set unavailable: %s", set.Error)
-	}
-	if len(set.Devices) != len(ids) {
-		t.Fatalf("windowsStorage returned %d devices, want %d (%v) - a non-terminating "+
-			"PowerShell error inside the per-disk loop drops a drive while still exiting 0",
-			len(set.Devices), len(ids), ids)
-	}
-}
-
-// TestWindowsStorageScriptReadsBusTypeFromTheRawPropertyBag keeps the fix above
-// from being "simplified" back. $d.BusType is the type-adapted view and is a
-// string once the Storage module loads; $d.CimInstanceProperties reaches the raw
-// CIM property bag, which the adapter cannot touch. This runs on every host,
-// including one with a single disk where the counting test above would pass
-// either way.
-func TestWindowsStorageScriptReadsBusTypeFromTheRawPropertyBag(t *testing.T) {
-	if !strings.Contains(windowsStorageScript, "$d.CimInstanceProperties['BusType'].Value") {
-		t.Fatal("storage script no longer reads BusType from the raw CIM property bag; " +
-			"the type-adapted $d.BusType is a string once Get-Volume autoloads the Storage module")
-	}
-	if strings.Contains(windowsStorageScript, "[uint16]$d.BusType") {
-		t.Fatal("storage script casts the type-adapted $d.BusType; that throws on a " +
-			"friendly-string BusType and silently drops the disk from the emitted array")
+	for _, tc := range cases {
+		c := &systemCollector{readDriveTemp: func(string) (float64, error) { return 0, tc.err }}
+		got := c.windowsDriveTemperature(windowsPhysicalDisk{Name: "PhysicalDrive4", BusType: tc.busType})
+		if got.Available || got.Error != tc.want {
+			t.Fatalf("bus type %d with %v = %+v, want %q", tc.busType, tc.err, got, tc.want)
+		}
 	}
 }

@@ -4,20 +4,31 @@ import "testing"
 
 // TestStorageTemperatureUnavailableReasonNamesTheBridge pins the point of the
 // message: a USB-attached drive's missing temperature must read as a diagnosed
-// limitation of the bridge, not as a generic sensor fault. Every other bus keeps
-// the plain wording - an internal drive with no reading really is unexplained.
+// limitation of the bridge, not as a generic sensor fault. A drive on another
+// bus whose temperature is not read says which ones are.
 func TestStorageTemperatureUnavailableReasonNamesTheBridge(t *testing.T) {
 	if got := storageTemperatureUnavailableReason(storageBusTypeUSB); got != usbEnclosureTemperatureReason {
 		t.Fatalf("USB reason = %q, want %q", got, usbEnclosureTemperatureReason)
 	}
-	// 17 NVMe, 11 SATA, 3 ATA, 10 SAS, 0 unknown.
-	for _, busType := range []uint16{0, 3, 10, 11, 17} {
-		got := storageTemperatureUnavailableReason(busType)
-		if got == usbEnclosureTemperatureReason {
-			t.Fatalf("bus type %d claimed a USB enclosure", busType)
+	// 10 SAS, 12 SD, 0 unknown.
+	for _, busType := range []uint16{0, 10, 12} {
+		if got := storageTemperatureUnavailableReason(busType); got != unreadBusTemperatureReason {
+			t.Fatalf("bus type %d reason = %q, want %q", busType, got, unreadBusTemperatureReason)
 		}
-		if got == "" {
-			t.Fatalf("bus type %d produced an empty reason", busType)
+	}
+}
+
+// TestDriveTemperatureReadableCoversNVMeAndSATA: the buses Windows is asked
+// about, and the ones it is not.
+func TestDriveTemperatureReadableCoversNVMeAndSATA(t *testing.T) {
+	for _, busType := range []uint16{storageBusTypeNVMe, storageBusTypeSATA, storageBusTypeATA} {
+		if !driveTemperatureReadable(busType) {
+			t.Fatalf("bus type %d not read", busType)
+		}
+	}
+	for _, busType := range []uint16{0, storageBusTypeUSB, 10, storageBusTypeVirtual, storageBusTypeFileBackedVirtual} {
+		if driveTemperatureReadable(busType) {
+			t.Fatalf("bus type %d read", busType)
 		}
 	}
 }

@@ -60,31 +60,26 @@ var (
 
 // Daemon read deadlines and recycling policy. The cold read gets its own budget
 // rather than reusing the one-shot lhmBridgeTimeout, because Computer.Open()
-// scales with the hardware present: it is ~2-4 s on a simple host but was
-// measured at 8.6 s on a 4-NVMe box, where enumerating the drives dominates.
-// The cold read pays that Open() plus the daemon's prime pass before it can
-// answer, so it needs headroom the warm path does not.
-//
-// Warm reads are ~0.4 s for the whole sensor walk. The budget is well above
-// that because the daemon also refreshes one drive's SMART temperature on a
-// slow rotation (0.7-2.7 s per drive, see lhm-bridge-daemon.ps1), so the read
-// that carries a drive refresh is legitimately the slowest one. Sizing this to
-// the median walk instead is exactly the bug this replaced: at 3 s every read
-// on that host timed out, the agent killed and respawned the daemon on every
-// sample, and CPU power and temperatures were never reported at all.
+// scales with the hardware present (~2-4 s), and the cold read pays it plus
+// the daemon's prime pass before it can answer. Both budgets were sized when
+// LHM's storage group was still enabled: Open() then measured 8.6 s on a
+// 4-NVMe box, a read that refreshed a drive's SMART temperature 0.7-2.7 s more,
+// and against one slow USB disk Open() never finished. Drive temperatures come
+// from Windows now (readWindowsDriveTemperature) and the storage group is
+// never enabled, so warm reads are ~0.4 s; the budgets are kept as headroom.
+// Sizing the warm one to the median walk is the bug that once made every read
+// time out and the agent respawn the daemon on every sample.
 //
 // After a generous count / age the next full read is sent as a rescan, which
 // re-enumerates the USB PSU groups inside the running daemon so a hot-plugged
 // PSU is picked up. It used to kill the daemon instead, so the respawn's fresh
-// Computer.Open() would find it, and that was too blunt: Open() also rebuilds
-// the storage group, whose DiskInfoToolkit pass tries a dozen vendor ATA/NVMe
-// pass-through commands on every USB disk it cannot identify. Measured on
-// BBLWIN (2026-10-09), a Genesys GL3224 SD reader hung on one of them and was
-// USB-reset about 10 s after every respawn - a ~5 s I/O stall each 9 minutes,
-// and once the last 4 KiB of a write that had already completed never reached
-// the card. Storage needs no re-Open anyway: the storage group follows drive
-// arrival and removal itself (see Sync-StorageNodes in lhm-bridge-daemon.ps1).
-// The daemon is now respawned only after a transport failure.
+// Computer.Open() would find it. With the storage group enabled that was too
+// blunt: its DiskInfoToolkit pass tries a dozen vendor ATA/NVMe pass-through
+// commands on every USB disk it cannot identify, and on BBLWIN (2026-10-09) a
+// Genesys GL3224 SD reader hung on one of them and was USB-reset about 10 s
+// after every respawn - a ~5 s I/O stall each 9 minutes, and once the last
+// 4 KiB of a write that had already completed never reached the card. The
+// daemon is still respawned only after a transport failure.
 //
 // These are package vars (not consts) so unit tests can shorten the deadlines
 // and backoff to run in milliseconds without waiting on real timers.

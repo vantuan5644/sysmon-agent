@@ -8,22 +8,29 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// resolveHardwareNames returns the host's static identity strings -- the CPU
-// model and the RAM type/speed -- resolving them exactly once and caching the
-// result. They never change at runtime, and the RAM lookup spawns dmidecode
-// (root-only), so this keeps the cost off every slow pass and degrades to empty
-// strings when a value cannot be read.
-func (c *systemCollector) resolveHardwareNames(ctx context.Context) (cpuName, memoryName string) {
+// resolveHardwareNames returns the host's static identity -- the CPU model,
+// the RAM type/speed label and the running-vs-rated RAM speed -- resolving it
+// exactly once and caching the result. None of it changes at runtime, and the
+// RAM lookup reads the DMI table (root-only; see runDmidecodeMemory), so this
+// keeps the cost off every slow pass and degrades to empty values.
+func (c *systemCollector) resolveHardwareNames(ctx context.Context) (cpuName, memoryName string, memorySpeed MemorySpeed) {
 	c.hardwareOnce.Do(func() {
+		// The result is cached for the life of the process, so the caller's
+		// cancellation must not reach it: the first caller can be a /readyz
+		// request whose client has already given up, and a lookup that fails on
+		// a canceled context would stay failed until restart. Each lookup
+		// carries its own timeout.
+		ctx := context.WithoutCancel(ctx)
 		c.cpuName = readCPUModelName()
-		c.memoryName = readMemoryName(ctx)
+		c.memoryName, c.memorySpeed = readMemoryIdentity(ctx)
 	})
-	return c.cpuName, c.memoryName
+	return c.cpuName, c.memoryName, c.memorySpeed
 }
 
 // readCPUModelName returns a cleaned CPU model from /proc/cpuinfo (e.g.
@@ -45,22 +52,125 @@ func readCPUModelName() string {
 	return ""
 }
 
-// readMemoryName returns the RAM type + speed (e.g. "DDR5 · 6000 MT/s") from
-// dmidecode, or "" when dmidecode is missing or unreadable (it needs root, so
-// the user-session desktop service degrades to "" and the dashboard falls back
-// to the total size).
-func readMemoryName(ctx context.Context) string {
-	path, err := exec.LookPath("dmidecode")
-	if err != nil {
-		return ""
+// spdEEPROMGlob matches the SPD EEPROMs the spd5118 driver (DDR5) exposes.
+// They are world-readable, unlike the DMI table, so the rated speeds need no
+// privilege even when the running speed does.
+const spdEEPROMGlob = "/sys/bus/i2c/drivers/spd5118/*/eeprom"
+
+// dmidecodeCandidates are checked when dmidecode is not on PATH: Debian and
+// Ubuntu install it to /usr/sbin, which a user service's PATH may not carry.
+var dmidecodeCandidates = []string{"/usr/sbin/dmidecode", "/usr/bin/dmidecode"}
+
+// readMemoryIdentity returns the RAM label (e.g. "DDR5 · 6000 MT/s") and the
+// running-vs-rated speed. The label is "" when dmidecode is missing or
+// unreadable, and the dashboard falls back to the total size.
+func readMemoryIdentity(ctx context.Context) (string, MemorySpeed) {
+	out, reason := runDmidecodeMemory(ctx)
+	memType, configured, smbiosRated := parseDmidecodeSpeeds(out)
+	speed := buildMemorySpeed(memType, configured, smbiosRated, readSPDRating(), reason)
+	if out == "" {
+		return "", speed
+	}
+	return parseDmidecodeMemory(out), speed
+}
+
+// dmiMemorySnapshotPath is where sysmon-dmi-memory.service (installed by
+// scripts/install-dmi-memory.sh) leaves `dmidecode -t 17` output at boot. A var
+// so tests can point it at a fixture.
+var dmiMemorySnapshotPath = "/run/sysmon-dmi/memory.txt"
+
+// runDmidecodeMemory returns `dmidecode -t 17` output, or "" plus the reason it
+// could not be read. dmidecode needs root to read the DMI table, and the agent's
+// units set NoNewPrivileges, so a non-root agent cannot escalate even through
+// sudo: it reads the boot snapshot a root oneshot unit wrote instead. Only a
+// root agent (the system unit) runs dmidecode itself.
+func runDmidecodeMemory(ctx context.Context) (string, string) {
+	if data, err := os.ReadFile(dmiMemorySnapshotPath); err == nil && parseDmiHasSpeed(string(data)) {
+		return string(data), ""
+	}
+	if os.Geteuid() != 0 {
+		return "", "DMI table is root-only: run scripts/install-dmi-memory.sh"
+	}
+	path := findDmidecode()
+	if path == "" {
+		return "", "dmidecode is not installed"
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(callCtx, path, "-t", "17").Output()
-	if err != nil {
-		return ""
+	out, err := trackedOutput(exec.CommandContext(callCtx, path, "-t", "17"))
+	if err != nil || !parseDmiHasSpeed(string(out)) {
+		return "", "dmidecode returned no memory speed"
 	}
-	return parseDmidecodeMemory(string(out))
+	return string(out), ""
+}
+
+func findDmidecode() string {
+	if path, err := exec.LookPath("dmidecode"); err == nil {
+		return path
+	}
+	for _, candidate := range dmidecodeCandidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// parseDmiHasSpeed reports whether dmidecode output carries a module speed, so
+// an empty or truncated snapshot falls through instead of counting as a read.
+func parseDmiHasSpeed(out string) bool {
+	_, configured, rated := parseDmidecodeSpeeds(out)
+	return configured > 0 || rated > 0
+}
+
+// readSPDRating decodes every readable DDR5 SPD EEPROM and combines them. It
+// returns the zero rating when the spd5118 driver is not loaded (DDR4 hosts,
+// boards that hide the SMBus), and buildMemorySpeed then falls back to SMBIOS.
+func readSPDRating() memoryRating {
+	paths, _ := filepath.Glob(spdEEPROMGlob)
+	ratings := make([]memoryRating, 0, len(paths))
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if rating, ok := memoryRatingFromSPD(data); ok {
+			ratings = append(ratings, rating)
+		}
+	}
+	return combineMemoryRatings(ratings)
+}
+
+// parseDmidecodeSpeeds pulls the first populated module's type, configured
+// (running) speed and rated speed from `dmidecode -t 17` output, in MT/s.
+func parseDmidecodeSpeeds(out string) (memType string, configured, rated int) {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case memType == "" && strings.HasPrefix(line, "Type:"):
+			value := strings.TrimSpace(strings.TrimPrefix(line, "Type:"))
+			if value != "" && !strings.EqualFold(value, "Unknown") {
+				memType = value
+			}
+		case configured == 0 && strings.HasPrefix(line, "Configured Memory Speed:"):
+			configured = parseDmiMTps(strings.TrimPrefix(line, "Configured Memory Speed:"))
+		case rated == 0 && strings.HasPrefix(line, "Speed:"):
+			rated = parseDmiMTps(strings.TrimPrefix(line, "Speed:"))
+		}
+	}
+	return memType, configured, rated
+}
+
+func parseDmiMTps(raw string) int {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(fields[0])
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // parseDmidecodeMemory pulls the first populated module's type and speed from
@@ -197,7 +307,7 @@ func isWirelessIface(iface string) bool {
 func readWifiSSID(ctx context.Context, iface string) (string, bool) {
 	if path, err := exec.LookPath("iw"); err == nil {
 		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		out, err := exec.CommandContext(callCtx, path, "dev", iface, "link").Output()
+		out, err := trackedOutput(exec.CommandContext(callCtx, path, "dev", iface, "link"))
 		cancel()
 		if err == nil {
 			if ssid, ok := parseIwSSID(string(out)); ok {
@@ -207,7 +317,7 @@ func readWifiSSID(ctx context.Context, iface string) (string, bool) {
 	}
 	if path, err := exec.LookPath("nmcli"); err == nil {
 		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		out, err := exec.CommandContext(callCtx, path, "-t", "-f", "active,ssid", "dev", "wifi").Output()
+		out, err := trackedOutput(exec.CommandContext(callCtx, path, "-t", "-f", "active,ssid", "dev", "wifi"))
 		cancel()
 		if err == nil {
 			if ssid, ok := parseNmcliSSID(string(out)); ok {

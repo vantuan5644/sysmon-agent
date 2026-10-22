@@ -166,3 +166,95 @@ func TestBuildMemoryName(t *testing.T) {
 		}
 	}
 }
+
+// ddr5SPDFixture builds a 1 KiB DDR5 SPD image with the JEDEC period and the
+// optional EXPO/XMP 3.0 profile periods, laid out as on a Kingston
+// KF560C36-32 (BBN-PC): JEDEC 416 ps, EXPO and XMP profile 1 at 333 ps
+// (6000), profile 2 at 357 ps (5600).
+func ddr5SPDFixture(jedecPS int, expoPS, xmpPS []int) []byte {
+	spd := make([]byte, 1024)
+	spd[2] = spdDDR5TypeByte
+	put := func(offset, ps int) { spd[offset], spd[offset+1] = byte(ps), byte(ps>>8) }
+	put(spdJEDECTCKOffset, jedecPS)
+	if len(expoPS) > 0 {
+		copy(spd[spdEXPOOffset:], "EXPO")
+		for i, ps := range expoPS {
+			spd[spdEXPOOffset+5] |= 1 << i
+			put(spdEXPOProfileStart+i*spdEXPOProfileSize+spdEXPOTCKOffset, ps)
+		}
+	}
+	if len(xmpPS) > 0 {
+		spd[spdXMP3Offset], spd[spdXMP3Offset+1] = 0x0C, 0x4A
+		for i, ps := range xmpPS {
+			spd[spdXMP3Offset+3] |= 1 << i
+			put(spdXMP3ProfileStart+i*spdXMP3ProfileSize+spdXMP3TCKOffset, ps)
+		}
+	}
+	return spd
+}
+
+func TestMemoryRatingFromSPDPicksFastestProfile(t *testing.T) {
+	rating, ok := memoryRatingFromSPD(ddr5SPDFixture(416, []int{333, 357}, []int{333, 357}))
+	if !ok {
+		t.Fatal("DDR5 fixture not recognized")
+	}
+	want := memoryRating{JEDECMTps: 4800, ProfileMTps: 6000, ProfileLabel: "EXPO"}
+	if rating != want {
+		t.Fatalf("rating = %+v, want %+v", rating, want)
+	}
+
+	xmpOnly, _ := memoryRatingFromSPD(ddr5SPDFixture(416, nil, []int{312}))
+	if xmpOnly.ProfileMTps != 6400 || xmpOnly.ProfileLabel != "XMP" {
+		t.Fatalf("XMP-only rating = %+v, want XMP 6400", xmpOnly)
+	}
+
+	plain, _ := memoryRatingFromSPD(ddr5SPDFixture(416, nil, nil))
+	if plain.ProfileMTps != 0 || plain.JEDECMTps != 4800 {
+		t.Fatalf("JEDEC-only rating = %+v", plain)
+	}
+
+	notDDR5 := ddr5SPDFixture(416, nil, nil)
+	notDDR5[2] = 0x0C // DDR4
+	if _, ok := memoryRatingFromSPD(notDDR5); ok {
+		t.Fatal("DDR4 SPD decoded as DDR5")
+	}
+}
+
+func TestCombineMemoryRatingsUsesSlowestModule(t *testing.T) {
+	got := combineMemoryRatings([]memoryRating{
+		{JEDECMTps: 4800, ProfileMTps: 6000, ProfileLabel: "EXPO"},
+		{JEDECMTps: 4800, ProfileMTps: 5600, ProfileLabel: "XMP"},
+	})
+	if got.ProfileMTps != 5600 || got.ProfileLabel != "XMP" {
+		t.Fatalf("combined = %+v, want XMP 5600", got)
+	}
+	got = combineMemoryRatings([]memoryRating{
+		{JEDECMTps: 4800, ProfileMTps: 6000, ProfileLabel: "EXPO"},
+		{JEDECMTps: 4800},
+	})
+	if got.ProfileMTps != 0 || got.ProfileLabel != "" {
+		t.Fatalf("a module without a profile must drop it, got %+v", got)
+	}
+}
+
+func TestBuildMemorySpeed(t *testing.T) {
+	spd := memoryRating{JEDECMTps: 4800, ProfileMTps: 6000, ProfileLabel: "EXPO"}
+	got := buildMemorySpeed("DDR5", 6000, 4800, spd, "")
+	want := MemorySpeed{Available: true, Type: "DDR5", ConfiguredMTps: 6000, JEDECMTps: 4800, RatedMTps: 6000, RatedProfile: "EXPO"}
+	if got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+
+	// No SPD (Windows): SMBIOS knows only the JEDEC speed, and says so, so an
+	// EXPO kit running 6000 reads "6000/4800 JEDEC", not a bare "6000/4800".
+	got = buildMemorySpeed("DDR5", 6000, 4800, memoryRating{}, "")
+	if got.RatedMTps != 4800 || got.JEDECMTps != 4800 || got.RatedProfile != "JEDEC" {
+		t.Fatalf("SMBIOS fallback = %+v", got)
+	}
+
+	// Rated speed is still reported when the running speed is unreadable.
+	got = buildMemorySpeed("", 0, 0, spd, "dmidecode needs root")
+	if got.Available || got.Error != "dmidecode needs root" || got.RatedMTps != 6000 {
+		t.Fatalf("unreadable running speed = %+v", got)
+	}
+}

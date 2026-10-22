@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -187,4 +188,127 @@ func buildMemoryName(modules []memoryModuleInfo) string {
 	channel := channelLabel(len(channels), len(populated))
 
 	return composeMemoryName(typeLabel, speedLabel, channel)
+}
+
+// DDR5 SPD layout (JESD400-5) for the fields memoryRatingFromSPD reads. The
+// XMP 3.0 block starts at 0x280 with magic 0x0C 0x4A and a profile-enable
+// bitmap at +3; its profiles are 64-byte blocks from 0x2C0 with tCKAVGmin at
+// +5. The EXPO block starts at 0x340 with magic "EXPO" and a profile-enable
+// bitmap at +5; its profiles are 40-byte blocks from 0x34A with tCKAVGmin at
+// +4. Every tCK is a little-endian picosecond count.
+const (
+	spdDDR5TypeByte     = 0x12
+	spdJEDECTCKOffset   = 20
+	spdXMP3Offset       = 0x280
+	spdXMP3ProfileStart = 0x2C0
+	spdXMP3ProfileSize  = 64
+	spdXMP3TCKOffset    = 5
+	spdEXPOOffset       = 0x340
+	spdEXPOProfileStart = 0x34A
+	spdEXPOProfileSize  = 40
+	spdEXPOTCKOffset    = 4
+)
+
+// memoryRating is what one module's SPD says it can run at.
+type memoryRating struct {
+	JEDECMTps    int
+	ProfileMTps  int
+	ProfileLabel string // "EXPO" or "XMP"; "" when the module has no overclock profile
+}
+
+// mtpsFromTCK converts a DDR clock period in picoseconds to a data rate. Two
+// transfers per clock, so MT/s = 2e6/ps, rounded to the nearest 100 because
+// SPD stores truncated periods (6000 MT/s is 333 ps, which divides to 6006).
+func mtpsFromTCK(ps int) int {
+	if ps <= 0 {
+		return 0
+	}
+	return int(math.Round(2e6/float64(ps)/100)) * 100
+}
+
+func spdLE16(spd []byte, offset int) int {
+	if offset+1 >= len(spd) {
+		return 0
+	}
+	return int(spd[offset]) | int(spd[offset+1])<<8
+}
+
+// memoryRatingFromSPD decodes a DDR5 module's JEDEC speed and its fastest
+// enabled EXPO or XMP 3.0 profile. ok is false for anything that is not a DDR5
+// SPD image. A kit carrying both profile kinds at the same speed reports EXPO,
+// since AMD boards (the only ones that read EXPO) list it first.
+func memoryRatingFromSPD(spd []byte) (memoryRating, bool) {
+	if len(spd) < spdJEDECTCKOffset+2 || spd[2] != spdDDR5TypeByte {
+		return memoryRating{}, false
+	}
+	rating := memoryRating{JEDECMTps: mtpsFromTCK(spdLE16(spd, spdJEDECTCKOffset))}
+	consider := func(label string, mtps int) {
+		if mtps > rating.ProfileMTps {
+			rating.ProfileMTps, rating.ProfileLabel = mtps, label
+		}
+	}
+	if len(spd) > spdEXPOProfileStart && string(spd[spdEXPOOffset:spdEXPOOffset+4]) == "EXPO" {
+		enabled := spd[spdEXPOOffset+5]
+		for i := 0; i < 2; i++ {
+			if enabled&(1<<i) != 0 {
+				consider("EXPO", mtpsFromTCK(spdLE16(spd, spdEXPOProfileStart+i*spdEXPOProfileSize+spdEXPOTCKOffset)))
+			}
+		}
+	}
+	if len(spd) > spdXMP3ProfileStart && spd[spdXMP3Offset] == 0x0C && spd[spdXMP3Offset+1] == 0x4A {
+		enabled := spd[spdXMP3Offset+3]
+		for i := 0; i < 3; i++ {
+			if enabled&(1<<i) != 0 {
+				consider("XMP", mtpsFromTCK(spdLE16(spd, spdXMP3ProfileStart+i*spdXMP3ProfileSize+spdXMP3TCKOffset)))
+			}
+		}
+	}
+	return rating, true
+}
+
+// combineMemoryRatings folds per-module ratings into one: the slowest module
+// sets the ceiling for the whole kit, so both speeds take the minimum across
+// modules. The profile is dropped if any module lacks one.
+func combineMemoryRatings(ratings []memoryRating) memoryRating {
+	if len(ratings) == 0 {
+		return memoryRating{}
+	}
+	combined := ratings[0]
+	for _, r := range ratings[1:] {
+		if r.JEDECMTps < combined.JEDECMTps {
+			combined.JEDECMTps = r.JEDECMTps
+		}
+		if r.ProfileMTps == 0 {
+			combined.ProfileMTps, combined.ProfileLabel = 0, ""
+		} else if combined.ProfileMTps != 0 && r.ProfileMTps < combined.ProfileMTps {
+			combined.ProfileMTps, combined.ProfileLabel = r.ProfileMTps, r.ProfileLabel
+		}
+	}
+	return combined
+}
+
+// buildMemorySpeed assembles the memory_speed metric from the running speed,
+// the SMBIOS-rated speed and an SPD rating (zero when no SPD was readable).
+// The SPD profile is the rating that matters, because SMBIOS reports the JEDEC
+// speed and so can never show an EXPO/XMP gap; an SMBIOS-only rating is
+// labeled "JEDEC".
+func buildMemorySpeed(memType string, configured, smbiosRated int, spd memoryRating, unavailableReason string) MemorySpeed {
+	speed := MemorySpeed{Type: memType, ConfiguredMTps: configured, JEDECMTps: spd.JEDECMTps}
+	switch {
+	case spd.ProfileMTps > 0:
+		speed.RatedMTps, speed.RatedProfile = spd.ProfileMTps, spd.ProfileLabel
+	case spd.JEDECMTps > 0:
+		speed.RatedMTps, speed.RatedProfile = spd.JEDECMTps, "JEDEC"
+	case smbiosRated > 0:
+		// SMBIOS reports the module's JEDEC speed, not an EXPO/XMP profile
+		// (measured: bblwin's EXPO-6000 kit reads 4800), so name it as such
+		// rather than let "6000/4800" read as running past its rating.
+		speed.JEDECMTps, speed.RatedMTps, speed.RatedProfile = smbiosRated, smbiosRated, "JEDEC"
+	}
+	if configured > 0 {
+		speed.Available = true
+	} else {
+		speed.Error = unavailableReason
+	}
+	return speed
 }
