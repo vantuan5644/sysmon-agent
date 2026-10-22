@@ -5,9 +5,16 @@ const args = process.argv.slice(2);
 const sampleMode = args.includes("--sample");
 const settingsRoundTrip = args.includes("--settings-roundtrip");
 const clientCheckRoundTrip = args.includes("--client-check-roundtrip");
+// --agent-budget[=cores]: in live mode, fail when the agent's own CPU cost
+// (processes.agent.cpu_cores, agent_cost.go) is over budget. Every
+// /api/metrics fetch counts as demand, so the slow lane - the expensive half -
+// runs while this measures, the condition the 2026-09-10 regression needed.
+// SYSMON_AGENT_CPU_BUDGET_CORES overrides the default.
+const agentBudgetArg = args.find((arg) => arg === "--agent-budget" || arg.startsWith("--agent-budget="));
+const agentBudgetCores = agentBudgetArg ? parseAgentBudget(agentBudgetArg) : null;
 const baseURL = normalizeBaseURL(args.find((arg) => !arg.startsWith("--")) || defaultBaseURL);
 const timeoutMS = 5000;
-const dashboardBuild = "sysmon-static-v156";
+const dashboardBuild = "sysmon-static-v165";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,
@@ -51,6 +58,7 @@ if (sampleMode) {
   validateCodexUsage(sampleCodexUsageUnconfigured());
   validateCodexUsage(sampleCodexUsageConfigured());
   validateCodexUsage({ ...sampleCodexUsageConfigured(), source: "live" });
+  validateHistory(sampleHistory());
   if (settingsRoundTrip) {
     validateSettings(roundTripSampleSettings(), roundTripSettings);
     validateStatus(sampleStatus(roundTripSampleSettings()), roundTripSettings);
@@ -88,6 +96,13 @@ if (sampleMode) {
 
   const codexUsage = await fetchJSON("/api/codex-usage");
   validateCodexUsage(codexUsage);
+
+  const history = await fetchJSON("/api/history");
+  validateHistory(history);
+
+  if (agentBudgetCores !== null) {
+    await assertAgentCostWithinBudget(agentBudgetCores);
+  }
 
   if (settingsRoundTrip) {
     await assertSettingsRejectsMissingOrigin();
@@ -200,6 +215,80 @@ async function assertSettingsRejectsMissingOrigin() {
   assert(status === 403, `settings without Origin returned HTTP ${status}, want 403`);
 }
 
+function parseAgentBudget(arg) {
+  const raw = process.env.SYSMON_AGENT_CPU_BUDGET_CORES || (arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : "0.5");
+  const cores = Number(raw);
+  if (!Number.isFinite(cores) || cores <= 0) {
+    console.error(`agent CPU budget must be a positive number of cores, got ${JSON.stringify(raw)}`);
+    process.exit(2);
+  }
+  return cores;
+}
+
+// assertAgentCostWithinBudget takes the median of three readings two seconds
+// apart (a pass in which a long-lived child exits charges its whole lifetime
+// at once, so one reading can spike) and compares it with the budget.
+async function assertAgentCostWithinBudget(budget) {
+  const readings = [];
+  const deadline = Date.now() + 30000;
+  while (readings.length < 3 && Date.now() < deadline) {
+    const metrics = await fetchJSON("/api/metrics");
+    const agent = metrics?.processes?.agent;
+    if (agent?.available && agent.cpu_cores?.available) {
+      readings.push({ cores: agent.cpu_cores.value, members: agent.members || [] });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  assert(readings.length > 0, "processes.agent.cpu_cores never became available; is the agent older than agent_cost.go?");
+  const sorted = [...readings].sort((a, b) => a.cores - b.cores);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const names = median.members.map((member) => `${member.name}${member.count > 1 ? ` x${member.count}` : ""}`).join(", ");
+  assert(
+    median.cores <= budget,
+    `agent costs ${median.cores.toFixed(3)} cores (median of ${readings.length}), over the ${budget}-core budget; its processes: ${names || "unknown"}`,
+  );
+  console.log(`ok: agent cost ${median.cores.toFixed(3)} cores, median of ${readings.length} (budget ${budget})`);
+}
+
+// validateHistory checks GET /api/history (history.go): oldest-first 5 s
+// buckets on the host clock, each field a number or an explicit null gap.
+function validateHistory(history) {
+  assertObject(history, "history");
+  assertInteger(history.step_seconds, "history.step_seconds", { min: 1 });
+  assertInteger(history.retention_seconds, "history.retention_seconds", { min: history.step_seconds });
+  assert(Array.isArray(history.points), "history.points must be an array");
+  let previous = -Infinity;
+  history.points.forEach((point, index) => {
+    const name = `history.points[${index}]`;
+    assertObject(point, name);
+    assertInteger(point.t, `${name}.t`, { min: 0 });
+    assert(point.t % (history.step_seconds * 1000) === 0, `${name}.t is not on a bucket boundary`);
+    assert(point.t > previous, `${name}.t is not after the previous point`);
+    previous = point.t;
+    for (const key of ["cpu", "mem", "gpu", "net_rx", "net_tx", "disk"]) {
+      assert(key in point, `${name}.${key} must be present (null for a gap)`);
+      const value = point[key];
+      assert(value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0), `${name}.${key} must be null or a non-negative number`);
+    }
+    for (const key of ["cpu", "mem", "gpu"]) {
+      assert(point[key] === null || point[key] <= 100, `${name}.${key} must be 0-100`);
+    }
+  });
+}
+
+function sampleHistory() {
+  const now = Date.now();
+  const bucket = now - (now % 5000);
+  return {
+    step_seconds: 5,
+    retention_seconds: 900,
+    points: [
+      { t: bucket - 5000, cpu: 12.5, mem: 40.1, gpu: null, net_rx: null, net_tx: null, disk: null },
+      { t: bucket, cpu: 95, mem: 40.2, gpu: 31, net_rx: 2048, net_tx: 512, disk: 4_194_304 },
+    ],
+  };
+}
+
 function validateHealth(health) {
   assertObject(health, "health");
   assert(health.status === "ok", "health.status must be ok");
@@ -254,6 +343,20 @@ function validateMetrics(metrics) {
   validateNumberMetric(metrics.cpu_percent, "metrics.cpu_percent", { unit: "%", allowUnavailable: false, min: 0, max: 100 });
   validateCPUCores(metrics.cpu_cores);
   validateCapacityMetric(metrics.memory, "metrics.memory", { allowUnavailable: false });
+  // Commit charge (Windows) and pressure stall information (Linux); each OS
+  // reports the other's as unavailable (pressure.go).
+  if (metrics.memory_commit !== undefined) {
+    validateCapacityMetric(metrics.memory_commit, "metrics.memory_commit", { allowUnavailable: true });
+  }
+  if (metrics.pressure !== undefined) {
+    assertObject(metrics.pressure, "metrics.pressure");
+    assert(typeof metrics.pressure.available === "boolean", "metrics.pressure.available must be boolean");
+    for (const key of ["cpu_some", "memory_some", "memory_full", "io_some", "io_full"]) {
+      if (metrics.pressure[key] !== undefined) {
+        validateProcessNumberMetric(metrics.pressure[key], `metrics.pressure.${key}`, "%", 0, 100);
+      }
+    }
+  }
 
   assert(Array.isArray(metrics.disks) && metrics.disks.length > 0, "metrics.disks must include at least one item");
   metrics.disks.forEach((disk, index) => {
@@ -271,6 +374,7 @@ function validateMetrics(metrics) {
   validateStorage(metrics.storage);
   validateProcesses(metrics.processes);
   validateCollectionErrors(metrics.collection_errors);
+  validateCollectionErrors(metrics.collection_notes, "metrics.collection_notes");
 }
 
 // validateCPUCores checks the optional per-core utilization set. It degrades as
@@ -598,6 +702,19 @@ function validateGPU(gpu) {
       min: -50,
       max: 150,
     });
+    // Engine types (gpu_engines.go), busiest first; absent when none reported.
+    if (device.engines !== undefined) {
+      assert(Array.isArray(device.engines), `metrics.gpu.devices[${index}].engines must be an array`);
+      let previous = Infinity;
+      device.engines.forEach((engine, e) => {
+        const name = `metrics.gpu.devices[${index}].engines[${e}]`;
+        assertNonEmptyString(engine?.name, `${name}.name`);
+        validateProcessNumberMetric(engine.usage_percent, `${name}.usage_percent`, "%", 0, 100);
+        const value = engine.usage_percent.available ? engine.usage_percent.value : 0;
+        assert(value <= previous, `${name} is busier than the engine before it`);
+        previous = value;
+      });
+    }
   });
 }
 
@@ -632,6 +749,12 @@ function validateStorage(storage) {
       min: -50,
       max: 150,
     });
+    // Throughput (storage_rates.go); absent from agents older than it.
+    for (const key of ["read_bytes_per_second", "write_bytes_per_second"]) {
+      if (device[key] !== undefined) {
+        validateProcessNumberMetric(device[key], `metrics.storage.devices[${index}].${key}`, "B/s", 0);
+      }
+    }
   });
 }
 
@@ -651,12 +774,39 @@ function validateProcesses(processes) {
     return;
   }
   assertInteger(processes.total, "metrics.processes.total", { min: 0 });
+  if (processes.agent !== undefined) {
+    const agent = processes.agent;
+    assertObject(agent, "metrics.processes.agent");
+    assert(typeof agent.available === "boolean", "metrics.processes.agent.available must be boolean");
+    validateProcessNumberMetric(agent.cpu_percent, "metrics.processes.agent.cpu_percent", "%", 0, 100);
+    validateProcessNumberMetric(agent.cpu_cores, "metrics.processes.agent.cpu_cores", "cores", 0);
+    validateProcessNumberMetric(agent.memory_bytes, "metrics.processes.agent.memory_bytes", "B", 0);
+    if (agent.available) {
+      assertInteger(agent.pid, "metrics.processes.agent.pid", { min: 1 });
+      assertInteger(agent.processes, "metrics.processes.agent.processes", { min: 1 });
+    } else {
+      assertNonEmptyString(agent.error, "metrics.processes.agent.error");
+    }
+  }
   (processes.apps || []).forEach((app, index) => {
     assertObject(app, `metrics.processes.apps[${index}]`);
     assertNonEmptyString(app.name, `metrics.processes.apps[${index}].name`);
     assertInteger(app.count, `metrics.processes.apps[${index}].count`, { min: 1 });
+    if (app.members !== undefined) {
+      assert(Array.isArray(app.members), `metrics.processes.apps[${index}].members must be an array`);
+      let merged = 0;
+      app.members.forEach((member, m) => {
+        assertNonEmptyString(member?.name, `metrics.processes.apps[${index}].members[${m}].name`);
+        assertInteger(member.count, `metrics.processes.apps[${index}].members[${m}].count`, { min: 1 });
+        merged += member.count;
+      });
+      assert(merged <= app.count, `metrics.processes.apps[${index}].members count more processes than the row merged`);
+    }
     validateProcessNumberMetric(app.cpu_percent, `metrics.processes.apps[${index}].cpu_percent`, "%", 0, 100);
     validateProcessNumberMetric(app.memory_bytes, `metrics.processes.apps[${index}].memory_bytes`, "B", 0);
+    if (app.gpu_percent !== undefined) {
+      validateProcessNumberMetric(app.gpu_percent, `metrics.processes.apps[${index}].gpu_percent`, "%", 0, 100);
+    }
     validateProcessNumberMetric(app.gpu_memory, `metrics.processes.apps[${index}].gpu_memory`, "B", 0);
     validateProcessNumberMetric(app.disk_read, `metrics.processes.apps[${index}].disk_read`, "B/s", 0);
     validateProcessNumberMetric(app.disk_write, `metrics.processes.apps[${index}].disk_write`, "B/s", 0);
@@ -665,8 +815,17 @@ function validateProcesses(processes) {
     assertObject(proc, `metrics.processes.processes[${index}]`);
     assertInteger(proc.pid, `metrics.processes.processes[${index}].pid`, { min: 1 });
     assertNonEmptyString(proc.name, `metrics.processes.processes[${index}].name`);
+    // Process tree fields (process_tree.go); absent from agents older than it.
+    if (proc.ppid !== undefined) {
+      assertInteger(proc.ppid, `metrics.processes.processes[${index}].ppid`, { min: 0 });
+      assert(proc.ppid !== proc.pid, `metrics.processes.processes[${index}] is its own parent`);
+      assertInteger(proc.children, `metrics.processes.processes[${index}].children`, { min: 0 });
+    }
     validateProcessNumberMetric(proc.cpu_percent, `metrics.processes.processes[${index}].cpu_percent`, "%", 0, 100);
     validateProcessNumberMetric(proc.memory_bytes, `metrics.processes.processes[${index}].memory_bytes`, "B", 0);
+    if (proc.gpu_percent !== undefined) {
+      validateProcessNumberMetric(proc.gpu_percent, `metrics.processes.processes[${index}].gpu_percent`, "%", 0, 100);
+    }
     validateProcessNumberMetric(proc.gpu_memory, `metrics.processes.processes[${index}].gpu_memory`, "B", 0);
     validateProcessNumberMetric(proc.disk_read, `metrics.processes.processes[${index}].disk_read`, "B/s", 0);
     validateProcessNumberMetric(proc.disk_write, `metrics.processes.processes[${index}].disk_write`, "B/s", 0);
@@ -823,6 +982,7 @@ function sampleMetrics() {
     collection_duration_ms: 142,
     cpu_name: "AMD Ryzen 9 7950X",
     memory_name: "DDR5 · 6000 MT/s",
+    memory_speed: { available: true, type: "DDR5", configured_mtps: 6000, jedec_mtps: 4800, rated_mtps: 6000, rated_profile: "EXPO" },
     cpu_percent: { available: true, value: 37, unit: "%" },
     cpu_power: { available: false, unit: "W", error: "no CPU package power counters found" },
     psu_output_power: { available: false, unit: "W", error: "no PSU output power sensor exposed on Linux" },
@@ -838,6 +998,15 @@ function sampleMetrics() {
     cpu_temperature: { available: false, unit: "C", error: "no CPU temperature sensor reported" },
     cpu_cores: { available: true, cores: [95, 12, 88, 4], count: 4, busy: 2, busy_threshold: 80 },
     memory: { available: true, used_bytes: 8_589_934_592, total_bytes: 17_179_869_184, percent: 50 },
+    memory_commit: { available: false, used_bytes: 0, total_bytes: 0, percent: 0, error: "Linux overcommits by default, so commit charge has no enforced limit; see pressure" },
+    pressure: {
+      available: true,
+      cpu_some: { available: true, value: 1.25, unit: "%" },
+      memory_some: { available: true, value: 0.4, unit: "%" },
+      memory_full: { available: true, value: 0, unit: "%" },
+      io_some: { available: true, value: 12, unit: "%" },
+      io_full: { available: true, value: 3.5, unit: "%" },
+    },
     disks: [{
       name: "root",
       mountpoint: "/",
@@ -854,6 +1023,8 @@ function sampleMetrics() {
           mountpoints: ["/"],
           capacity: { available: true, used_bytes: 50_000_000_000, total_bytes: 100_000_000_000, percent: 50 },
           temperature_celsius: { available: true, value: 46, unit: "C" },
+          read_bytes_per_second: { available: true, value: 2_500_000, unit: "B/s" },
+          write_bytes_per_second: { available: false, unit: "B/s", error: "disk I/O sampler is warming up" },
         },
         {
           name: "nvme2n1",
@@ -889,15 +1060,29 @@ function sampleMetrics() {
         power_watts: { available: false, unit: "W", error: "DRM GPU power not exposed" },
         memory: { available: false, error: "DRM VRAM usage not exposed" },
         temperature_celsius: { available: true, value: 49, unit: "C" },
+        engines: [
+          { name: "Video Encode", usage_percent: { available: true, value: 12, unit: "%" } },
+          { name: "Video Decode", usage_percent: { available: true, value: 0, unit: "%" } },
+        ],
       }],
       error: "nvidia-smi not found",
     },
     processes: {
       available: true,
       total: 142,
+      agent: {
+        available: true,
+        pid: 4242,
+        cpu_percent: { available: true, value: 0.21, unit: "%" },
+        cpu_cores: { available: true, value: 0.07, unit: "cores" },
+        memory_bytes: { available: true, value: 245_366_784, unit: "B" },
+        processes: 3,
+        members: [{ name: "sysmon-agent", count: 1 }, { name: "pwsh", count: 1 }, { name: "conhost", count: 1 }],
+      },
       apps: [{
         name: "chrome",
         count: 12,
+        members: [{ name: "chrome", count: 11 }, { name: "crashpad_handler", count: 1 }],
         cpu_percent: { available: true, value: 23.5, unit: "%" },
         memory_bytes: { available: true, value: 4_294_967_296, unit: "B" },
         gpu_memory: { available: true, value: 536_870_912, unit: "B" },
@@ -907,8 +1092,15 @@ function sampleMetrics() {
       processes: [{
         pid: 4321,
         name: "chrome",
+        ppid: 1,
+        parent_name: "systemd",
+        children: 3,
+        launcher: "chrome",
+        launcher_pid: 4321,
         cpu_percent: { available: true, value: 18.2, unit: "%" },
         memory_bytes: { available: true, value: 805_306_368, unit: "B" },
+        gpu_percent: { available: true, value: 41.6, unit: "%" },
+        gpu_engine: "Video Encode",
         gpu_memory: { available: false, unit: "B", error: "not a CUDA/compute process" },
         disk_read: { available: false, unit: "B/s", error: "insufficient privilege or warming up" },
         disk_write: { available: false, unit: "B/s", error: "insufficient privilege or warming up" },
@@ -924,6 +1116,9 @@ function sampleMetrics() {
       "gpu Intel GPU card1 usage: DRM GPU usage not exposed",
       "gpu Intel GPU card1 power: DRM GPU power not exposed",
       "gpu Intel GPU card1 memory: DRM VRAM usage not exposed",
+    ],
+    collection_notes: [
+      "storage CT4000T710SSD8 capacity: no mounted filesystems",
     ],
   };
 }

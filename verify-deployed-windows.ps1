@@ -773,12 +773,13 @@ try {
     if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
         throw 'node is required for deployed API schema validation'
     }
-    Write-Host 'Checking deployed API schema...'
-    & node verify-api.mjs $BaseUrl
+    Write-Host 'Checking deployed API schema and the agent own CPU cost...'
+    & node verify-api.mjs $BaseUrl --agent-budget
     if ($LASTEXITCODE -ne 0) {
-        throw 'deployed API schema validation failed'
+        throw 'deployed API schema or agent CPU budget validation failed'
     }
     Write-Report 'api_schema=pass'
+    Write-Report 'agent_cost=pass'
 
     Write-Host 'Checking deployed dashboard/PWA install assets...'
     Test-PwaInstallAssets $BaseUrl

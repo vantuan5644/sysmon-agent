@@ -61,6 +61,7 @@ func main() {
 	// an agent's /api/status, only when a dashboard asks for the host list.
 	peerList := flag.String("peers", envString("SYSMON_PEERS", ""), "other agents the dashboard can switch to, comma-separated [name=]URL entries (e.g. minipc=https://minipc.example.ts.net:9443)")
 	peerDiscovery := flag.Bool("peer-discovery", envBool("SYSMON_PEER_DISCOVERY", true), "find other agents on the tailnet (tailscale status, then one request each to :9443 and :9099) when a dashboard opens the host list")
+	storageExclude := flag.String("storage-exclude", envString("SYSMON_STORAGE_EXCLUDE", ""), "drives to leave out of the storage panel and send nothing to, comma-separated parts of their model as the panel shows it (e.g. \"ZEPHYR USB DISK\")")
 	showVersion := flag.Bool("version", false, "print the build version and exit")
 	flag.Parse()
 
@@ -132,6 +133,12 @@ func main() {
 	}
 
 	collector := NewSystemCollector()
+	if exclude := parseStorageExclusions(*storageExclude); len(exclude) > 0 {
+		if excluder, ok := collector.(interface{ ExcludeStorage(storageExclusions) }); ok {
+			excluder.ExcludeStorage(exclude)
+			log.Printf("storage: leaving out drives whose model contains %q", []string(exclude))
+		}
+	}
 	// The resident sampler keeps a warm in-memory snapshot (fast lane: CPU/RAM;
 	// slow lane: everything else) and exposes an SSE stream, so the HTTP layer
 	// serves metrics instantly instead of spawning a collection per request. It

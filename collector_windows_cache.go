@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -22,7 +23,13 @@ const (
 	// from the bridge on every pass, so stale rows are worth far more than an
 	// empty panel - but not forever, or a removed drive would haunt the
 	// dashboard indefinitely.
-	windowsStorageStaleGrace  = 15 * time.Minute
+	windowsStorageStaleGrace = 15 * time.Minute
+	// windowsStorageDiscoveryWait is how long the first sample waits for the
+	// first discovery, and how long a later refresh may run before it is
+	// reported as unfinished. It covers windowsDeviceReadBudget, the longest a
+	// discovery waits on a slow drive.
+	windowsStorageDiscoveryWait = 6 * time.Second
+
 	windowsTailscaleTTL       = 15 * time.Second
 	windowsUplinkCacheTTL     = 60 * time.Second
 	windowsGPUCacheTTL        = 5 * time.Second
@@ -65,38 +72,93 @@ func (c *systemCollector) cachedWindowsSwap(ctx context.Context) CapacityMetric 
 	return value
 }
 
-// cachedWindowsStorageRows refreshes physical-disk discovery on a long TTL and,
-// when a refresh fails, keeps serving the last successful rows for a bounded
-// grace period rather than reporting the whole set unavailable. Failures are
-// also retried well before the success TTL: the observed failure here was a
-// transient one (the query measured 2.0 s against its budget on an idle host
-// and exited 0), so holding it for five minutes made a momentary miss look like
-// a broken collector.
+// cachedWindowsStorageRows serves physical-disk discovery from a cache that is
+// refreshed in the background on a long TTL. When a refresh fails it keeps
+// serving the last successful rows for a bounded grace period rather than
+// reporting the whole set unavailable, and retries well before the success TTL
+// so a momentary miss does not look like a broken collector.
+//
+// The slow lane never waits on a refresh. It used to run inline, so a
+// discovery stalled by one slow drive held back power, temperatures, GPU and
+// network with it: 8 s of every 45 s while BBLWIN's ZEPHYR recorder was
+// plugged in (see collector_windows_storage.go). Only the very first discovery
+// is waited for, briefly, so the first sample and -self-check have rows.
 func (c *systemCollector) cachedWindowsStorageRows(ctx context.Context) ([]windowsPhysicalDisk, error) {
-	now := time.Now()
 	c.mu.Lock()
-	rows, lastErr, goodAt, attemptAt := c.storageRows, c.storageRowsErr, c.storageRowsAt, c.storageAttemptAt
+	c.startWindowsStorageRefreshLocked(time.Now())
+	pending, first := c.storageRefresh, c.storageAttemptAt.IsZero()
 	c.mu.Unlock()
 
-	ttl := windowsStorageCacheTTL
-	if lastErr != nil {
-		ttl = windowsStorageRetryAfter
-	}
-	if !attemptAt.IsZero() && now.Sub(attemptAt) < ttl {
-		return windowsStorageRowsOrError(rows, lastErr, goodAt, now)
+	if pending != nil && first {
+		timer := time.NewTimer(windowsStorageDiscoveryWait)
+		select {
+		case <-pending:
+		case <-timer.C:
+		case <-ctx.Done():
+		}
+		timer.Stop()
 	}
 
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	err := c.storageRowsErr
+	// A refresh that outlives the first-sample wait is the current story, so
+	// it replaces the last completed attempt's error. It still only surfaces
+	// once the last good rows are past windowsStorageStaleGrace.
+	if c.storageRefresh != nil && (c.storageAttemptAt.IsZero() || now.Sub(c.storageRefreshAt) >= windowsStorageDiscoveryWait) {
+		err = fmt.Errorf("storage discovery has not finished after %s", now.Sub(c.storageRefreshAt).Round(100*time.Millisecond))
+	}
+	return windowsStorageRowsOrError(c.storageRows, err, c.storageRowsAt, now)
+}
+
+// startWindowsStorageRefreshLocked starts a background discovery when the
+// cached one is due and none is running. One at a time: a discovery stuck on
+// a hung device blocks only the next refresh, never piles up goroutines. The
+// caller holds c.mu.
+func (c *systemCollector) startWindowsStorageRefreshLocked(now time.Time) {
+	if c.storageRefresh != nil {
+		return
+	}
+	ttl := windowsStorageCacheTTL
+	if c.storageRowsErr != nil {
+		ttl = windowsStorageRetryAfter
+	}
+	if !c.storageAttemptAt.IsZero() && now.Sub(c.storageAttemptAt) < ttl {
+		return
+	}
+	discover := c.storageDiscover
+	if discover == nil {
+		exclude := c.storageExclude
+		discover = func() ([]windowsPhysicalDisk, error) { return discoverWindowsPhysicalDisks(exclude) }
+	}
+	done := make(chan struct{})
+	c.storageRefresh, c.storageRefreshAt = done, now
+	go c.runWindowsStorageRefresh(discover, done)
+}
+
+func (c *systemCollector) runWindowsStorageRefresh(discover func() ([]windowsPhysicalDisk, error), done chan struct{}) {
 	var fresh []windowsPhysicalDisk
-	err := runPowerShellJSONArrayWithTimeout(ctx, windowsStorageScript, &fresh, windowsStorageQueryTimeout)
+	var err error
+	func() {
+		// Nothing above this goroutine recovers a panic, and an unrecovered one
+		// would take the whole agent down.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				fresh, err = nil, fmt.Errorf("storage discovery panicked: %v", recovered)
+			}
+		}()
+		fresh, err = discover()
+	}()
 	completed := time.Now()
 	c.mu.Lock()
 	c.storageRowsErr, c.storageAttemptAt = err, completed
 	if err == nil {
 		c.storageRows, c.storageRowsAt = fresh, completed
 	}
-	rows, goodAt = c.storageRows, c.storageRowsAt
+	c.storageRefresh = nil
 	c.mu.Unlock()
-	return windowsStorageRowsOrError(rows, err, goodAt, completed)
+	close(done)
 }
 
 // windowsStorageRowsOrError picks between the last good discovery and the error

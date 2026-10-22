@@ -76,12 +76,22 @@ type systemCollector struct {
 	// derive per-process CPU% as a delta. It is replaced wholesale each slow
 	// pass, so dead PIDs are pruned automatically. Guarded by mu.
 	prevProc map[int]procSample
+	// agentCost measures the agent's own footprint from each process pass.
+	// Carries its own lock.
+	agentCost agentCostTracker
+	// diskRates turns IOCTL_DISK_PERFORMANCE counters into per-drive
+	// throughput. Carries its own lock.
+	diskRates diskRateTracker
+	// gpuEngines holds the GPU Engine PDH query and the DXGI adapter list.
+	// Carries its own lock.
+	gpuEngines gpuEngineSampler
 	// hardwareOnce resolves the static identity strings (CPU model, RAM
 	// type/speed/channel) exactly once -- they never change at runtime and the
 	// lookups spawn CIM queries, so this keeps the cost off every slow pass.
 	hardwareOnce sync.Once
 	cpuName      string
 	memoryName   string
+	memorySpeed  MemorySpeed
 	// clockBase is static firmware identity. Resolving it once keeps the
 	// Win32_Processor CIM query off every active slow pass.
 	clockBaseOnce sync.Once
@@ -95,10 +105,24 @@ type systemCollector struct {
 	// storageRows / storageRowsAt hold the last SUCCESSFUL discovery; a failed
 	// pass updates storageRowsErr and storageAttemptAt only, so the rows
 	// survive a transient query failure (see cachedWindowsStorageRows).
-	storageRows        []windowsPhysicalDisk
-	storageRowsErr     error
-	storageRowsAt      time.Time
-	storageAttemptAt   time.Time
+	// storageRefresh is non-nil while a background discovery runs (closed when
+	// it finishes) and storageRefreshAt is when it started. storageDiscover
+	// replaces discoverWindowsPhysicalDisks in tests. storageExclude is set once,
+	// before the sampler starts (ExcludeStorage).
+	storageRows      []windowsPhysicalDisk
+	storageRowsErr   error
+	storageRowsAt    time.Time
+	storageAttemptAt time.Time
+	storageRefresh   chan struct{}
+	storageRefreshAt time.Time
+	storageDiscover  func() ([]windowsPhysicalDisk, error)
+	storageExclude   storageExclusions
+	// driveTemps caches each drive's last temperature by drive name
+	// (guarded by mu); driveTempReads keeps one read per drive outstanding.
+	// readDriveTemp replaces readWindowsDriveTemperature in tests.
+	driveTemps         map[string]cachedDriveTemperature
+	driveTempReads     boundedReads[float64]
+	readDriveTemp      func(name string) (float64, error)
 	tailscaleCached    TailscaleStatus
 	tailscaleAt        time.Time
 	gpuCached          GPUSet
@@ -173,6 +197,7 @@ func (c *systemCollector) EnablePersistentBridge() {
 // inner collector on graceful shutdown, sending stdin EOF (clean pwsh exit) and
 // best-effort-killing any lingering process so a service stop leaves no orphan.
 func (c *systemCollector) Close() error {
+	c.gpuEngines.close()
 	c.lhmMu.Lock()
 	daemon := c.daemon
 	c.lhmMu.Unlock()
@@ -188,7 +213,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.Platform = c.platformCache.Get(func() string {
 		return windowsPlatform(ctx)
 	})
-	metrics.CPUName, metrics.MemoryName = c.resolveHardwareNames(ctx)
+	metrics.CPUName, metrics.MemoryName, metrics.MemorySpeed = c.resolveHardwareNames(ctx)
 
 	var wg sync.WaitGroup
 	var cpu NumberMetric
@@ -217,6 +242,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	// Computer.Open() calls, so the bridge runs once per sample behind a
 	// collector-scoped mutex and feeds both CPU power and temperatures.
 	bridgeResult, bridgeErr := c.fetchLhmBridge(ctx)
+	engines := c.gpuEngines.warmSummary()
 	collectMetricAsync(&wg, &cpuPower, func() NumberMetric {
 		return windowsCPUPowerFromBridge(bridgeResult, bridgeErr)
 	}, func(recovered any) NumberMetric {
@@ -243,9 +269,13 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	}, func(recovered any) cpuClockSet {
 		return degradedCPUClockSet(fmt.Sprintf("Windows CPU clock collector panicked: %v", recovered))
 	})
+	var commit CapacityMetric
 	collectMetricAsync(&wg, &memory, func() CapacityMetric {
-		return windowsMemoryFast()
+		physical, committed := windowsMemoryStatusFast()
+		commit = committed
+		return physical
 	}, func(recovered any) CapacityMetric {
+		commit = unavailableCapacity(fmt.Sprintf("Windows memory collector panicked: %v", recovered))
 		return unavailableCapacity(fmt.Sprintf("Windows memory collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &swap, func() CapacityMetric {
@@ -259,7 +289,9 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return unavailableDisk(fmt.Sprintf("Windows disk collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &storage, func() StorageSet {
-		return c.cachedWindowsStorage(ctx, bridgeResult, bridgeErr)
+		set := c.cachedWindowsStorage(ctx)
+		c.applyWindowsStorageRates(&set)
+		return set
 	}, func(recovered any) StorageSet {
 		return unavailableStorage(fmt.Sprintf("Windows storage collector panicked: %v", recovered))
 	})
@@ -284,11 +316,14 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Windows Tailscale collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &processes, func() ProcessSet {
-		return c.collectProcesses(ctx)
+		return c.collectProcesses(ctx, engines)
 	}, func(recovered any) ProcessSet {
 		return unavailableProcessSet(fmt.Sprintf("Windows process collector panicked: %v", recovered))
 	})
 	wg.Wait()
+	if engines.Available {
+		gpu = attachGPUEngines(gpu, c.gpuEngines.dxgiAdapters(), engines)
+	}
 
 	metrics.CPU = cpu
 	metrics.CPUCores = c.windowsCPUCores(ctx)
@@ -301,6 +336,8 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.PSUOutputPower = psuOutputPower
 	metrics.Memory = memory
 	metrics.MemorySwap = swap
+	metrics.MemoryCommit = commit
+	metrics.Pressure = unavailablePressure(windowsNoPressureMessage)
 	metrics.Disks = disks
 	metrics.Storage = storage
 	metrics.Network = network
@@ -397,83 +434,37 @@ func windowsSwap(ctx context.Context) CapacityMetric {
 	return availableCapacity(current*mib, allocated*mib)
 }
 
-// windowsPhysicalDisk is the JSON shape emitted by the MSFT_PhysicalDisk +
-// MSFT_Partition/MSFT_Volume join below: one entry per physical drive with its
-// model, physical size, and aggregated used/total over the drive-lettered
+// windowsPhysicalDisk is one physical drive from discoverWindowsPhysicalDisks:
+// its model, physical size, and aggregated used/total over the drive-lettered
 // volumes that live on it.
 type windowsPhysicalDisk struct {
-	Name        string   `json:"name"`
-	Model       string   `json:"model"`
-	SizeBytes   uint64   `json:"size_bytes"`
-	UsedBytes   uint64   `json:"used_bytes"`
-	TotalBytes  uint64   `json:"total_bytes"`
-	Mountpoints []string `json:"mountpoints"`
-	// BusType is the MSFT_PhysicalDisk BusType enumeration. It is carried only
-	// to explain a missing temperature (see storageTemperatureUnavailableReason)
-	// - a USB-attached drive has no readable one through the generic path.
-	BusType uint16 `json:"bus_type"`
+	Name        string
+	Model       string
+	SizeBytes   uint64
+	UsedBytes   uint64
+	TotalBytes  uint64
+	Mountpoints []string
+	// BusType is the STORAGE_BUS_TYPE enumeration (the values
+	// MSFT_PhysicalDisk.BusType uses). It decides whether the drive's
+	// temperature is read at all (driveTemperatureReadable).
+	BusType uint16
 }
 
-// windowsStorageScript joins physical disks to their drive-lettered volumes and
-// aggregates capacity. -ErrorAction Stop on the CIM queries makes a missing
-// namespace / cmdlet surface as a non-zero exit, which runPowerShellJSONArray
-// turns into a Go error so the whole set degrades cleanly.
-//
-// BusType is read through $d.CimInstanceProperties, never as $d.BusType, and
-// that is load-bearing rather than stylistic. The first Get-Volume in the loop
-// autoloads the Storage module, whose types.ps1xml re-projects BusType on every
-// already-materialized MSFT_PhysicalDisk as a friendly *string* ("NVMe", "File
-// Backed Virtual"). [uint16] on that string throws, and because it throws while
-// evaluating the hashtable the statement emits nothing - so the disk vanishes
-// from the array while PowerShell still exits 0 with valid JSON for the
-// survivors, which runPowerShell reads as success. Measured on BBLWIN: only the
-// one drive iterated before the module loaded (the offline one, with no drive
-// letters to make Get-Volume run) survived; the second NVMe and the virtual disk
-// were silently dropped and the dashboard showed a single SSD.
-// CimInstanceProperties reads the raw CIM property bag, which the type adapter
-// cannot reach, so the value is UInt16 whether or not the module is loaded. The
-// try/catch is the second belt: an unreadable bus type degrades to 0 (Unknown)
-// per the per-field degradation invariant, and can never again delete a whole
-// drive. TestWindowsStorageScriptEmitsEveryPhysicalDisk guards both halves.
-const windowsStorageScript = `$ns='root/Microsoft/Windows/Storage'; ` +
-	`$disks=@(Get-CimInstance -Namespace $ns -ClassName MSFT_PhysicalDisk -ErrorAction Stop); ` +
-	`$parts=@(Get-CimInstance -Namespace $ns -ClassName MSFT_Partition -ErrorAction Stop); ` +
-	`foreach ($d in $disks) { ` +
-	`$dp=@($parts | Where-Object { [uint32]$_.DiskNumber -eq [uint32]$d.DeviceId }); ` +
-	`$u=[uint64]0; $t=[uint64]0; $m=@(); ` +
-	`foreach ($p in $dp) { ` +
-	`$l=$p.DriveLetter; ` +
-	`if($l){ $v=Get-Volume -DriveLetter $l -ErrorAction SilentlyContinue; ` +
-	`if($v -and $v.Size -gt 0){ $u+=[uint64]$v.Size-[uint64]$v.SizeRemaining; $t+=[uint64]$v.Size; $m+=($l.ToString()+':') } } ` +
-	`} ` +
-	`$bt=[uint16]0; try { $bt=[uint16]$d.CimInstanceProperties['BusType'].Value } catch { $bt=[uint16]0 } ` +
-	`[ordered]@{name=('PhysicalDrive'+$d.DeviceId);model=($d.FriendlyName);size_bytes=([uint64]$d.Size);used_bytes=$u;total_bytes=$t;mountpoints=$m;bus_type=$bt} ` +
-	`}`
-
-// windowsStorage builds the per-physical-drive storage set on Windows. Capacity
-// comes from a Get-CimInstance MSFT_PhysicalDisk query joined to volumes via
-// MSFT_Partition (root/Microsoft/Windows/Storage); temperature is matched from
-// the LibreHardwareMonitor bridge by FriendlyName (the bridge harvest loop is
-// generic over whatever IsStorageEnabled emits). Any failure degrades the whole
-// set to unavailable rather than failing the response. The serving path caches
-// discovery rows while still applying fresh LHM temperatures on every pass.
-func (c *systemCollector) cachedWindowsStorage(ctx context.Context, bridge lhmBridgeResult, bridgeErr error) StorageSet {
+// cachedWindowsStorage builds the per-physical-drive storage set on Windows.
+// Drives and capacity come from discoverWindowsPhysicalDisks, refreshed in the
+// background on a long TTL (cachedWindowsStorageRows); drive temperatures are
+// read on their own shorter cadence (windowsDriveTemperature). A failed
+// discovery degrades the whole set to unavailable rather than failing the
+// response.
+func (c *systemCollector) cachedWindowsStorage(ctx context.Context) StorageSet {
 	rows, err := c.cachedWindowsStorageRows(ctx)
 	if err != nil {
 		return unavailableStorage(err.Error())
 	}
-	return windowsStorageFromRows(rows, bridge, bridgeErr)
+	return windowsStorageFromRows(rows, c.windowsDriveTemperature)
 }
 
-func windowsStorage(ctx context.Context, bridge lhmBridgeResult, bridgeErr error) StorageSet {
-	var rows []windowsPhysicalDisk
-	if err := runPowerShellJSONArray(ctx, windowsStorageScript, &rows); err != nil {
-		return unavailableStorage(err.Error())
-	}
-	return windowsStorageFromRows(rows, bridge, bridgeErr)
-}
-
-func windowsStorageFromRows(rows []windowsPhysicalDisk, bridge lhmBridgeResult, bridgeErr error) StorageSet {
+func windowsStorageFromRows(rows []windowsPhysicalDisk, temperature func(windowsPhysicalDisk) NumberMetric) StorageSet {
 	if len(rows) == 0 {
 		return unavailableStorage("no physical disks found")
 	}
@@ -483,7 +474,7 @@ func windowsStorageFromRows(rows []windowsPhysicalDisk, bridge lhmBridgeResult, 
 		if row.TotalBytes > 0 {
 			capacity = availableCapacity(row.UsedBytes, row.TotalBytes)
 		} else {
-			capacity = unavailableCapacity("no mounted filesystems")
+			capacity = unavailableCapacity(noMountedFilesystemsReason)
 		}
 		devices = append(devices, StorageDevice{
 			Name:        row.Name,
@@ -491,47 +482,11 @@ func windowsStorageFromRows(rows []windowsPhysicalDisk, bridge lhmBridgeResult, 
 			SizeBytes:   row.SizeBytes,
 			Mountpoints: row.Mountpoints,
 			Capacity:    capacity,
-			Temperature: windowsStorageTemperatureForModel(row.Model, row.BusType, bridge, bridgeErr),
+			Temperature: temperature(row),
 		})
 	}
 	sort.Slice(devices, func(i, j int) bool { return devices[i].Name < devices[j].Name })
 	return StorageSet{Available: true, Devices: devices}
-}
-
-// windowsStorageTemperatureForModel matches one physical disk's temperature
-// from the LibreHardwareMonitor bridge by FriendlyName. LHM names storage
-// sensors "<FriendlyName> Temperature", so a case-insensitive substring match
-// on the model is specific enough (no CPU/GPU/board temp carries a drive model).
-// Returns unavailable (never an error) when the bridge is down or no match.
-//
-// busType only selects the explanation for a miss. A USB-attached drive misses
-// for a reason we have diagnosed and cannot fix from here, and it misses twice
-// over: Windows names it after the enclosure while LHM names the drive inside
-// (measured on BBLWIN: "ROG ESD-S1CL" vs "WDC WDS100T2B0C-00PXH0"), so the model
-// match cannot connect them - and even matched by index there is nothing to
-// read, because LHM reports that drive's Composite Temperature as 0. Matching by
-// index instead would therefore buy no reading and cost a hazard: the next
-// name-matched sensor on a 0-Composite drive is its static 79 C warning
-// threshold. See usbEnclosureTemperatureReason.
-func windowsStorageTemperatureForModel(model string, busType uint16, bridge lhmBridgeResult, bridgeErr error) NumberMetric {
-	if bridgeErr != nil || !bridge.Available {
-		return unavailableNumber("C", "storage temperature unavailable")
-	}
-	needle := strings.ToLower(strings.TrimSpace(model))
-	if needle == "" {
-		return unavailableNumber("C", storageTemperatureUnavailableReason(busType))
-	}
-	for _, temp := range bridge.Temperatures {
-		name := strings.ToLower(temp.Name)
-		if !strings.Contains(name, needle) {
-			continue
-		}
-		if !isFinite(temp.Value) || temp.Value < -50 || temp.Value > 150 {
-			continue
-		}
-		return availableNumber(temp.Value, "C")
-	}
-	return unavailableNumber("C", storageTemperatureUnavailableReason(busType))
 }
 
 // windowsNetwork builds the per-interface throughput set and attaches the
@@ -699,7 +654,7 @@ func runLhmBridgeOnce(ctx context.Context) (lhmBridgeResult, error) {
 	cmd.Stdin = strings.NewReader("")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	stdout, err := cmd.Output()
+	stdout, err := trackedOutput(cmd)
 	if err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" && len(stdout) > 0 {
@@ -1167,27 +1122,11 @@ func runPowerShellJSON(ctx context.Context, script string, target any) error {
 	return json.Unmarshal(out, target)
 }
 
-const (
-	// powerShellQueryTimeout bounds one bounded-interval PowerShell/CIM query.
-	powerShellQueryTimeout = 4 * time.Second
-	// windowsStorageQueryTimeout is the storage discovery budget. The script
-	// enumerates MSFT_PhysicalDisk and MSFT_Partition and calls Get-Volume per
-	// drive letter; measured on BBLWIN as LocalSystem it costs ~2.0 s idle, but
-	// a loaded host pushed it past the 4 s default and the kill was reported as
-	// "exit status 1". It matches metricsCollectTimeout so a direct collect
-	// bounds it the same way, and it runs at most once per cache TTL.
-	windowsStorageQueryTimeout = 8 * time.Second
-)
+// powerShellQueryTimeout bounds one bounded-interval PowerShell/CIM query.
+const powerShellQueryTimeout = 4 * time.Second
 
 func runPowerShellJSONArray(ctx context.Context, script string, target any) error {
-	return runPowerShellJSONArrayWithTimeout(ctx, script, target, powerShellQueryTimeout)
-}
-
-// runPowerShellJSONArrayWithTimeout is the escape hatch for the one query whose
-// measured cost does not fit the default budget (storage discovery, which
-// enumerates two CIM classes and every drive-lettered volume).
-func runPowerShellJSONArrayWithTimeout(ctx context.Context, script string, target any, timeout time.Duration) error {
-	out, err := runPowerShellWithTimeout(ctx, "$items = @("+script+"); ConvertTo-Json -Compress -InputObject $items", timeout)
+	out, err := runPowerShell(ctx, "$items = @("+script+"); ConvertTo-Json -Compress -InputObject $items")
 	if err != nil {
 		return err
 	}
@@ -1218,7 +1157,7 @@ func runPowerShellWithTimeout(ctx context.Context, script string, timeout time.D
 	// surfaced when the command actually fails or produces no JSON.
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, err := trackedOutput(cmd)
 	if err != nil {
 		// Name a deadline kill instead of passing its exit status along. Go
 		// kills a timed-out child with TerminateProcess(handle, 1), so a query

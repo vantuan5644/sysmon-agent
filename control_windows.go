@@ -120,7 +120,7 @@ func (windowsController) Apply(ctx context.Context, action ControlAction) Contro
 	cmd.Stdin = strings.NewReader("")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	stdout, err := cmd.Output()
+	stdout, err := trackedOutput(cmd)
 	if err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" && len(stdout) > 0 {

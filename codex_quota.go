@@ -176,6 +176,7 @@ func readCodexQuota(parent context.Context, binary, configDir string) ([]QuotaRo
 		cancel()
 		_ = stdin.Close()
 		_ = cmd.Wait()
+		noteChildExit(cmd)
 	}()
 	return readCodexQuotaProtocol(ctx, stdout, stdin)
 }

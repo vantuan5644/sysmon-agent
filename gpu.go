@@ -1,16 +1,30 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/csv"
 	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 const bytesPerMiB = 1024 * 1024
+
+// nvidiaGPUQueryFields is the device query every slow pass runs. The two
+// video-engine fields ride the same spawn (gpu_engines.go) and sit last, so a
+// driver that does not know them can be retried without them.
+const (
+	nvidiaGPUQueryFields    = "name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,pci.bus_id"
+	nvidiaVideoEngineFields = ",utilization.encoder,utilization.decoder"
+)
+
+// nvidiaVideoEnginesUnsupported latches once nvidia-smi rejects the video
+// engine fields, so an old driver costs one failed query per agent run.
+var nvidiaVideoEnginesUnsupported atomic.Bool
 
 func collectNVIDIAGPU(ctx context.Context) GPUSet {
 	if _, err := exec.LookPath("nvidia-smi"); err != nil {
@@ -20,17 +34,38 @@ func collectNVIDIAGPU(ctx context.Context) GPUSet {
 	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(
-		queryCtx,
-		"nvidia-smi",
-		"--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,pci.bus_id",
-		"--format=csv,noheader,nounits",
-	)
-	out, err := cmd.Output()
+	withEngines := !nvidiaVideoEnginesUnsupported.Load()
+	out, err := runNVIDIAGPUQuery(queryCtx, withEngines)
+	if err != nil && withEngines && nvidiaRejectedQueryField(out, err) {
+		nvidiaVideoEnginesUnsupported.Store(true)
+		out, err = runNVIDIAGPUQuery(queryCtx, false)
+	}
 	if err != nil {
 		return GPUSet{Available: false, Error: fmt.Sprintf("nvidia-smi failed: %v", err)}
 	}
 	return parseNVIDIAGPUCSV(string(out))
+}
+
+func runNVIDIAGPUQuery(ctx context.Context, withEngines bool) ([]byte, error) {
+	fields := nvidiaGPUQueryFields
+	if withEngines {
+		fields += nvidiaVideoEngineFields
+	}
+	cmd := exec.CommandContext(ctx, "nvidia-smi", "--query-gpu="+fields, "--format=csv,noheader,nounits")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := trackedOutput(cmd)
+	if err != nil {
+		return append(out, stderr.Bytes()...), err
+	}
+	return out, nil
+}
+
+// nvidiaRejectedQueryField recognizes nvidia-smi's answer to a field it does
+// not know ('Field "utilization.encoder" is not a valid field to query.'), as
+// opposed to a driver that is down, which must not latch the fields off.
+func nvidiaRejectedQueryField(out []byte, err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(string(out)), "not a valid field")
 }
 
 func parseNVIDIAGPUCSV(out string) GPUSet {
@@ -62,6 +97,10 @@ func parseNVIDIAGPUCSV(out string) GPUSet {
 		if len(row) > 6 {
 			pciBusID = strings.TrimSpace(row[6])
 		}
+		var engines []GPUEngine
+		if len(row) > 8 {
+			engines = nvidiaVideoEngines(row[7], row[8])
+		}
 		devices = append(devices, GPUMetric{
 			PCIBusID:           pciBusID,
 			HotspotTemperature: unavailableNumber("C", "NVIDIA hotspot sensor not reported"),
@@ -70,6 +109,7 @@ func parseNVIDIAGPUCSV(out string) GPUSet {
 			Power:              power,
 			Memory:             memory,
 			Temperature:        temp,
+			Engines:            engines,
 		})
 	}
 
@@ -163,7 +203,7 @@ func nvidiaProcessGPUMemory(ctx context.Context) map[int]int64 {
 		"--query-compute-apps=pid,used_memory",
 		"--format=csv,noheader,nounits",
 	)
-	out, err := cmd.Output()
+	out, err := trackedOutput(cmd)
 	if err != nil {
 		return nil
 	}

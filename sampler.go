@@ -77,6 +77,10 @@ type sampler struct {
 	lastOSDDemandAt time.Time
 	osdHardware     osdHardware
 	subs            map[*subscriber]struct{}
+	// lastSlowAt is when a slow-lane patch was last applied. History uses it to
+	// tell a fresh GPU/network reading from one a parked slow lane left behind.
+	lastSlowAt time.Time
+	history    *metricsHistory
 
 	started bool
 	cancel  context.CancelFunc
@@ -93,6 +97,7 @@ func newSampler(inner MetricsCollector, fastEvery, slowEvery time.Duration) *sam
 		slowEvery: clampInterval(slowEvery, minSlowSampleInterval, defaultSlowSampleInterval),
 		idleAfter: samplerIdleAfter,
 		subs:      map[*subscriber]struct{}{},
+		history:   newMetricsHistory(historyStep, historyRetention),
 	}
 	s.working = warmingMetrics(s.hostname)
 	return s
@@ -140,6 +145,8 @@ func warmingMetrics(hostname string) Metrics {
 	m.CPUTemperature = unavailableNumber("C", warming)
 	m.PSUOutputPower = unavailableNumber("W", warming)
 	m.Memory = unavailableCapacity(warming)
+	m.MemoryCommit = unavailableCapacity(warming)
+	m.Pressure = unavailablePressure(warming)
 	m.Disks = unavailableDisk(warming)
 	m.Storage = unavailableStorage(warming)
 	m.Network = NetworkSet{Available: false, Error: warming}
@@ -228,7 +235,7 @@ func (s *sampler) runSlowLoop(ctx context.Context) {
 	// regardless of whether a client is connected yet.
 	started := time.Now()
 	patch := s.lanes.CollectSlow(ctx)
-	s.applyAndPublish(patch, started)
+	s.applyLaneAndPublish(patch, started, true)
 	for {
 		if sleepCanceled(ctx, s.slowEvery) {
 			return
@@ -238,7 +245,7 @@ func (s *sampler) runSlowLoop(ctx context.Context) {
 		}
 		started := time.Now()
 		patch := s.lanes.CollectSlow(ctx)
-		s.applyAndPublish(patch, started)
+		s.applyLaneAndPublish(patch, started, true)
 	}
 }
 
@@ -334,16 +341,28 @@ func (s *sampler) hasDemand() bool {
 // applyAndPublish applies a lane patch to the working snapshot, finalizes it,
 // stores it as the current snapshot, and broadcasts the JSON to subscribers.
 func (s *sampler) applyAndPublish(patch func(*Metrics), started time.Time) {
+	s.applyLaneAndPublish(patch, started, false)
+}
+
+// applyLaneAndPublish is applyAndPublish for a patch that may come from the
+// slow lane; slow marks the slow-lane fields as freshly sampled for history.
+func (s *sampler) applyLaneAndPublish(patch func(*Metrics), started time.Time, slow bool) {
 	if patch == nil {
 		return
 	}
 	s.mu.Lock()
 	patch(&s.working)
-	s.working.Timestamp = time.Now().UTC()
+	now := time.Now()
+	s.working.Timestamp = now.UTC()
+	if slow {
+		s.lastSlowAt = now
+	}
+	slowFresh := !s.lastSlowAt.IsZero() && now.Sub(s.lastSlowAt) <= s.slowFreshWindow()
 	working := s.working
 	s.mu.Unlock()
 
 	final := finishMetrics(working, started)
+	s.history.observe(final, slowFresh)
 	data, err := json.Marshal(final)
 	if err != nil {
 		return
@@ -361,6 +380,7 @@ func (s *sampler) applyAndPublish(patch func(*Metrics), started time.Time) {
 // publishWhole stores and broadcasts a full Metrics produced by the fallback
 // loop (collectors without lane support).
 func (s *sampler) publishWhole(metrics Metrics) {
+	s.history.observe(metrics, true)
 	data, err := json.Marshal(metrics)
 	if err != nil {
 		return
@@ -412,6 +432,21 @@ func (s *sampler) Collect(ctx context.Context) (Metrics, error) {
 	// No snapshot yet (called before the first lane pass): fall back to a direct
 	// collection so early /readyz and /api/metrics requests still succeed.
 	return s.inner.Collect(ctx)
+}
+
+// slowFreshWindow is how long after a slow pass its readings still count as
+// current. Two intervals plus a pass's own worst cost (a cold LHM daemon read on
+// Windows, the slowest thing the slow lane waits for) so one slow pass never
+// reads as a gap; a parked lane falls outside it within seconds.
+func (s *sampler) slowFreshWindow() time.Duration {
+	return 2*s.slowEvery + 5*time.Second
+}
+
+// History returns the agent-side metrics history (see history.go). It reads
+// only the ring, so unlike Collect it registers no demand and never wakes the
+// slow lane.
+func (s *sampler) History() HistoryResponse {
+	return s.history.snapshot()
 }
 
 func (s *sampler) Subscribe() (<-chan []byte, func()) {

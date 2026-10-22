@@ -29,9 +29,7 @@
 #     clean shutdown): exit 0.
 #
 # The agent sends "rescan" every N reads / M minutes so a hot-plugged USB PSU is
-# picked up. It used to kill and respawn this process for that, but a fresh
-# Computer.Open() also re-runs storage detection, which sends vendor pass-through
-# commands to every USB disk and USB-reset an SD card reader mid-write; see the
+# picked up. It used to kill and respawn this process for that; see the
 # lhmDaemonRescanReads comment in lhm_bridge_windows.go.
 #
 # Usage: pwsh -NoProfile -ExecutionPolicy Bypass -File lhm-bridge-daemon.ps1
@@ -70,11 +68,7 @@ function New-LhmComputer([bool]$EnablePsu) {
     $computer.IsGpuEnabled = $true
     $computer.IsMotherboardEnabled = $true
     $computer.IsMemoryEnabled = $true
-    # Storage enables NVMe/SATA SMART temperature reads so per-drive storage temps
-    # surface with no Go change (the temperature harvest loop is already generic).
-    if ($computer.PSObject.Properties['IsStorageEnabled']) {
-        $computer.IsStorageEnabled = $true
-    }
+    # Storage is never enabled; see the drive temperature note below.
     $computer.IsPowerMonitorEnabled = $true
     if ($EnablePsu -and $computer.PSObject.Properties['IsPsuEnabled']) {
         $computer.IsPsuEnabled = $true
@@ -91,21 +85,12 @@ function New-ErrorObject([string]$message) {
 # not useful as dashboard temperatures, so filter them out and keep only live
 # temperature channels.
 #
-# 'warning' / 'critical' are the NVMe SMART composite thresholds, which every
-# drive reports alongside its live Composite Temperature (measured here: 79-88 C
-# against real drive temps of 29-49 C). They are constants, not readings, and
-# dropping them is not cosmetic: windowsStorageTemperatureForModel takes the
-# FIRST matching sensor for a drive, so on a drive whose Composite reads 0 (an
-# unpopulated channel, dropped by Test-PlausibleTemperature) the next match is
-# the 79 C warning threshold, which would publish a static limit as that drive's
-# live temperature. Same class of bug as picking the wrong CPU die sensor: the
-# same field name carrying a different physical quantity.
-#
-# This is a latent hazard rather than something observed in the field. The only
-# drive here whose Composite reads 0 is a USB-enclosed one that is spared by an
-# unrelated mismatch - LHM names it by the drive inside the enclosure and Windows
-# by the enclosure, so nothing matches it at all. Any internal drive that stopped
-# reporting Composite would hit it.
+# 'warning' / 'critical' / 'threshold' sensors carry configured limits, not
+# readings. The measured case was the NVMe SMART composite thresholds (79-88 C
+# next to live drive temperatures of 29-50 C), back when drive sensors came
+# through LHM; publishing one would put a static limit where a live
+# temperature belongs, the same class of bug as picking the wrong CPU die
+# sensor. Kept identical in lhm-bridge.ps1 and lhm-bridge-daemon.ps1.
 function Test-LiveTemperature([string]$sensorName) {
     if (-not $sensorName) { return $true }
     $n = $sensorName.ToLower()
@@ -142,117 +127,23 @@ function Get-NvidiaHotspot($hardware) {
 }
 
 
-# --- Storage SMART temperatures are refreshed on their own slow cadence. ---
+# --- Drive temperatures do not come from LibreHardwareMonitor. ---
 #
-# Every other sensor in the walk is a register / MSR / SMU read costing single-
-# digit milliseconds. A storage node's Update() instead issues an NVMe or SATA
-# SMART health-log ioctl to the drive itself, which costs 0.7-2.7 s EACH.
-# Measured on a 4-NVMe host (7950X, ASUS X670E, LHM 0.9.6): the full sensor walk
-# took 4.8-6.4 s with storage enabled versus 0.39 s without it, and
-# Computer.Open() took 8.6 s versus 2.3 s.
-#
-# That is what broke this daemon in practice. Every read blew the agent's warm
-# deadline, so the agent killed and respawned the process on every sample, the
-# respawn's cold read blew the cold deadline too, and CPU package power, CPU
-# temperature and PSU power were permanently unavailable. Reading drive temps on
-# the hot path cost the dashboard the very metrics it exists to show.
-#
-# Drive temperatures move over tens of seconds, so they do not belong on the
-# per-read path at all. At most ONE drive is refreshed per read, and only once
-# $StorageRefreshIntervalMs has elapsed since the last refresh; every drive's
-# last reading is cached and re-emitted on the reads in between, so the JSON
-# contract is unchanged. With N drives each one refreshes every N * interval.
-# A drive with no cached reading yet bypasses the interval, so a fresh daemon
-# fills the cache within N reads instead of taking N * interval seconds.
-#
-# SYSMON_LHM_STORAGE_MS overrides the interval; 0 disables storage temperature
-# reads entirely, the escape hatch for a host with a pathologically slow drive.
-$StorageRefreshIntervalMs = 15000
-if ($env:SYSMON_LHM_STORAGE_MS) {
-    $parsedInterval = 0
-    if ([int]::TryParse($env:SYSMON_LHM_STORAGE_MS, [ref]$parsedInterval) -and $parsedInterval -ge 0) {
-        $StorageRefreshIntervalMs = $parsedInterval
-    }
-}
-$script:StorageNodes = New-Object System.Collections.Generic.List[object]
-$script:StorageTemps = @{}
-$script:StorageCursor = 0
-$script:StorageRefreshedAt = $null
-
-function Test-StorageNode($hw) {
-    return ($hw.HardwareType -and $hw.HardwareType.ToString() -eq 'Storage')
-}
-
-# Refreshes at most one storage node per call per the cadence above, then
-# returns every cached storage temperature entry - including the drives not
-# touched on this pass.
-function Update-StorageTemperatures {
-    if ($StorageRefreshIntervalMs -le 0 -or $script:StorageNodes.Count -eq 0) {
-        return @()
-    }
-    $due = $null
-    # Seed pass: a drive with no cached reading yet is refreshed immediately.
-    foreach ($node in $script:StorageNodes) {
-        if (-not $script:StorageTemps.ContainsKey($node.Identifier.ToString())) {
-            $due = $node
-            break
-        }
-    }
-    if ($null -eq $due) {
-        $elapsed = if ($null -eq $script:StorageRefreshedAt) {
-            [double]::MaxValue
-        } else {
-            ((Get-Date) - $script:StorageRefreshedAt).TotalMilliseconds
-        }
-        if ($elapsed -ge $StorageRefreshIntervalMs) {
-            $due = $script:StorageNodes[$script:StorageCursor % $script:StorageNodes.Count]
-            $script:StorageCursor++
-        }
-    }
-    if ($null -ne $due) {
-        $script:StorageRefreshedAt = Get-Date
-        try { $due.Update() } catch {}
-        $entries = New-Object System.Collections.Generic.List[object]
-        foreach ($s in @($due.Sensors)) {
-            if ($s.SensorType -eq 'Temperature' -and $s.Value -ne $null) {
-                $temp = [double]$s.Value
-                if ((Test-PlausibleTemperature $temp) -and (Test-LiveTemperature $s.Name)) {
-                    $entries.Add(@{ name = ($due.Name + ' ' + $s.Name).Trim(); value = [math]::Round($temp, 2) })
-                }
-            }
-        }
-        $script:StorageTemps[$due.Identifier.ToString()] = $entries
-    }
-    $all = New-Object System.Collections.Generic.List[object]
-    foreach ($cached in $script:StorageTemps.Values) {
-        foreach ($entry in $cached) { $all.Add($entry) }
-    }
-    return $all
-}
-
-# Re-reads the storage rotation from the drives the Computer holds now. The
-# storage group follows drive arrival and removal by itself (DiskInfoToolkit
-# listens for WM_DEVICECHANGE and checks only the drive that changed), so a
-# drive plugged in after Open() shows up in $computer.Hardware without another
-# Open(). A drive that left must also leave the cache, or its last reading
-# would be re-emitted forever now that no periodic respawn clears it.
-function Sync-StorageNodes($computer) {
-    $current = @($computer.Hardware | Where-Object { Test-StorageNode $_ })
-    $present = @{}
-    foreach ($hw in $current) { $present[$hw.Identifier.ToString()] = $true }
-    foreach ($id in @($script:StorageTemps.Keys)) {
-        if (-not $present.ContainsKey($id)) { $script:StorageTemps.Remove($id) }
-    }
-    $script:StorageNodes.Clear()
-    foreach ($hw in $current) { $script:StorageNodes.Add($hw) }
-}
+# The storage group is never enabled. Enabling it runs DiskInfoToolkit's drive
+# detection, which tries vendor ATA/NVMe pass-through commands on every USB disk
+# it cannot identify, both at Open() and whenever a disk is plugged in. That
+# reset a USB SD card reader mid-write (2026-10-09), and on 2026-10-22 an
+# in-development USB recorder let every command time out, so Open() ran past
+# 5 minutes and the agent's restart loop sent the commands again and again.
+# LHM has no per-drive exclusion, and the drives with a useful temperature,
+# NVMe and SATA, report it to Windows itself: the agent reads them with
+# IOCTL_STORAGE_QUERY_PROPERTY (collector_windows_storage.go).
 
 # Re-enumerates hardware that can be hot-plugged, inside the open Computer.
 # LibreHardwareMonitor adds or removes a sensor group when its Is*Enabled flag
 # flips on an open Computer, so cycling IsPsuEnabled rebuilds only the USB PSU
 # groups. It also retries a PSU that another process held exclusively at
 # startup, which is what made Open() fall back to New-LhmComputer $false.
-# Storage is left alone on purpose (see Sync-StorageNodes).
 function Update-HotPluggedHardware($computer) {
     if ($computer.PSObject.Properties['IsPsuEnabled']) {
         try {
@@ -264,7 +155,6 @@ function Update-HotPluggedHardware($computer) {
             try { $computer.IsPsuEnabled = $false } catch {}
         }
     }
-    Sync-StorageNodes $computer
 }
 
 # Selects the aggregate output power (watts) from a PSU hardware node's Power
@@ -361,10 +251,6 @@ function Read-LhmSnapshot($computer) {
     $gpuHotspots = New-Object System.Collections.Generic.List[object]
 
     foreach ($hw in $computer.Hardware) {
-        # Storage carries no power / clock / PSU sensor, only SMART temperatures,
-        # and its Update() is the one that costs seconds rather than milliseconds
-        # (see the storage cadence block above). It is refreshed out of band below.
-        if (Test-StorageNode $hw) { continue }
         try { $hw.Update() } catch {}
         $sensors = @($hw.Sensors)
         foreach ($reading in @(Get-NvidiaHotspot $hw)) { $gpuHotspots.Add($reading) }
@@ -450,9 +336,6 @@ function Read-LhmSnapshot($computer) {
             }
         }
     }
-
-    # Cached SMART drive temperatures, refreshing at most one drive per read.
-    foreach ($entry in (Update-StorageTemperatures)) { $temperatures.Add($entry) }
 
     $result = @{
         available        = $true
@@ -542,14 +425,6 @@ if (-not $dll) {
         # frequently returns stale or zero values while the kernel driver warms
         # up, so poll every hardware (and subhardware) once and let it settle.
         foreach ($hw in $computer.Hardware) {
-            if (Test-StorageNode $hw) {
-                # Open() has already enumerated the drive; priming it here would
-                # add another 0.7-2.7 s per drive to a cold start that the agent
-                # bounds with a deadline. Its sensors read 0 until the first
-                # Update(), which the storage cadence issues on the early reads.
-                $script:StorageNodes.Add($hw)
-                continue
-            }
             try { $hw.Update() } catch {}
             foreach ($sub in $hw.SubHardware) {
                 try { $sub.Update() } catch {}

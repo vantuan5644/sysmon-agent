@@ -69,17 +69,21 @@ func (c *systemCollector) CollectFast(ctx context.Context) (patch func(*Metrics)
 				m.CPU = cpu
 				m.CPUCores = cores
 				m.Memory = memory
+				m.MemoryCommit = memory
+				m.Pressure = unavailablePressure(windowsNoPressureMessage)
 			}
 		}
 	}()
 
 	cpu := c.windowsCPUFast(ctx)
 	cores := c.windowsCPUCores(ctx)
-	memory := windowsMemoryFast()
+	memory, commit := windowsMemoryStatusFast()
 	return func(m *Metrics) {
 		m.CPU = cpu
 		m.CPUCores = cores
 		m.Memory = memory
+		m.MemoryCommit = commit
+		m.Pressure = unavailablePressure(windowsNoPressureMessage)
 	}
 }
 
@@ -229,7 +233,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	platform := c.platformCache.Get(func() string {
 		return windowsPlatform(ctx)
 	})
-	cpuName, memoryName := c.resolveHardwareNames(ctx)
+	cpuName, memoryName, memorySpeed := c.resolveHardwareNames(ctx)
 
 	var wg sync.WaitGroup
 	var cpuPower NumberMetric
@@ -250,6 +254,9 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	// One bridge invocation per slow pass feeds CPU power, clock, PSU and temps;
 	// LHM's kernel driver does not tolerate concurrent Computer.Open() calls.
 	bridgeResult, bridgeErr := c.fetchLhmBridge(ctx)
+	// One GPU Engine collection per pass (~1 ms) feeds both the per-process GPU
+	// column and each adapter's engine list.
+	engines := c.gpuEngines.summary()
 	collectMetricAsync(&wg, &cpuPower, func() NumberMetric {
 		return windowsCPUPowerFromBridge(bridgeResult, bridgeErr)
 	}, func(recovered any) NumberMetric {
@@ -284,7 +291,9 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		return unavailableDisk(fmt.Sprintf("Windows disk collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &storage, func() StorageSet {
-		return c.cachedWindowsStorage(ctx, bridgeResult, bridgeErr)
+		set := c.cachedWindowsStorage(ctx)
+		c.applyWindowsStorageRates(&set)
+		return set
 	}, func(recovered any) StorageSet {
 		return unavailableStorage(fmt.Sprintf("Windows storage collector panicked: %v", recovered))
 	})
@@ -314,18 +323,24 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		return unavailableCapacity(fmt.Sprintf("Windows swap collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &processes, func() ProcessSet {
-		return c.collectProcesses(ctx)
+		return c.collectProcesses(ctx, engines)
 	}, func(recovered any) ProcessSet {
 		return unavailableProcessSet(fmt.Sprintf("Windows process collector panicked: %v", recovered))
 	})
 	wg.Wait()
 	gpu = mergeWindowsGPUHotspots(gpu, bridgeResult.GPUHotspots, bridgeResult.Available && bridgeErr == nil)
+	// DXGI enumeration (~18 ms, then cached) only when there is something to
+	// attach.
+	if engines.Available {
+		gpu = attachGPUEngines(gpu, c.gpuEngines.dxgiAdapters(), engines)
+	}
 
 	cpuTemperature, cpuTemperatureSensor := pickCPUTemperatureSensor(temperatures)
 	return func(m *Metrics) {
 		m.Platform = platform
 		m.CPUName = cpuName
 		m.MemoryName = memoryName
+		m.MemorySpeed = memorySpeed
 		m.CPUPower = cpuPower
 		m.CPUCorePower = cpuCorePower
 		m.CPUSocPower = cpuSocPower
@@ -457,11 +472,23 @@ func filetimeTicks(ft syscall.Filetime) uint64 {
 // windowsMemoryFast reports physical memory usage from GlobalMemoryStatusEx,
 // degrading to an unavailable capacity (never a hard error) on failure.
 func windowsMemoryFast() CapacityMetric {
+	memory, _ := windowsMemoryStatusFast()
+	return memory
+}
+
+// windowsMemoryStatusFast reads physical memory and commit charge from one
+// GlobalMemoryStatusEx call. ullTotalPageFile is the system commit limit (RAM
+// plus page files) and ullAvailPageFile what is left of it, so their
+// difference is the "Committed" figure Task Manager shows.
+func windowsMemoryStatusFast() (memory, commit CapacityMetric) {
 	var status memoryStatusEx
 	status.dwLength = uint32(unsafe.Sizeof(status))
 	r, _, errno := procGlobalMemoryStatusEx.Call(uintptr(unsafe.Pointer(&status)))
 	if r == 0 {
-		return unavailableCapacity(fmt.Sprintf("GlobalMemoryStatusEx failed: %v", errno))
+		failed := unavailableCapacity(fmt.Sprintf("GlobalMemoryStatusEx failed: %v", errno))
+		return failed, failed
 	}
-	return availableCapacityFromTotalFree(status.ullTotalPhys, status.ullAvailPhys, "invalid Windows memory counters")
+	memory = availableCapacityFromTotalFree(status.ullTotalPhys, status.ullAvailPhys, "invalid Windows memory counters")
+	commit = availableCapacityFromTotalFree(status.ullTotalPageFile, status.ullAvailPageFile, "invalid Windows commit counters")
+	return memory, commit
 }

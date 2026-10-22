@@ -356,9 +356,13 @@ func registryDeviceChildren(key syscall.Handle) ([]string, error) {
 	}
 }
 
-func registryCaptureUsage(key syscall.Handle, depth int) (bool, bool) {
-	if depth > 4 {
-		return false, false
+// registryOpenCaptures appends every record at or below key that claims a
+// running capture (LastUsedTimeStart set, LastUsedTimeStop zero); path is key's
+// position below the capability key. It returns false when part of the tree
+// could not be read.
+func registryOpenCaptures(key syscall.Handle, path []string, records *[]privacyRecord) bool {
+	if len(path) > 4 {
+		return false
 	}
 	read := func(name string) (uint64, bool) {
 		ptr, _ := syscall.UTF16PtrFromString(name)
@@ -371,7 +375,7 @@ func registryCaptureUsage(key syscall.Handle, depth int) (bool, bool) {
 	start, hasStart := read("LastUsedTimeStart")
 	stop, hasStop := read("LastUsedTimeStop")
 	if hasStart && hasStop && start > 0 && stop == 0 {
-		return true, true
+		*records = append(*records, privacyRecord{key: append([]string(nil), path...), start: start})
 	}
 	names, err := registryDeviceChildren(key)
 	complete := err == nil
@@ -382,14 +386,87 @@ func registryCaptureUsage(key syscall.Handle, depth int) (bool, bool) {
 			complete = false
 			continue
 		}
-		active, ok := registryCaptureUsage(child, depth+1)
+		complete = registryOpenCaptures(child, append(path, name), records) && complete
 		syscall.RegCloseKey(child)
-		if active {
-			return true, true
-		}
-		complete = complete && ok
 	}
-	return false, complete
+	return complete
+}
+
+var procGetPackageFamilyName = kernel32.NewProc("GetPackageFamilyName")
+
+// readPrivacyProcesses lists the running processes for privacyRecordRunning.
+// A process that cannot be opened keeps a zero creation time and an unread
+// package, which makes every record it could own count as running.
+func readPrivacyProcesses() ([]privacyProcess, error) {
+	snapshot, _, callErr := procCreateToolhelp32Snapshot.Call(th32csSnapProcess, 0)
+	if snapshot == uintptr(syscall.InvalidHandle) {
+		return nil, fmt.Errorf("CreateToolhelp32Snapshot: %v", callErr)
+	}
+	defer syscall.CloseHandle(syscall.Handle(snapshot))
+	entry := processEntry32{Size: uint32(unsafe.Sizeof(processEntry32{}))}
+	ok, _, callErr := procProcess32FirstW.Call(snapshot, uintptr(unsafe.Pointer(&entry)))
+	if ok == 0 {
+		return nil, fmt.Errorf("Process32FirstW: %v", callErr)
+	}
+	var processes []privacyProcess
+	for {
+		if entry.ProcessID > 0 {
+			processes = append(processes, readPrivacyProcess(entry.ProcessID, syscall.UTF16ToString(entry.ExecutableFile[:])))
+		}
+		entry.Size = uint32(unsafe.Sizeof(entry))
+		if ok, _, _ = procProcess32NextW.Call(snapshot, uintptr(unsafe.Pointer(&entry))); ok == 0 {
+			return processes, nil
+		}
+	}
+}
+
+func readPrivacyProcess(pid uint32, exe string) privacyProcess {
+	// PID 4 is the System process, i.e. the kernel: it never has a package,
+	// but GetPackageFamilyName fails on it instead of saying so (measured on
+	// BBLWIN, elevated). Left unread it would keep every packaged record.
+	p := privacyProcess{exe: exe, familyOK: pid == 4}
+	handle, _, _ := procOpenProcess.Call(processQueryLimitedInformation, 0, uintptr(pid))
+	if handle == 0 {
+		return p
+	}
+	defer syscall.CloseHandle(syscall.Handle(handle))
+	var created, exited, kernelTime, userTime syscall.Filetime
+	if ok, _, _ := procGetProcessTimes.Call(
+		handle,
+		uintptr(unsafe.Pointer(&created)),
+		uintptr(unsafe.Pointer(&exited)),
+		uintptr(unsafe.Pointer(&kernelTime)),
+		uintptr(unsafe.Pointer(&userTime)),
+	); ok != 0 {
+		p.created = filetimeTicks(created)
+	}
+	var family [256]uint16
+	length := uint32(len(family))
+	switch result, _, _ := procGetPackageFamilyName.Call(handle, uintptr(unsafe.Pointer(&length)), uintptr(unsafe.Pointer(&family[0]))); result {
+	case 0:
+		p.family, p.familyOK = syscall.UTF16ToString(family[:]), true
+	case 15700: // APPMODEL_ERROR_NO_PACKAGE
+		p.familyOK = true
+	}
+	return p
+}
+
+// privacyCaptureRunning drops records whose capturing process is gone; see
+// privacyRecordRunning. When the processes cannot be listed the records stand.
+func privacyCaptureRunning(records []privacyRecord) bool {
+	if len(records) == 0 {
+		return false
+	}
+	processes, err := readPrivacyProcesses()
+	if err != nil {
+		return true
+	}
+	for _, record := range records {
+		if privacyRecordRunning(record, processes) {
+			return true
+		}
+	}
+	return false
 }
 
 func windowsPrivacyActivity(capability string) DeviceActivity {
@@ -397,6 +474,7 @@ func windowsPrivacyActivity(capability string) DeviceActivity {
 	if err != nil {
 		return unknownDeviceActivity("Windows " + capability + " privacy activity is unreadable")
 	}
+	var records []privacyRecord
 	checked, complete := false, true
 	for _, name := range names {
 		if !strings.HasPrefix(name, "S-1-5-21-") && !strings.HasPrefix(name, "S-1-12-1-") {
@@ -412,12 +490,11 @@ func windowsPrivacyActivity(capability string) DeviceActivity {
 			continue
 		}
 		checked = true
-		active, ok := registryCaptureUsage(key, 0)
+		complete = registryOpenCaptures(key, nil, &records) && complete
 		syscall.RegCloseKey(key)
-		if active {
-			return observedDeviceActivity(true, "Windows privacy activity (best-effort; loaded user profiles)")
-		}
-		complete = complete && ok
+	}
+	if privacyCaptureRunning(records) {
+		return observedDeviceActivity(true, "Windows privacy activity (best-effort; loaded user profiles)")
 	}
 	if !checked || !complete {
 		return unknownDeviceActivity(capability + " privacy activity unavailable for some loaded users")

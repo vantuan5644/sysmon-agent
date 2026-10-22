@@ -33,6 +33,12 @@ type systemCollector struct {
 	// replaced wholesale each slow pass, so dead PIDs are pruned automatically.
 	// Guarded by mu. See collectProcesses.
 	prevProc map[int]procSample
+	// agentCost measures the agent's own footprint from each process pass.
+	// Carries its own lock.
+	agentCost agentCostTracker
+	// diskRates turns /proc/diskstats into per-drive throughput. Carries its
+	// own lock.
+	diskRates diskRateTracker
 
 	// clockPeak ratchets the observed CPU boost ceiling reported as
 	// cpu_clock_max. Shared, untagged implementation so the field means the same
@@ -45,11 +51,15 @@ type systemCollector struct {
 	hardwareOnce sync.Once
 	cpuName      string
 	memoryName   string
+	memorySpeed  MemorySpeed
 
 	// uplink caches the active network identity (Wi-Fi SSID / wired link) with a
 	// short TTL so the slow lane does not spawn `iw`/`nmcli` on every pass.
 	uplink   NetworkUplink
 	uplinkAt time.Time
+
+	// storageExclude is set once, before the sampler starts (ExcludeStorage).
+	storageExclude storageExclusions
 }
 
 type cpuTimes struct {
@@ -112,7 +122,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	started := time.Now()
 	metrics := baseMetrics(c.hostname)
 	metrics.Platform = readFirstLine("/proc/sys/kernel/osrelease")
-	metrics.CPUName, metrics.MemoryName = c.resolveHardwareNames(ctx)
+	metrics.CPUName, metrics.MemoryName, metrics.MemorySpeed = c.resolveHardwareNames(ctx)
 
 	var wg sync.WaitGroup
 	var cpu NumberMetric
@@ -157,7 +167,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return unavailableDisk(fmt.Sprintf("Linux disk collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &storage, func() StorageSet {
-		return collectStorage()
+		return collectStorage(c.storageExclude)
 	}, func(recovered any) StorageSet {
 		return unavailableStorage(fmt.Sprintf("Linux storage collector panicked: %v", recovered))
 	})
@@ -197,7 +207,10 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.PSUOutputPower = unavailableNumber("W", "no PSU output power sensor exposed on Linux")
 	metrics.Memory = memory
 	metrics.MemorySwap = swap
+	metrics.MemoryCommit = unavailableCapacity(linuxNoCommitMessage)
+	metrics.Pressure = collectPressureFrom(pressureRoot)
 	metrics.Disks = disks
+	c.applyStorageRates(&storage)
 	metrics.Storage = storage
 	metrics.Network = network
 	metrics.Tailscale = tailscale
@@ -253,7 +266,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	}()
 
 	platform := readFirstLine("/proc/sys/kernel/osrelease")
-	cpuName, memoryName := c.resolveHardwareNames(ctx)
+	cpuName, memoryName, memorySpeed := c.resolveHardwareNames(ctx)
 
 	var wg sync.WaitGroup
 	var cpuPower NumberMetric
@@ -282,7 +295,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		return unavailableDisk(fmt.Sprintf("Linux disk collector panicked: %v", recovered))
 	})
 	collectMetricAsync(&wg, &storage, func() StorageSet {
-		return collectStorage()
+		return collectStorage(c.storageExclude)
 	}, func(recovered any) StorageSet {
 		return unavailableStorage(fmt.Sprintf("Linux storage collector panicked: %v", recovered))
 	})
@@ -314,10 +327,15 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	wg.Wait()
 
 	cpuTemperature, cpuTemperatureSensor := pickCPUTemperatureSensor(temperatures)
+	pressure := collectPressureFrom(pressureRoot)
+	c.applyStorageRates(&storage)
 	return func(m *Metrics) {
 		m.Platform = platform
+		m.MemoryCommit = unavailableCapacity(linuxNoCommitMessage)
+		m.Pressure = pressure
 		m.CPUName = cpuName
 		m.MemoryName = memoryName
+		m.MemorySpeed = memorySpeed
 		m.CPUPower = cpuPower
 		unavailableCPUPowerRails(m, linuxNoPowerRailsMessage)
 		cpuClocks.applyTo(m)
@@ -333,6 +351,11 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		m.Processes = processes
 	}
 }
+
+// linuxNoProcessGPUMessage explains the per-process GPU column on Linux:
+// NVML needs cgo, and the DRM fdinfo route means reading every open file
+// descriptor of every process each pass (gpu_engines.go).
+const linuxNoProcessGPUMessage = "per-process GPU utilization is not collected on Linux"
 
 // linuxNoPowerRailsMessage explains the permanently-absent per-rail CPU power
 // breakdown on Linux. RAPL (/sys/class/powercap) exposes package and, on some
@@ -352,6 +375,7 @@ func linuxDegradedSlowPatch(message string) func(*Metrics) {
 		m.CPUTemperature = unavailableNumber("C", message)
 		m.CPUTemperatureSensor = ""
 		m.PSUOutputPower = unavailableNumber("W", message)
+		m.Pressure = unavailablePressure(message)
 		m.Disks = unavailableDisk(message)
 		m.Storage = unavailableStorage(message)
 		m.Network = NetworkSet{Available: false, Error: message}
@@ -1166,8 +1190,14 @@ func isMoreRootMountpoint(a, b string) bool {
 // drive with nothing mounted (e.g. an unmounted NTFS drive) degrades Capacity to
 // unavailable with "no mounted filesystems" rather than reporting a bogus
 // 0%-of-physical; Temperature degrades independently. Mirrors the GPUSet pattern.
-func collectStorage() StorageSet {
-	return collectStorageFrom("/sys")
+func collectStorage(exclude storageExclusions) StorageSet {
+	return collectStorageFrom("/sys", exclude)
+}
+
+// ExcludeStorage sets the drives the agent leaves alone (-storage-exclude).
+// main calls it once, before the sampler starts.
+func (c *systemCollector) ExcludeStorage(exclude storageExclusions) {
+	c.storageExclude = exclude
 }
 
 // collectStorageFrom builds the per-physical-drive storage set rooted at sysRoot
@@ -1177,7 +1207,7 @@ func collectStorage() StorageSet {
 // with nothing mounted (e.g. an unmounted NTFS drive) degrades Capacity to
 // unavailable with "no mounted filesystems" rather than reporting a bogus
 // 0%-of-physical; Temperature degrades independently. Mirrors the GPUSet pattern.
-func collectStorageFrom(sysRoot string) StorageSet {
+func collectStorageFrom(sysRoot string, exclude storageExclusions) StorageSet {
 	blockRoot := filepath.Join(sysRoot, "block")
 	entries, err := os.ReadDir(blockRoot)
 	if err != nil {
@@ -1204,10 +1234,17 @@ func collectStorageFrom(sysRoot string) StorageSet {
 		if shouldSkipBlockDevice(name) {
 			continue
 		}
+		// The model is a sysfs attribute the kernel cached when the drive
+		// arrived; an excluded drive is dropped before its size and temperature
+		// (which can reach the device) are read.
+		model := strings.TrimSpace(readFirstLine(filepath.Join(blockRoot, name, "device", "model")))
+		if exclude.excludes(model) {
+			continue
+		}
 		mounts := mountsByDevice[name]
 		devices = append(devices, StorageDevice{
 			Name:        name,
-			Model:       strings.TrimSpace(readFirstLine(filepath.Join(blockRoot, name, "device", "model"))),
+			Model:       model,
 			SizeBytes:   linuxBlockDeviceSize(name, blockRoot),
 			Mountpoints: mountpointsOf(mounts),
 			Capacity:    aggregateDeviceCapacity(mounts),
@@ -1300,7 +1337,7 @@ func aggregateDeviceCapacity(mounts []mountInfo) CapacityMetric {
 		usedSum = used
 	}
 	if !anyAvailable {
-		return unavailableCapacity("no mounted filesystems")
+		return unavailableCapacity(noMountedFilesystemsReason)
 	}
 	return availableCapacity(usedSum, totalSum)
 }
@@ -1346,10 +1383,16 @@ func linuxStorageTemperature(diskName, sysRoot string) NumberMetric {
 	} else {
 		temperature = blockDeviceStorageTemperature(diskName, blockRoot)
 	}
-	if temperature.Available || !linuxBlockDeviceIsUSB(diskName, blockRoot) {
+	if temperature.Available {
 		return temperature
 	}
-	return unavailableNumber("C", usbEnclosureTemperatureReason)
+	if linuxBlockDeviceIsUSB(diskName, blockRoot) {
+		return unavailableNumber("C", usbEnclosureTemperatureReason)
+	}
+	if linuxBlockDeviceIsVirtual(diskName, blockRoot) {
+		return unavailableNumber("C", virtualDiskTemperatureReason)
+	}
+	return temperature
 }
 
 // nvmeControllerForDisk maps an NVMe whole-disk name to its controller: nvme0n1
@@ -1856,7 +1899,9 @@ func (c *systemCollector) collectProcesses(ctx context.Context) ProcessSet {
 		if !readOK {
 			continue
 		}
-		pm := ProcessMetric{PID: pr.pid, Name: pr.name}
+		// Linux reparents an orphan to init or a subreaper, so a PPID always
+		// names a live process and needs none of Windows' reuse check.
+		pm := ProcessMetric{PID: pr.pid, PPID: pr.ppid, Name: pr.name}
 		if pr.rssAvail {
 			pm.Memory = availableNumber(float64(pr.rssBytes), "B")
 		} else {
@@ -1888,6 +1933,7 @@ func (c *systemCollector) collectProcesses(ctx context.Context) ProcessSet {
 		} else {
 			pm.GPUMemory = unavailableNumber("B", "not a CUDA/compute process")
 		}
+		pm.GPU = unavailableNumber("%", linuxNoProcessGPUMessage)
 
 		current[pid] = procSample{
 			cpuSeconds: pr.cpuSeconds,
@@ -1902,13 +1948,17 @@ func (c *systemCollector) collectProcesses(ctx context.Context) ProcessSet {
 	c.mu.Lock()
 	c.prevProc = current
 	c.mu.Unlock()
-	return buildProcessSet(raw, total)
+	set := buildProcessSet(raw, total)
+	agent := c.agentCost.measure(raw, os.Getpid(), now, numCPU)
+	set.Agent = &agent
+	return set
 }
 
 // linuxProcessRaw is the cumulative-counter snapshot read from /proc/[pid] for
 // one PID, before delta math turns it into rates.
 type linuxProcessRaw struct {
 	pid        int
+	ppid       int
 	name       string
 	cpuSeconds float64
 	rssBytes   uint64
@@ -1941,6 +1991,7 @@ func readLinuxProcess(pidStr string) (linuxProcessRaw, bool) {
 	}
 	pr := linuxProcessRaw{
 		pid:        pid,
+		ppid:       parseLinuxProcStatPPID(string(stat)),
 		name:       name,
 		cpuSeconds: float64(utime+stime) / linuxClockTicksPerSecond,
 	}
@@ -1978,6 +2029,37 @@ func parseLinuxProcStat(stat string) (utime, stime uint64, name string, ok bool)
 		return 0, 0, name, false
 	}
 	return utime, stime, name, true
+}
+
+// applyStorageRates reads /proc/diskstats once and fills every drive's
+// throughput. Storage device names are /sys/block names, which are the names
+// diskstats uses.
+func (c *systemCollector) applyStorageRates(storage *StorageSet) {
+	data, err := os.ReadFile("/proc/diskstats")
+	var counters map[string]diskIOCounter
+	if err == nil {
+		counters = parseLinuxDiskstats(string(data))
+	}
+	c.diskRates.apply(storage, counters, err, time.Now())
+}
+
+// parseLinuxProcStatPPID returns field 4 (ppid) of a /proc/[pid]/stat line,
+// read after the last ')' for the same reason parseLinuxProcStat does: the comm
+// field may itself contain spaces and parentheses. 0 when unparseable.
+func parseLinuxProcStatPPID(stat string) int {
+	rp := strings.LastIndexByte(stat, ')')
+	if rp < 0 {
+		return 0
+	}
+	rest := strings.Fields(stat[rp+1:])
+	if len(rest) < 2 {
+		return 0
+	}
+	ppid, err := strconv.Atoi(rest[1])
+	if err != nil || ppid < 0 {
+		return 0
+	}
+	return ppid
 }
 
 // readLinuxProcRSS returns the resident set size in bytes from the VmRSS line
