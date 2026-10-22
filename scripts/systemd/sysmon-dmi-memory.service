@@ -1,0 +1,28 @@
+[Unit]
+# Snapshots `dmidecode -t 17` (RAM modules, including the configured speed the
+# board trained to) into a world-readable file for sysmon-agent. The agent's
+# units set NoNewPrivileges, so it can never read the root-only DMI table
+# itself, not even through sudo. The speed only changes across a reboot (a BIOS
+# setting), so one snapshot per boot is enough.
+Description=RAM module snapshot for sysmon-agent
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+RuntimeDirectory=sysmon-dmi
+RuntimeDirectoryMode=0755
+UMask=0022
+ExecStart=/bin/sh -c 'dmidecode -t 17 > /run/sysmon-dmi/memory.txt.tmp && mv /run/sysmon-dmi/memory.txt.tmp /run/sysmon-dmi/memory.txt'
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
