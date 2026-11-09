@@ -386,6 +386,10 @@ func (s *sampler) publishWhole(metrics Metrics) {
 		return
 	}
 	s.mu.Lock()
+	// The device loop publishes by patching s.working, so it has to hold this
+	// collection. Left at the startup placeholder, every device tick would put
+	// "warming up" back over the real readings.
+	s.working = metrics
 	s.snapshot = metrics
 	s.snapshotJSON = data
 	s.haveSnapshot = true
