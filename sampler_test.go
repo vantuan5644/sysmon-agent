@@ -99,6 +99,47 @@ func TestDeviceActivityRefreshesWhileSlowCollectorIsStalled(t *testing.T) {
 	})
 }
 
+// wholeOnlyCollector has no lanes, so the sampler drives it with runWholeLoop.
+type wholeOnlyCollector struct{ hostname string }
+
+func (f *wholeOnlyCollector) Hostname() string { return f.hostname }
+
+func (f *wholeOnlyCollector) Collect(ctx context.Context) (Metrics, error) {
+	m := baseMetrics(f.hostname)
+	m.CPU = availableNumber(42, "%")
+	m.Memory = availableCapacity(10, 100)
+	return m, nil
+}
+
+// The device loop publishes by patching the sampler's working copy. Without
+// lanes that copy has to be the latest full collection, or each device tick
+// puts the startup placeholder back over real readings (seen on macOS).
+func TestDevicePublishKeepsWholeCollectionReadings(t *testing.T) {
+	inner := &wholeOnlyCollector{hostname: "test-host"}
+	s := newSampler(inner, 0, 0)
+	s.devices = newDeviceManager(filepath.Join(t.TempDir(), "settings.json"), &fakeDeviceBackend{})
+	ctx := context.Background()
+
+	whole, err := inner.Collect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.publishWhole(whole)
+	activity := s.devices.sample(ctx)
+	s.applyAndPublish(func(m *Metrics) { m.DeviceActivity = &activity }, time.Now())
+
+	got, err := s.Collect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.CPU.Available || got.CPU.Value != 42 || !got.Memory.Available {
+		t.Fatalf("device publish lost the collection: cpu=%+v memory=%+v", got.CPU, got.Memory)
+	}
+	if got.DeviceActivity == nil {
+		t.Fatal("device publish did not apply its own patch")
+	}
+}
+
 func waitForCond(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
