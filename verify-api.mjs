@@ -14,7 +14,7 @@ const agentBudgetArg = args.find((arg) => arg === "--agent-budget" || arg.starts
 const agentBudgetCores = agentBudgetArg ? parseAgentBudget(agentBudgetArg) : null;
 const baseURL = normalizeBaseURL(args.find((arg) => !arg.startsWith("--")) || defaultBaseURL);
 const timeoutMS = 5000;
-const dashboardBuild = "sysmon-static-v165";
+const dashboardBuild = "sysmon-static-v166";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,

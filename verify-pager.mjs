@@ -193,10 +193,10 @@ window.addEventListener("load", function () {
   }
 
   // The widest string each gauge center can show (CPU, GPU, RAM, NET order).
-  var gaugeSamples = ["100%", "100%", "100%", "\u219399.9M"];
-  var gaugeSubSamples = ["4.7/5.5GHz", "23.9/24.0G", "1000/1024G", "\u219199.9M"];
+  var gaugeSamples = ["100%", "100%", "100%", '\u219399.9<span class="gauge-unit">MB/s</span>'];
+  var gaugeSubSamples = ["4.7/5.5GHz", "23.9/24.0G", "1000/1024G", "\u219199.9MB/s"];
   Array.from(document.querySelectorAll(".gauge")).forEach(function (gauge, index) {
-    gauge.querySelector(".gauge-value").textContent = gaugeSamples[index];
+    gauge.querySelector(".gauge-value").innerHTML = gaugeSamples[index];
     gauge.querySelector(".gauge-sub").textContent = gaugeSubSamples[index];
   });
   document.getElementById("gpuName").textContent = "NVIDIA GeForce RTX 4090 Founders Edition";

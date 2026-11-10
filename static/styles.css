@@ -33,6 +33,27 @@
   box-sizing: border-box;
 }
 
+/* Icons come from the sprite in index.html and take their colour from the text
+   around them. See iconElement in app.js for why they are not text. */
+.icon-sprite {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+.icon {
+  display: inline-block;
+  flex: none;
+  width: 1em;
+  height: 1em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 html,
 body {
   width: 100%;
@@ -969,8 +990,9 @@ body.host-remote .host-controls {
      the ring is too small for it. Each limit keeps that gauge's widest string
      under 65% of the diameter, inside the inner ring's 71% hole. The font is
      monospace, so widths are character counts at 0.6em: "100%" is 2.36em with
-     the value's tracking, so 26cqw; NET overrides it for "↓99.9M" (3.54em). The
-     widest sub is 10 characters ("23.9/24.0G", 6em), so 10cqw. */
+     the value's tracking, so 26cqw; NET overrides it for "↓99.9MB/s" with its
+     unit at .gauge-unit's size (4.3em). The widest sub is 10 characters
+     ("23.9/24.0G", 6em), so 10cqw. */
   --value-fit: 26cqw;
   /* Everything in a 2x2 card except the gauge, plus half the grid gap; the
      gauge gets what is left of its row. It follows the .card-detail size, which
@@ -992,7 +1014,12 @@ body.host-remote .host-controls {
 }
 
 #netGauge {
-  --value-fit: 18cqw;
+  --value-fit: 15cqw;
+}
+
+.gauge-unit {
+  font-size: 0.55em;
+  font-weight: 650;
 }
 
 @media (min-width: 560px) {
@@ -1087,6 +1114,13 @@ body.host-remote .host-controls {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.card-id .icon {
+  width: 1.15em;
+  height: 1.15em;
+  margin-right: 0.35em;
+  vertical-align: -0.22em;
 }
 
 .card-detail {
@@ -1849,12 +1883,20 @@ body.host-remote .host-controls {
   color: var(--text);
 }
 
+.processes-head .processes-sort.sorted::after {
+  content: "";
+  display: inline-block;
+  margin-left: 0.35em;
+  vertical-align: 0.08em;
+  border-inline: 0.32em solid transparent;
+}
+
 .processes-head .processes-sort.sorted[data-proc-dir="asc"]::after {
-  content: " ▲";
+  border-bottom: 0.5em solid currentColor;
 }
 
 .processes-head .processes-sort.sorted[data-proc-dir="desc"]::after {
-  content: " ▼";
+  border-top: 0.5em solid currentColor;
 }
 
 .processes-row {
