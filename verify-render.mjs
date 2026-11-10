@@ -145,7 +145,7 @@ function writeFixture(root) {
     <section class="gauge-grid" aria-label="Primary metrics">
       ${gaugeCard("CPU", 37, "37%", "var(--good)", "AMD Ryzen 9 7950X", "52°C · 88 W", coreGridMock())}
       ${gaugeCard("GPU", 74, "74%", "var(--warn)", "NVIDIA GeForce RTX 4090", "61°C · 320 W", sparkline(74, "var(--warn)"))}
-      ${gaugeCard("RAM", 61, "61%", "var(--good)", "DDR5 · 6000 MT/s", "⇅ 1.2 GB swap", sparkline(61, "var(--good)"))}
+      ${gaugeCard("RAM", 61, "61%", "var(--good)", "DDR5 · 6000 MT/s", "1.2 GB swap", sparkline(61, "var(--good)"))}
       ${gaugeCard("NET", 30, "3.0M", "var(--accent)", "BiBi-Pro-Max", netDetailMock(), sparkline(30, "var(--accent)"))}
     </section>
     <section class="panel alerts-panel" role="button" tabindex="0" aria-label="Collapse alert details" aria-expanded="true" aria-live="polite">

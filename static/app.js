@@ -126,7 +126,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v165";
+const dashboardBuild = "sysmon-static-v166";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -2333,8 +2333,13 @@ function setNetGauge(net) {
   gauge.style.setProperty("--p", down);
   gauge.style.setProperty("--c", colorFor(down, netRingWarnPercent));
   setInnerRing("netGauge", { available: true, value: up, color: colorFor(up, netRingWarnPercent) });
-  value.textContent = `↓${formatRateCompact(net.rx)}`;
-  setGaugeSub("netSub", `↑${formatRateCompact(net.tx)}`);
+  const download = rateParts(net.rx);
+  const unit = document.createElement("span");
+  unit.className = "gauge-unit";
+  unit.textContent = `${download.unit}/s`;
+  value.textContent = `↓${download.number}`;
+  value.append(unit);
+  setGaugeSub("netSub", `↑${formatRateCompact(net.tx)}/s`);
 }
 
 // setInnerRing drives the inner conic ring of a double gauge. Pass a ring with
@@ -3176,7 +3181,7 @@ function renderPrimaryCardDetails(metrics, primaryGPU) {
 
   const swap = capacityPercent(metrics.memory_swap);
   setCardDetail("memDetail", joinDetail([
-    swap.available ? `⇅ ${formatBytes(swap.usedBytes)} swap` : "no swap",
+    swap.available ? `${formatBytes(swap.usedBytes)} swap` : "no swap",
     memoryPressureDetail(metrics),
   ]), null, null);
   $("memDetail").title = memoryPressureTitle(metrics);
@@ -4158,27 +4163,38 @@ function renderCardIdentities(metrics, primaryGPU) {
   const memGauge = $("memGauge");
   if (memGauge) { memGauge.title = memorySpeedTitle(metrics.memory_speed); }
 
-  const uplink = metrics.network && metrics.network.uplink;
-  setCardId("netName", uplinkDisplay(uplink));
+  renderNetName(metrics.network && metrics.network.uplink);
 }
 
-// uplinkDisplay renders the active network identity with a leading glyph for the
-// link kind -- signal bars for Wi-Fi, a wired-network plug for Ethernet -- so the
-// NET card shows at a glance how the host is connected. The name is the SSID
-// (Wi-Fi) or "Ethernet [+ link speed]" (wired); a degraded/absent uplink leaves
-// the line blank. Glyph-only fallbacks cover a known kind with no resolved name.
+// uplinkDisplay describes the active network identity: an icon for the link kind
+// (so the NET card shows at a glance how the host is connected) and a name, the
+// SSID on Wi-Fi or "Ethernet [+ link speed]" when wired. A degraded/absent uplink
+// is blank, and a known kind with no resolved name falls back to the kind.
 function uplinkDisplay(uplink) {
   if (!uplink || !uplink.available) {
-    return "";
+    return { icon: "", text: "" };
   }
   const name = nonEmptyText(uplink.name);
   if (uplink.kind === "wifi") {
-    return name ? `📶 ${name}` : "📶 Wi-Fi";
+    return { icon: "wifi", text: name || "Wi-Fi" };
   }
   if (uplink.kind === "ethernet") {
-    return name ? `🖧 ${name}` : "🖧 Ethernet";
+    return { icon: "ethernet", text: name || "Ethernet" };
   }
-  return name;
+  return { icon: "", text: name };
+}
+
+// renderNetName paints the NET card's identity line. It runs on every frame, and
+// the line is an aria-live region, so an unchanged uplink leaves the DOM alone.
+function renderNetName(uplink) {
+  const el = $("netName");
+  if (!el) { return; }
+  const { icon, text } = uplinkDisplay(uplink);
+  if (shownIcon(el) === icon && el.textContent === text) { return; }
+  el.textContent = "";
+  if (!text) { return; }
+  if (icon) { el.append(iconElement(icon)); }
+  el.append(text);
 }
 
 function setCardId(id, text) {
@@ -4262,6 +4278,31 @@ function meshIcon() {
     ["circle", { cx: 6.5, cy: 17.5, r: 2.3, fill: "currentColor", stroke: "none" }],
     ["circle", { cx: 17.5, cy: 17.5, r: 2.3, fill: "currentColor", stroke: "none" }],
   ]);
+}
+
+// iconElement returns an inline <svg> drawing a symbol from the sprite in
+// index.html. Icons are never text: the bundled font is a Latin subset, so any
+// other glyph depends on the fonts of the device viewing the dashboard.
+function iconElement(name) {
+  const svg = document.createElementNS(SVG_ICON_NS, "svg");
+  svg.setAttribute("class", "icon");
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS(SVG_ICON_NS, "use");
+  use.setAttribute("href", `#icon-${name}`);
+  svg.append(use);
+  return svg;
+}
+
+// shownIcon names the sprite symbol el currently starts with, "" if none.
+function shownIcon(el) {
+  const href = el.children[0]?.children[0]?.getAttribute("href") ?? "";
+  return href.replace("#icon-", "");
+}
+
+function setIcon(el, name) {
+  if (shownIcon(el) === name) { return; }
+  el.textContent = "";
+  el.append(iconElement(name));
 }
 
 // exitNodeIcon -- a doorway with an arrow leaving through it (egress): the mark
@@ -4693,7 +4734,7 @@ function paintSpeakerControl() {
   const muted = speakerMuteState === "muted";
   const busy = controlBusy("volume_mute");
   setPressed(button, muted);
-  $("volumeCtlGlyph").textContent = muted ? "🔇" : "🔊";
+  setIcon($("volumeCtlGlyph"), muted ? "speaker-muted" : "speaker");
   $("volumeCtlLabel").textContent = busy ? "…" : muted ? "Muted" : "Speaker";
   button.setAttribute("aria-label", busy ? "Speaker mute is changing" :
     muted ? "Unmute speaker; currently muted" :
@@ -4817,7 +4858,7 @@ function controlErrorText(error) {
 function togglePause() {
   state.paused = !state.paused;
   const button = $("pauseBtn");
-  setIconButton(button, state.paused ? "▶" : "Ⅱ", state.paused ? "Resume updates" : "Pause updates");
+  setIconButton(button, state.paused ? "play" : "pause", state.paused ? "Resume updates" : "Pause updates");
   setPressed(button, state.paused);
   if (state.paused) {
     schedulePolling();
@@ -4852,20 +4893,20 @@ async function requestWakeLock() {
   if (!("wakeLock" in navigator)) {
     state.wakeWanted = false;
     writeStoredBoolean(wakePreferenceKey, false);
-    setIconButton(button, "×", "Wake lock unavailable");
+    setIconButton(button, "close", "Wake lock unavailable");
     setPressed(button, false);
     return;
   }
   try {
     const lock = await navigator.wakeLock.request("screen");
     state.wakeLock = lock;
-    setIconButton(button, "☀", "Screen awake");
+    setIconButton(button, "wake", "Screen awake");
     setPressed(button, true);
     lock.addEventListener("release", () => handleWakeLockRelease(lock));
   } catch {
     state.wakeWanted = false;
     writeStoredBoolean(wakePreferenceKey, false);
-    setIconButton(button, "×", "Wake lock denied");
+    setIconButton(button, "close", "Wake lock denied");
     setPressed(button, false);
   }
 }
@@ -4880,7 +4921,7 @@ function handleWakeLockRelease(lock) {
     return;
   }
   const button = $("wakeBtn");
-  setIconButton(button, "☀", "Wake lock retrying");
+  setIconButton(button, "wake", "Wake lock retrying");
   setPressed(button, false);
   if (document.visibilityState === "visible") {
     requestWakeLock();
@@ -4889,12 +4930,12 @@ function handleWakeLockRelease(lock) {
 
 function setWakeButtonIdle() {
   const button = $("wakeBtn");
-  setIconButton(button, "☀", "Keep screen awake");
+  setIconButton(button, "wake", "Keep screen awake");
   setPressed(button, false);
 }
 
-function setIconButton(button, glyph, label) {
-  button.textContent = glyph;
+function setIconButton(button, icon, label) {
+  setIcon(button, icon);
   button.title = label;
   button.setAttribute("aria-label", label);
 }
@@ -4918,22 +4959,29 @@ function formatBytes(bytes) {
   return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
 }
 
-// formatRateCompact renders a byte/second rate as a short SI-ish string for the
-// NET gauge center/sub labels where space is tight (e.g. "12M", "8.4M", "940K").
-// Decimal (1000) base keeps it aligned with how link speeds are quoted.
-function formatRateCompact(bytesPerSecond) {
+// rateParts splits a byte/second rate into a short number and its unit. Rates are
+// bytes, so the unit keeps its capital B: the link speed printed beside them is
+// in bits ("2.5 Gb/s"). Decimal (1000) base matches how link speeds are quoted.
+function rateParts(bytesPerSecond) {
   const value = finiteNumber(bytesPerSecond);
   if (value === null || value < 0) {
-    return "0";
+    return { number: "0", unit: "B" };
   }
-  const units = ["B", "K", "M", "G", "T"];
+  const units = ["B", "KB", "MB", "GB", "TB"];
   let v = value;
   let u = 0;
   while (v >= 1000 && u < units.length - 1) {
     v /= 1000;
     u += 1;
   }
-  return `${v >= 100 || u === 0 ? v.toFixed(0) : v.toFixed(1)}${units[u]}`;
+  return { number: v >= 100 || u === 0 ? v.toFixed(0) : v.toFixed(1), unit: units[u] };
+}
+
+// formatRateCompact renders a byte/second rate without the "/s", e.g. "12MB",
+// "8.4MB", "940KB".
+function formatRateCompact(bytesPerSecond) {
+  const { number, unit } = rateParts(bytesPerSecond);
+  return `${number}${unit}`;
 }
 
 function formatPower(watts) {

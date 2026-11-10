@@ -543,7 +543,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v165",
+    dashboard_build: "sysmon-static-v166",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -561,7 +561,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v165",
+    dashboard_build: "sysmon-static-v166",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -652,6 +652,14 @@ function mergeDashboardSettings(current, update) {
     next.thresholds = { ...(current.thresholds || defaultThresholds), ...update.thresholds };
   }
   return next;
+}
+
+// iconOf names the sprite symbol an element draws, and fails when the sprite
+// has no such symbol: a mistyped icon name renders an empty button, not an error.
+function iconOf(element) {
+  const href = element.children[0]?.children[0]?.getAttribute("href") ?? "";
+  assert(href.startsWith("#icon-") && html.includes(`id="${href.slice(1)}"`), `icon ${JSON.stringify(href)} is not in the sprite`);
+  return href.slice("#icon-".length);
 }
 
 function assert(condition, message) {
@@ -928,11 +936,11 @@ assert(document.getElementById("historySummary").textContent === "last 1 min · 
   assert(rows[0].children[0].textContent === "CPU", "history panel first row is not CPU");
   assert(rows[0].children[1].children.length === 90, "history strip did not render 90 slots");
   assert(rows[0].children[2].textContent === "95%", "history panel did not report the CPU spike as the window peak");
-  assert(rows[3].children[2].textContent === "2.0K/s", "history panel did not report the network peak rate");
+  assert(rows[3].children[2].textContent === "2.0KB/s", "history panel did not report the network peak rate");
   // DISK is log-scaled and never warning-coloured; its peak includes the live
-  // frame (2.5M/s + 125K/s on nvme0n1), which outranks the agent's buckets.
+  // frame (2.5MB/s + 125KB/s on nvme0n1), which outranks the agent's buckets.
   assert(rows[4].children[0].textContent === "DISK", "history panel last row is not DISK");
-  assert(rows[4].children[2].textContent === "2.6M/s", `history disk peak = ${rows[4].children[2].textContent}`);
+  assert(rows[4].children[2].textContent === "2.6MB/s", `history disk peak = ${rows[4].children[2].textContent}`);
   const diskBars = rows[4].children[1].children;
   const lastDisk = diskBars[diskBars.length - 1];
   assert(lastDisk.style.values.get("--c") === "var(--accent)", "disk history bar was not drawn in the neutral accent colour");
@@ -959,7 +967,7 @@ assert(document.getElementById("memSub").textContent === "8.0/16G", "memory gaug
 assert(!document.getElementById("memGauge").classList.contains("hide-inner"), "available RAM speed did not show the inner ring");
 assert(document.getElementById("memGauge").style.values.get("--inner-p") === String((5600 - 4800) / (6000 - 4800) * 100), "RAM speed inner ring did not scale JEDEC -> rated");
 assert(document.getElementById("memGauge").style.values.get("--inner-c") === "var(--warn)", "RAM running below its rated profile did not warn");
-assert(document.getElementById("memDetail").textContent === "⇅ 2.0 GB swap · stall 0.4%", "memory card detail did not render swap and memory pressure");
+assert(document.getElementById("memDetail").textContent === "2.0 GB swap · stall 0.4%", "memory card detail did not render swap and memory pressure");
 assert(document.getElementById("memDetail").title === "Pressure stall, 10 s average. CPU: some 1.3%. Memory: some 0.4%, full 0.0%. IO: some 12%, full 3.5%.", `memory pressure title = ${document.getElementById("memDetail").title}`);
 {
   // A Windows host: no PSI, so the card shows commit charge, and commit near
@@ -968,7 +976,7 @@ assert(document.getElementById("memDetail").title === "Pressure stall, 10 s aver
   windowsHost.pressure = { available: false, error: "Windows keeps no pressure stall accounting; see memory_commit" };
   windowsHost.memory_commit = { available: true, used_bytes: 60129542144, total_bytes: 64424509440, percent: 93.33 };
   context.render(windowsHost);
-  assert(document.getElementById("memDetail").textContent === "⇅ 2.0 GB swap · commit 93%", "memory card detail did not fall back to commit charge");
+  assert(document.getElementById("memDetail").textContent === "2.0 GB swap · commit 93%", "memory card detail did not fall back to commit charge");
   assert(document.getElementById("memDetail").title === "Committed 56 GB of the 60 GB commit limit (RAM plus page files)", `commit title = ${document.getElementById("memDetail").title}`);
   assert(document.getElementById("alertsChip").hidden === false, "commit near its limit did not raise an alert");
   assert(document.getElementById("alertsList").children[0].textContent === "RAM commit 93% over 90%", `commit alert = ${document.getElementById("alertsList").children[0]?.textContent}`);
@@ -993,13 +1001,23 @@ context.render(hotspotMetrics);
 assert(document.getElementById("gpuDetail").textContent === "49\u00b0C \u00b7 112 W", "missing hotspot stayed visible");
 context.render(sampleMetrics());
 
-assert(document.getElementById("netValue").textContent.includes("2.0K"), "NET gauge did not render download rate");
-assert(document.getElementById("netSub").textContent.includes("1.0K"), "NET gauge sub did not render upload rate");
+assert(document.getElementById("netValue").textContent === "↓2.0KB/s", `NET gauge download = ${document.getElementById("netValue").textContent}`);
+assert(document.getElementById("netSub").textContent === "↑1.0KB/s", `NET gauge upload = ${document.getElementById("netSub").textContent}`);
 assert(document.getElementById("cpuName").textContent === "AMD Ryzen 9 7950X", "CPU identity line did not render the CPU model");
 assert(document.getElementById("gpuName").textContent === "GPU 0", "GPU identity line did not render the GPU model");
 assert(document.getElementById("memName").textContent === "DDR5 · 5600/6000 EXPO", "RAM identity line did not render type + running/rated speed");
 assert(document.getElementById("memGauge").title === "Running 5600 MT/s, rated 6000 MT/s (EXPO), JEDEC 4800 MT/s", "RAM gauge tooltip did not spell out the speed comparison");
-assert(document.getElementById("netName").textContent === "📶 BiBi-Pro-Max", "NET identity line did not render the Wi-Fi glyph + SSID");
+assert(document.getElementById("netName").textContent === "BiBi-Pro-Max" && iconOf(document.getElementById("netName")) === "wifi", "NET identity line did not render the Wi-Fi icon + SSID");
+{
+  const wired = sampleMetrics();
+  wired.network.uplink = { available: true, kind: "ethernet", name: "Ethernet · 2.5 Gb/s" };
+  context.render(wired);
+  assert(document.getElementById("netName").textContent === "Ethernet · 2.5 Gb/s" && iconOf(document.getElementById("netName")) === "ethernet", "NET identity line did not render the Ethernet icon + link speed");
+  wired.network.uplink = { available: false };
+  context.render(wired);
+  assert(document.getElementById("netName").textContent === "" && document.getElementById("netName").children.length === 0, "an absent uplink did not leave the NET identity line blank");
+  context.render(sampleMetrics());
+}
 assert(document.getElementById("storagePanel").hidden === false, "storage panel did not show for available devices");
 assert(document.getElementById("storageSummary").textContent === "3 drives", "storage panel summary did not render drive count");
 {
@@ -1012,7 +1030,7 @@ assert(document.getElementById("storageSummary").textContent === "3 drives", "st
   assert(storageRows[0].children[2].children[0].textContent === "/", "storage row 0 mountpoint caption did not render");
   assert(storageRows[0].children[2].children[1].textContent === "250 B / 1000 B", "storage row 0 capacity did not render used/total");
   assert(storageRows[0].children[3]?.className === "storage-io", "storage row 0 did not render its throughput");
-  assert(storageRows[0].children[3].textContent === "read 2.5M/s · write 125K/s", `storage row 0 throughput = ${storageRows[0].children[3].textContent}`);
+  assert(storageRows[0].children[3].textContent === "read 2.5MB/s · write 125KB/s", `storage row 0 throughput = ${storageRows[0].children[3].textContent}`);
   // Second device: unmounted -> "no mounted filesystems" caption + em dash.
   assert(storageRows[1].children[0].children[1].textContent === "41°C", "storage row 1 temperature did not render");
   assert(storageRows[1].children[2].children[0].textContent === "no mounted filesystems", "storage row 1 did not render the unmounted caption");
@@ -1133,7 +1151,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v165, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v166, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1181,7 +1199,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v165; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v166; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1191,7 +1209,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v165",
+    dashboard_build: "sysmon-static-v166",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1201,7 +1219,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v165",
+    dashboard_build: "sysmon-static-v166",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1336,7 +1354,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v165", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v166", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -1547,12 +1565,12 @@ assert(document.getElementById("shiftBtn").classList.contains("active"), "shift 
 assert(document.getElementById("shiftBtn").getAttribute("aria-pressed") === "true", "shift control did not expose pressed state");
 
 await document.getElementById("wakeBtn").click();
-assert(document.getElementById("wakeBtn").textContent === "×", "unsupported wake lock did not show unavailable state");
+assert(iconOf(document.getElementById("wakeBtn")) === "close", "unsupported wake lock did not show unavailable state");
 assert(document.getElementById("wakeBtn").getAttribute("aria-label") === "Wake lock unavailable", "unsupported wake lock did not update accessible label");
 assert(document.getElementById("wakeBtn").getAttribute("aria-pressed") === "false", "unsupported wake lock exposed pressed state");
 assert(localStorageValues.get("sysmon:wake-wanted") === "0", "unsupported wake lock did not persist disabled preference");
 await document.getElementById("wakeBtn").click();
-assert(document.getElementById("wakeBtn").textContent === "×", "unsupported wake lock did not stay unavailable on retry");
+assert(iconOf(document.getElementById("wakeBtn")) === "close", "unsupported wake lock did not stay unavailable on retry");
 assert(document.getElementById("wakeBtn").getAttribute("aria-label") === "Wake lock unavailable", "unsupported wake lock did not keep unavailable label");
 assert(document.getElementById("wakeBtn").getAttribute("aria-pressed") === "false", "unsupported wake lock retry exposed pressed state");
 
@@ -1631,7 +1649,7 @@ assert(document.getElementById("wakeBtn").getAttribute("aria-label") === "Keep s
 assert(document.getElementById("wakeBtn").getAttribute("aria-pressed") === "false", "failing wake lock release did not clear pressed state");
 
 await document.getElementById("pauseBtn").click();
-assert(document.getElementById("pauseBtn").textContent === "▶", "pause button did not switch to resume icon");
+assert(iconOf(document.getElementById("pauseBtn")) === "play", "pause button did not switch to resume icon");
 assert(document.getElementById("pauseBtn").getAttribute("aria-label") === "Resume updates", "pause button did not update accessible label");
 assert(document.getElementById("pauseBtn").getAttribute("aria-pressed") === "true", "pause button did not expose pressed state");
 assert(document.getElementById("statusText").textContent === "Paused", "pause control did not update status");
@@ -1695,7 +1713,7 @@ context.fetch = async (path, options = {}) => {
 };
 const metricsBeforeResume = metricsRequests;
 await document.getElementById("pauseBtn").click();
-assert(document.getElementById("pauseBtn").textContent === "Ⅱ", "pause button did not switch back to pause icon");
+assert(iconOf(document.getElementById("pauseBtn")) === "pause", "pause button did not switch back to pause icon");
 assert(document.getElementById("pauseBtn").getAttribute("aria-pressed") === "false", "pause button did not clear pressed state on resume");
 assert(!document.getElementById("statusDot").classList.contains("paused"), "resume left paused indicator active");
 assert(context.totalIntervalCount() === 4, "resumed dashboard did not restore all polling timers");
@@ -2790,7 +2808,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   paint("muted", "muted");
   assert(micState() === "Off", "host-reported microphone mute did not show without a toggle");
   assert(mic.getAttribute("aria-pressed") === "true", "host-reported mute did not press the mic button");
-  assert(speakerLabel() === "Muted" && document.getElementById("volumeCtlGlyph").textContent === "🔇", "host-reported speaker mute did not show");
+  assert(speakerLabel() === "Muted" && iconOf(document.getElementById("volumeCtlGlyph")) === "speaker-muted", "host-reported speaker mute did not show");
   paint("unmuted", "unmuted");
   assert(micState() === "On" && speakerLabel() === "Speaker", "host-reported unmute did not show");
   paint("mixed");
@@ -2926,7 +2944,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v165" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v166" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],

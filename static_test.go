@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"image/png"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -132,7 +133,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v165"`,
+		`const STATIC_CACHE = "sysmon-static-v166"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -412,7 +413,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 5000;`,
-		`const dashboardBuild = "sysmon-static-v165";`,
+		`const dashboardBuild = "sysmon-static-v166";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -862,11 +863,11 @@ func TestDashboardWakeLockUnavailableClearsWantedState(t *testing.T) {
 		`function handleWakeLockRelease(lock) {`,
 		`if (state.wakeLock !== lock) {`,
 		`if (!state.wakeWanted) {`,
-		`setIconButton(button, "☀", "Wake lock retrying");`,
+		`setIconButton(button, "wake", "Wake lock retrying");`,
 		`if (document.visibilityState === "visible") {`,
 		`requestWakeLock();`,
-		`setIconButton(button, "×", "Wake lock unavailable");`,
-		`setIconButton(button, "×", "Wake lock denied");`,
+		`setIconButton(button, "close", "Wake lock unavailable");`,
+		`setIconButton(button, "close", "Wake lock denied");`,
 		`setPressed(button, false);`,
 	} {
 		if !strings.Contains(appJS, needle) {
@@ -1041,7 +1042,7 @@ func TestDashboardHostControlButtons(t *testing.T) {
 		`id="volumeCtl" class="control-btn" type="button" data-control="volume_mute"`,
 		`id="lockCtl" class="control-btn" type="button" data-control="lock_screen"`,
 		`<span class="control-label" id="micCtlLabel">Mic</span>`,
-		`<span class="control-glyph" id="volumeCtlGlyph" aria-hidden="true">🔊</span>`,
+		`<span class="control-glyph" id="volumeCtlGlyph" aria-hidden="true"><svg class="icon"><use href="#icon-speaker"></use></svg></span>`,
 		`<span class="control-label" id="volumeCtlLabel">Speaker</span>`,
 	} {
 		if !strings.Contains(indexHTML, needle) {
@@ -1078,7 +1079,7 @@ func TestDashboardHostControlButtons(t *testing.T) {
 		`function applyControlCapabilities(controls) {`,
 		`button.disabled = !available.has(action);`,
 		`applyControlCapabilities(status?.controls);`,
-		`$("volumeCtlGlyph").textContent = muted ? "🔇" : "🔊";`,
+		`setIcon($("volumeCtlGlyph"), muted ? "speaker-muted" : "speaker");`,
 	} {
 		if !strings.Contains(appJS, needle) {
 			t.Fatalf("app.js missing host control behavior %q", needle)
@@ -1493,6 +1494,53 @@ func TestDashboardRendersPrimaryMetricSparklines(t *testing.T) {
 	} {
 		if !strings.Contains(css, needle) {
 			t.Fatalf("styles.css missing primary metric sparkline style %q", needle)
+		}
+	}
+}
+
+// The dashboard's font is a Latin subset, so any other character is drawn by
+// whatever fonts the viewing device happens to have: a box on a device with none
+// that covers it, and a mismatched face or a clipped shape on one that does.
+// Icons therefore come from the SVG sprite in index.html. A character added here
+// must be in static/fonts/jetbrains-mono.woff2.
+func TestDashboardStaysInsideTheBundledFont(t *testing.T) {
+	const inFont = "°·×—…↑↓"
+	escape := regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
+	for _, name := range []string{"static/index.html", "static/app.js", "static/styles.css"} {
+		data, err := staticFS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := escape.ReplaceAllStringFunc(string(data), func(match string) string {
+			code, err := strconv.ParseUint(match[2:], 16, 32)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(rune(code))
+		})
+		for line, content := range strings.Split(text, "\n") {
+			for _, r := range content {
+				if r > 0x7e && !strings.ContainsRune(inFont, r) {
+					t.Errorf("%s:%d: %q (U+%04X) is not in the bundled font; use an icon from the sprite in index.html", name, line+1, r, r)
+				}
+			}
+		}
+	}
+}
+
+func TestDashboardIconsResolveInTheSprite(t *testing.T) {
+	index, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(index)
+	uses := regexp.MustCompile(`<use href="#(icon-[a-z-]+)">`).FindAllStringSubmatch(html, -1)
+	if len(uses) == 0 {
+		t.Fatal("index.html draws no icons from the sprite")
+	}
+	for _, use := range uses {
+		if !strings.Contains(html, `<symbol id="`+use[1]+`"`) {
+			t.Errorf("index.html uses %s, which the sprite does not define", use[1])
 		}
 	}
 }
