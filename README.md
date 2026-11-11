@@ -489,10 +489,20 @@ integration — the same binary is both console app and service). From an elevat
 .\install-windows.ps1 -Action Install -TailscaleServe  # also publish https://<machine>.<tailnet>.ts.net:9443
 .\install-windows.ps1 -Action Pair        # a new pairing PIN (also: Start, Sysmon Agent, Pair a device)
 .\install-windows.ps1 -Action Install -Pairing off  # open to every device, as before pairing
+.\install-windows.ps1 -Action Install -LanSubnet 192.168.1.0/24  # LAN access on a Public network
 .\install-windows.ps1 -Action Status      # checks /readyz, reports settings, pairing, AI usage sources, Serve
 .\install-windows.ps1 -Action Update      # download + verify + swap + rollback
 .\install-windows.ps1 -Action Uninstall
 ```
+
+The firewall rule the installer adds covers Domain and Private networks only. Windows puts
+every new network in Public (a new Wi-Fi network, or the first time you plug in a cable),
+and other devices on that LAN then time out while the dashboard still opens on the PC
+itself. Install and Status warn when this happens and print the subnet to use.
+`-LanSubnet` adds a second rule that opens the port on Public networks to that subnet only.
+Later installs keep it, `-LanSubnet ''` removes it, and Uninstall removes both rules. The
+alternative is to mark the network Private in Windows Settings, which also opens every
+other Private-only rule on the PC.
 
 The service runs as **LocalSystem**, which is why it can load the LibreHardwareMonitor
 kernel driver every boot. Don't run it interactively under an unprivileged account for

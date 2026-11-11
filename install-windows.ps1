@@ -50,6 +50,18 @@ param(
     # with the desktop widget: two pollers on one account fight the rate limit.
     [switch]$ClaudeQuotaPoll,
     [switch]$NoFirewall,
+    # Also open the port on networks Windows calls Public, but only to these
+    # addresses (comma-separated, e.g. 192.168.1.0/24). Windows applies firewall
+    # profiles per interface and starts every new network (a new SSID, a first
+    # cable) as Public, where the Domain,Private rule does not apply, so LAN
+    # devices time out while the service looks healthy. This adds a second rule,
+    # $ServiceName-$Port-lan. A reinstall without the parameter keeps the
+    # addresses that rule already allows, -LanSubnet '' removes it, and Uninstall
+    # removes it with the main rule. The main rule stays unscoped, because other
+    # agents reach this one by its Tailscale address. Status warns while a Public
+    # network still blocks the port.
+    [ValidateScript({ @($_ -split ',' | Where-Object { $_.Trim() -in @('Any', '*', '0.0.0.0/0', '::/0') }).Count -eq 0 })]
+    [string]$LanSubnet = '',
     # Publish the dashboard over Tailscale Serve HTTPS, so every host shares one
     # address shape: https://<machine>.<tailnet>.ts.net:9443. That is the secure
     # context an iPhone Home Screen app needs, and the first address other
@@ -105,6 +117,9 @@ $ErrorActionPreference = 'Stop'
 # The parameters the caller named. Status and Pair take the rest of -Bind and
 # -Port from the installed service (Use-ServiceEndpoint).
 $script:GivenParameters = @($PSBoundParameters.Keys)
+# Whether -LanSubnet was passed at all. Without it, Install keeps the addresses
+# the existing LAN rule allows (Resolve-LanSubnet).
+$LanSubnetGiven = $PSBoundParameters.ContainsKey('LanSubnet')
 
 function Assert-Admin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -185,6 +200,26 @@ function Get-BinaryPath {
 
 function Get-FirewallRuleName {
     return "$ServiceName-$Port"
+}
+
+# Named under $ServiceName-* so Remove-ServiceFirewallRules clears it with the
+# main rule on every install and on uninstall.
+function Get-LanFirewallRuleName {
+    return "$(Get-FirewallRuleName)-lan"
+}
+
+# The addresses the Public-profile LAN rule should allow. -LanSubnet wins ('' for
+# none). Without it, Install keeps what the current rule allows, so a plain
+# reinstall does not quietly close the LAN again.
+function Resolve-LanSubnet {
+    if ($LanSubnetGiven) {
+        return @($LanSubnet -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    $rule = Get-NetFirewallRule -Name (Get-LanFirewallRuleName) -ErrorAction SilentlyContinue
+    if (-not $rule) {
+        return @()
+    }
+    return @(($rule | Get-NetFirewallAddressFilter).RemoteAddress | Where-Object { $_ -and $_ -ne 'Any' })
 }
 
 function Resolve-HealthHost {
@@ -994,6 +1029,110 @@ function Remove-ServiceFirewallRules {
     }
 }
 
+# Recreates the service's rules: the main one on Domain,Private and, when
+# Resolve-LanSubnet names addresses, the Public-profile LAN rule limited to them.
+function Set-ServiceFirewallRules {
+    if ($NoFirewall) {
+        Remove-ServiceFirewallRules
+        return
+    }
+    # Read before the rules go, so a plain reinstall keeps the LAN rule.
+    $lanAddresses = @(Resolve-LanSubnet)
+    Remove-ServiceFirewallRules
+    New-NetFirewallRule `
+        -Name (Get-FirewallRuleName) `
+        -DisplayName "$DisplayName ($Port)" `
+        -Direction Inbound `
+        -Action Allow `
+        -Protocol TCP `
+        -LocalPort $Port `
+        -Profile Domain,Private | Out-Null
+    if ($lanAddresses.Count -gt 0) {
+        New-NetFirewallRule `
+            -Name (Get-LanFirewallRuleName) `
+            -DisplayName "$DisplayName LAN ($Port)" `
+            -Description "TCP $Port on Public networks, from $($lanAddresses -join ', ') only. Managed by install-windows.ps1 -LanSubnet." `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort $Port `
+            -Profile Public `
+            -RemoteAddress $lanAddresses | Out-Null
+        Write-Host "Firewall: TCP $Port is also open on Public networks, from $($lanAddresses -join ', ') only."
+    }
+}
+
+# The network of an IPv4 address as a CIDR: 10.0.0.4 with 24 is 10.0.0.0/24.
+function Get-Ipv4Subnet([string]$Address, [int]$PrefixLength) {
+    $bytes = ([System.Net.IPAddress]::Parse($Address)).GetAddressBytes()
+    for ($i = 0; $i -lt 4; $i++) {
+        $bits = [Math]::Max(0, [Math]::Min(8, $PrefixLength - 8 * $i))
+        $bytes[$i] = $bytes[$i] -band ((0xFF -shl (8 - $bits)) -band 0xFF)
+    }
+    return "$($bytes -join '.')/$PrefixLength"
+}
+
+# IPv4 addresses on interfaces Windows has put in the Public profile, which the
+# main rule does not cover.
+function Get-PublicLanAddresses {
+    if (-not (Get-Command Get-NetConnectionProfile -ErrorAction SilentlyContinue)) {
+        return
+    }
+    $public = @{}
+    Get-NetConnectionProfile -ErrorAction SilentlyContinue |
+        Where-Object { [string]$_.NetworkCategory -eq 'Public' -and (Test-DeviceInterfaceName ([string]$_.InterfaceAlias)) } |
+        ForEach-Object { $public[[int]$_.InterfaceIndex] = [string]$_.InterfaceAlias }
+    if ($public.Count -eq 0) {
+        return
+    }
+    Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $public.ContainsKey([int]$_.InterfaceIndex) -and (Test-UsableDeviceHost ([string]$_.IPAddress)) } |
+        ForEach-Object {
+            [pscustomobject]@{
+                Interface = $public[[int]$_.InterfaceIndex]
+                Address = [string]$_.IPAddress
+                Subnet = Get-Ipv4Subnet ([string]$_.IPAddress) ([int]$_.PrefixLength)
+            }
+        }
+}
+
+# Enabled inbound allow rules for TCP $Port that apply on Public. Matched by
+# port, so a rule added by hand under another name counts too. This works
+# unelevated; a Get-NetFirewallPortFilter -All scan stops at Access denied there
+# and misses rules.
+function Get-PublicPortRules {
+    $candidates = @(Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+        Where-Object { [string]$_.Profile -eq 'Any' -or ([string]$_.Profile).Contains('Public') })
+    if ($candidates.Count -eq 0) {
+        return
+    }
+    $candidates |
+        Get-NetFirewallPortFilter -ErrorAction SilentlyContinue |
+        Where-Object { @('TCP', 'Any') -contains [string]$_.Protocol -and @($_.LocalPort) -contains [string]$Port } |
+        Get-NetFirewallRule -ErrorAction SilentlyContinue
+}
+
+# On a Public network other devices time out while every check run on this
+# machine passes, because traffic from the machine itself skips the firewall.
+function Show-LanFirewallStatus {
+    if (@('localhost', '127.0.0.1', '::1') -contains $Bind.Trim().Trim('[', ']').ToLowerInvariant()) {
+        return
+    }
+    $addresses = @(Get-PublicLanAddresses)
+    if ($addresses.Count -eq 0) {
+        return
+    }
+    $where = ($addresses | ForEach-Object { "$($_.Interface) ($($_.Address))" }) -join ', '
+    $rules = @(Get-PublicPortRules)
+    if ($rules.Count -gt 0) {
+        $open = ($rules | ForEach-Object { "$($_.Name) (remote $(@(($_ | Get-NetFirewallAddressFilter).RemoteAddress) -join ','))" }) -join ', '
+        Write-Host "LAN firewall: $where is on a Public network; TCP $Port is open there by $open."
+        return
+    }
+    $subnets = @($addresses | ForEach-Object { $_.Subnet } | Select-Object -Unique) -join ','
+    Write-Warning "LAN firewall: $where is on a Public network, which the $(Get-FirewallRuleName) rule (Domain,Private) does not cover, so other devices time out on TCP $Port while this machine still connects. Fix: re-run Install with -LanSubnet $subnets, or make that network Private (which also opens every other Private-only rule)."
+}
+
 function Set-ServiceRecovery {
     & sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/30000 | Out-Null
     & sc.exe failureflag $ServiceName 1 | Out-Null
@@ -1400,6 +1539,9 @@ function Invoke-AgentPair {
         # The advice goes first, so the PIN and its QR code are what the output
         # ends on, even in a console too short to hold all of it.
         Show-TailscaleServeAdvice
+        # A phone on a Public network times out on the code's address, while
+        # everything checked from this machine passes.
+        Show-LanFirewallStatus
         Write-Host ''
         Write-Host 'A paired dashboard can pair more devices: on its More status page (the second dot),'
         Write-Host 'Paired devices, Pair another device.'
@@ -1501,20 +1643,7 @@ function Install-Agent {
     Set-ServiceRecovery
 
     try {
-        if (-not $NoFirewall) {
-            Remove-ServiceFirewallRules
-            $ruleName = Get-FirewallRuleName
-            New-NetFirewallRule `
-                -Name $ruleName `
-                -DisplayName "$DisplayName ($Port)" `
-                -Direction Inbound `
-                -Action Allow `
-                -Protocol TCP `
-                -LocalPort $Port `
-                -Profile Domain,Private | Out-Null
-        } else {
-            Remove-ServiceFirewallRules
-        }
+        Set-ServiceFirewallRules
     } catch {
         # A firewall failure must not fail the whole install: the service is
         # already configured and the dashboard still works on this machine. Warn
@@ -1531,11 +1660,13 @@ function Install-Agent {
     Show-LhmLibraryStatus
     Show-PwshStatus
     if ($Pairing -ne 'required') {
+        Show-LanFirewallStatus
         Show-DeviceHandoff
         Write-Warning "Pairing is off: any device that reaches port $Port sees this host's data and can use its controls. Re-run Install without -Pairing off to require pairing."
         return
     }
     if ($SkipPair) {
+        Show-LanFirewallStatus
         Show-DeviceHandoff
         Write-Host ''
         Write-Host 'Pairing is required: other devices see this host only once they are paired. For a'
@@ -1543,7 +1674,7 @@ function Install-Agent {
         return
     }
     # The PIN goes last, where the output ends. -pair lists the device URLs
-    # itself.
+    # itself, and Invoke-AgentPair warns about a Public network first.
     Show-DeviceHandoff -SkipUrls
     Write-Host ''
     Write-Host 'Pair your first device:'
@@ -1600,6 +1731,7 @@ function Show-Status {
     }
 
     if ($serviceInstalled) {
+        Show-LanFirewallStatus
         Show-DeployedDeviceGate
         Show-DeviceHandoff
     }

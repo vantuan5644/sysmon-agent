@@ -524,6 +524,100 @@ func TestWindowsInstallerGPUGuard(t *testing.T) {
 	}
 }
 
+// Windows starts every new network (a new SSID, a first cable) as Public,
+// where the Domain,Private rule does not apply, so LAN devices time out while
+// the service and every check run on the machine itself look healthy.
+// -LanSubnet adds a Public rule limited to the LAN, a plain reinstall keeps it,
+// and Status names a Public network that still blocks the port.
+func TestWindowsInstallerLanSubnet(t *testing.T) {
+	data, err := os.ReadFile("install-windows.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(string(data), "\r\n", "\n")
+	for _, needle := range []string{
+		`[string]$LanSubnet = '',`,
+		`$LanSubnetGiven = $PSBoundParameters.ContainsKey('LanSubnet')`,
+		`return "$(Get-FirewallRuleName)-lan"`,
+		`function Resolve-LanSubnet`,
+		`($rule | Get-NetFirewallAddressFilter).RemoteAddress`,
+		`function Set-ServiceFirewallRules`,
+		// The LAN rule is read before Remove-ServiceFirewallRules deletes it.
+		`    $lanAddresses = @(Resolve-LanSubnet)
+    Remove-ServiceFirewallRules`,
+		`-Profile Domain,Private | Out-Null`,
+		`-Profile Public `,
+		`-RemoteAddress $lanAddresses | Out-Null`,
+		`    try {
+        Set-ServiceFirewallRules
+    } catch {`,
+		`function Get-PublicLanAddresses`,
+		`function Get-PublicPortRules`,
+		`-PolicyStore ActiveStore`,
+		`function Show-LanFirewallStatus`,
+		`Fix: re-run Install with -LanSubnet $subnets`,
+		// Every Install path warns about a Public network: the two that end on
+		// the handoff, and Invoke-AgentPair before the PIN and its QR code,
+		// which is also the Pair window the setup wizard opens.
+		`    if ($Pairing -ne 'required') {
+        Show-LanFirewallStatus
+        Show-DeviceHandoff`,
+		`    if ($SkipPair) {
+        Show-LanFirewallStatus
+        Show-DeviceHandoff`,
+		`        Show-TailscaleServeAdvice
+        # A phone on a Public network times out on the code's address, while
+        # everything checked from this machine passes.
+        Show-LanFirewallStatus
+`,
+		`    if ($serviceInstalled) {
+        Show-LanFirewallStatus`,
+	} {
+		if !strings.Contains(script, needle) {
+			t.Errorf("install-windows.ps1 missing %q", needle)
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	pwsh, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("PowerShell 7 is needed to run the subnet fixtures")
+	}
+	validate := regexp.MustCompile(`(?m)^    \[ValidateScript\(\{ (.*) \}\)\]\n    \[string\]\$LanSubnet`).FindStringSubmatch(script)
+	if validate == nil {
+		t.Fatal("-LanSubnet ValidateScript not found")
+	}
+	fixture := `$ErrorActionPreference = 'Stop'
+` + sliceFunction(t, script, "Get-Ipv4Subnet") + "\n}\n" + `
+$cases = @(
+    @('10.0.0.4', 24, '10.0.0.0/24'),
+    @('192.168.1.77', 24, '192.168.1.0/24'),
+    @('172.20.13.9', 20, '172.20.0.0/20'),
+    @('10.250.7.9', 9, '10.128.0.0/9'),
+    @('100.64.12.34', 32, '100.64.12.34/32')
+)
+foreach ($c in $cases) {
+    $got = Get-Ipv4Subnet $c[0] $c[1]
+    if ($got -ne $c[2]) { throw "Get-Ipv4Subnet $($c[0]) $($c[1]) = $got, want $($c[2])" }
+}
+function Test-LanSubnetValue([string]$Value) { return [bool]($Value | ForEach-Object { ` + validate[1] + ` }) }
+foreach ($ok in @('', '10.0.0.0/24', '10.0.0.0/24, 192.168.50.0/24', '10.0.0.0/255.255.255.0')) {
+    if (-not (Test-LanSubnetValue $ok)) { throw "-LanSubnet '$ok' rejected" }
+}
+foreach ($bad in @('Any', 'any', '*', '0.0.0.0/0', '::/0', '10.0.0.0/24, Any', ' * ')) {
+    if (Test-LanSubnetValue $bad) { throw "-LanSubnet '$bad' accepted; it opens the port to every address" }
+}
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, pwsh, "-NoProfile", "-NonInteractive", "-Command", fixture).CombinedOutput()
+	if err != nil {
+		t.Fatalf("LanSubnet fixtures: %v: %s", err, out)
+	}
+}
+
 func TestWindowsVerifierDefaults(t *testing.T) {
 	data, err := os.ReadFile("verify-windows.ps1")
 	if err != nil {
