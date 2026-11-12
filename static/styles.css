@@ -2239,9 +2239,130 @@ body.host-remote .host-controls {
   }
 }
 
-/* GPU hotspot is display-only and keeps neutral styling beside core warnings. */
+/* GPU hotspot: neutral until the GPU guard's lines (gpu_guard.thresholds, else
+   its defaults 90/95 C), and coloured on its own, apart from the core warning. */
 #gpuDetail { white-space: normal; overflow-wrap: anywhere; }
 .gpu-hotspot-detail { color: var(--muted); }
+.gpu-hotspot-detail.warn { color: var(--warn); }
+.gpu-hotspot-detail.crit { color: var(--bad); font-weight: 700; }
+
+/* GPU guard alarm (gpu_guard.level "critical"): one fixed layer over the whole
+   shell, so it covers every pager page. A sibling of .shell, never a child:
+   screen-shift's transform on .shell would make a fixed child scroll and drift
+   with it. Static red on purpose: no pulse (burn-in on an always-on kiosk, and
+   motion is not needed to be seen at this size). Solid colours, so nothing
+   depends on color-mix or backdrop-filter support. A tap anywhere hides it for
+   a minute; it comes back while the host is still critical. */
+.gpu-alarm {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding:
+    calc(16px + env(safe-area-inset-top))
+    calc(16px + env(safe-area-inset-right))
+    calc(16px + env(safe-area-inset-bottom))
+    calc(16px + env(safe-area-inset-left));
+  background: #5c0a0a;
+  color: #fff;
+  text-align: center;
+  cursor: pointer;
+}
+
+.gpu-alarm[hidden] {
+  display: none;
+}
+
+.gpu-alarm-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: min(100%, 560px);
+  padding: 22px 18px;
+  border: 3px solid #ff6b6b;
+  border-radius: 16px;
+  background: #3a0606;
+}
+
+.gpu-alarm-icon {
+  width: 64px;
+  height: 64px;
+  color: #ffd166;
+  stroke-width: 2.2;
+}
+
+.gpu-alarm-host {
+  margin: 0;
+  color: #ffd0d0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+/* "GPU hotspot 100°C" is 17 monospace characters: about 10.2em, so 1.8rem
+   fits the panel at a 390px-wide phone and 2.4rem from 600px up. */
+.gpu-alarm-title {
+  margin: 0;
+  font-size: 1.8rem;
+  font-weight: 800;
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+}
+
+@media (min-width: 600px) {
+  .gpu-alarm-title {
+    font-size: 2.4rem;
+  }
+}
+
+.gpu-alarm-readings {
+  margin: 0;
+  color: #ffd0d0;
+  font-size: 1rem;
+}
+
+.gpu-alarm-message,
+.gpu-alarm-action {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.gpu-alarm-action {
+  color: #ffd166;
+  font-weight: 600;
+}
+
+.gpu-alarm-dismiss {
+  min-height: 44px;
+  margin-top: 6px;
+  padding: 8px 18px;
+  border: 1px solid #ffd0d0;
+  border-radius: 10px;
+  background: transparent;
+  color: #fff;
+  cursor: pointer;
+}
+
+.gpu-alarm-dismiss:focus-visible {
+  outline: 2px solid #ffd166;
+  outline-offset: 2px;
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .gpu-alarm-panel {
+    gap: 6px;
+    padding: 12px 16px;
+  }
+
+  .gpu-alarm-icon {
+    width: 40px;
+    height: 40px;
+  }
+}
 
 /* The border indicates control state; usage has its own text and animation. */
 .control-btn[data-control="mic_mute"], .control-btn[data-control="camera_toggle"] {

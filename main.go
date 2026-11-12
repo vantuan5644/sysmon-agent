@@ -62,6 +62,14 @@ func main() {
 	peerList := flag.String("peers", envString("SYSMON_PEERS", ""), "other agents the dashboard can switch to, comma-separated [name=]URL entries (e.g. minipc=https://minipc.example.ts.net:9443)")
 	peerDiscovery := flag.Bool("peer-discovery", envBool("SYSMON_PEER_DISCOVERY", true), "find other agents on the tailnet (tailscale status, then one request each to :9443 and :9099) when a dashboard opens the host list")
 	storageExclude := flag.String("storage-exclude", envString("SYSMON_STORAGE_EXCLUDE", ""), "drives to leave out of the storage panel and send nothing to, comma-separated parts of their model as the panel shows it (e.g. \"ZEPHYR USB DISK\")")
+	// GPU overheat guard (gpu_guard.go). warn raises the alarms and logs what
+	// act would do; act also lowers the power limit and then ends GPU apps.
+	gpuGuardMode := flag.String("gpu-guard", envString("SYSMON_GPU_GUARD", "warn"), "GPU overheat guard: off, warn (alarms only) or act (alarms, then lower the power limit, then end GPU apps)")
+	gpuHotspotWarn := flag.Int("gpu-hotspot-warn", envInt("SYSMON_GPU_HOTSPOT_WARN", 0), "GPU hotspot warning in Celsius (70-105); 0 uses 90")
+	gpuHotspotCrit := flag.Int("gpu-hotspot-crit", envInt("SYSMON_GPU_HOTSPOT_CRIT", 0), "GPU hotspot critical level in Celsius (80-110), where the guard acts; 0 uses 95")
+	gpuDeltaWarn := flag.Int("gpu-delta-warn", envInt("SYSMON_GPU_DELTA_WARN", 0), "warn when the hotspot runs this many Celsius above the GPU core under load (10-40); 0 uses 20")
+	gpuGuardSpare := flag.String("gpu-guard-spare", envString("SYSMON_GPU_GUARD_SPARE", ""), "process names the guard never ends, comma-separated, besides the desktop, terminals, sysmon and streaming hosts")
+	gpuGuardTestFile := flag.String("gpu-guard-test-file", envString("SYSMON_GPU_GUARD_TEST_FILE", ""), "testing: a JSON file such as {\"hotspot\":96} whose values replace the GPU guard's readings while it exists")
 	showVersion := flag.Bool("version", false, "print the build version and exit")
 	flag.Parse()
 
@@ -130,6 +138,11 @@ func main() {
 		}
 		log.Printf("readiness check ok: %s", readinessCheckURL(listen))
 		return
+	}
+
+	gpuGuardOpts, err := parseGPUGuardOptions(*gpuGuardMode, *gpuHotspotWarn, *gpuHotspotCrit, *gpuDeltaWarn, *gpuGuardSpare, *gpuGuardTestFile)
+	if err != nil {
+		log.Fatalf("gpu guard: %v", err)
 	}
 
 	collector := NewSystemCollector()
@@ -215,6 +228,23 @@ func main() {
 
 	metricsSampler.Start()
 	defer metricsSampler.Stop()
+
+	// The GPU guard starts after the sampler, whose Start enables the LHM
+	// daemon it reads through on Windows, and stops before it (defers run in
+	// reverse), so it never reads a closed daemon. Never under -self-check.
+	if guard := startGPUGuard(gpuGuardOpts, collector, log.Printf); guard != nil {
+		metricsSampler.SetGPUGuard(guard)
+		guardCtx, stopGuard := context.WithCancel(context.Background())
+		guardDone := make(chan struct{})
+		go func() {
+			defer close(guardDone)
+			guard.Run(guardCtx)
+		}()
+		defer func() {
+			stopGuard()
+			<-guardDone
+		}()
+	}
 
 	// Start the update checker only on the serve path. It performs one outbound
 	// call at startup (after a short delay) and then once per

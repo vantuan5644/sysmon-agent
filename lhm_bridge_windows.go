@@ -364,8 +364,9 @@ func (d *lhmDaemon) handleSuccessLocked(request string) {
 	d.consecFailures = 0
 	d.coldRead = false
 	switch request {
-	case "osd":
-		// Lightweight OSD reads should not accelerate the hot-plug rescan.
+	case "osd", "gpu":
+		// Lightweight OSD and GPU-guard reads should not accelerate the
+		// hot-plug rescan.
 		return
 	case lhmDaemonRescanRequest:
 		d.reads = 0

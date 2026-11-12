@@ -5,6 +5,6 @@ import (
 	"syscall"
 )
 
-func hideCodexQuotaWindow(cmd *exec.Cmd) {
+func hideChildWindow(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 }

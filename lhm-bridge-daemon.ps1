@@ -354,12 +354,17 @@ function Read-LhmSnapshot($computer) {
 
 # OSD requests update only CPU/GPU nodes. They use the same already-open
 # Computer and skip storage, motherboard, PSU, and the full result traversal.
-function Read-LhmOsdSnapshot($computer) {
+# The GPU guard's 'gpu' request ($GpuOnly) updates only the GPU nodes. Both
+# carry the hotspot and package power, so core and hotspot come from one
+# Update() of one node and their difference is not skewed by the five seconds
+# nvidia-smi's core reading is cached for.
+function Read-LhmOsdSnapshot($computer, [bool]$GpuOnly = $false) {
     $temperatures = New-Object System.Collections.Generic.List[object]
     $devices = New-Object System.Collections.Generic.List[object]
     foreach ($hw in $computer.Hardware) {
         $cpu = Test-CpuNode $hw
         $gpu = $hw.HardwareType.ToString() -match '^Gpu(Nvidia|Amd|Intel)$'
+        if ($GpuOnly) { $cpu = $false }
         if (-not $cpu -and -not $gpu) { continue }
         $updated = $true
         try { $hw.Update() } catch { $updated = $false }
@@ -389,7 +394,16 @@ function Read-LhmOsdSnapshot($computer) {
             if ($temp -and (Test-PlausibleTemperature ([double]$temp.Value))) {
                 $temperature = @{available=$true;value=[math]::Round([double]$temp.Value,2);unit='C'}
             }
-            $devices.Add(@{name=$hw.Name;usage_percent=$usage;temperature_celsius=$temperature})
+            $hotspot = @{available=$false;value=0;unit='C';error='GPU hotspot unavailable'}
+            # Get-NvidiaHotspot reads the node's own sensors, which keep their
+            # last values when Update() failed, so ask it only after a good one.
+            $hot = $null
+            if ($updated) { $hot = Get-NvidiaHotspot $hw }
+            if ($hot) { $hotspot = @{available=$true;value=$hot.value;unit='C'} }
+            $pkg = $sensors | Where-Object { $_.SensorType -eq 'Power' -and $_.Name -eq 'GPU Package' -and $null -ne $_.Value } | Select-Object -First 1
+            $power = @{available=$false;value=0;unit='W';error='GPU package power unavailable'}
+            if ($pkg -and [double]$pkg.Value -gt 0) { $power = @{available=$true;value=[math]::Round([double]$pkg.Value,1);unit='W'} }
+            $devices.Add(@{name=$hw.Name;usage_percent=$usage;temperature_celsius=$temperature;hotspot_temperature_celsius=$hotspot;power_watts=$power})
         }
     }
     return @{available=$true;temperatures=$temperatures;gpu=$devices} | ConvertTo-Json -Compress -Depth 6
@@ -450,6 +464,8 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             $json = New-ErrorObject $startupError | ConvertTo-Json -Compress -Depth 6
         } elseif ($line -eq 'osd') {
             $json = Read-LhmOsdSnapshot $computer
+        } elseif ($line -eq 'gpu') {
+            $json = Read-LhmOsdSnapshot $computer $true
         } elseif ($line -eq 'rescan') {
             Update-HotPluggedHardware $computer
             $json = Read-LhmSnapshot $computer

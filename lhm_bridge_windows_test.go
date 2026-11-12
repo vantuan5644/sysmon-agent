@@ -55,19 +55,19 @@ func TestLhmOSDScriptUpdatesOnlyCPUAndGPU(t *testing.T) {
 $ErrorActionPreference = 'Stop'
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'lhm-bridge-daemon.ps1'),[ref]$tokens,[ref]$errors)
-foreach ($name in @('Test-CpuNode','Test-PlausibleTemperature','Test-LiveTemperature','Read-LhmOsdSnapshot')) {
+foreach ($name in @('Test-CpuNode','Test-PlausibleTemperature','Test-LiveTemperature','Get-NvidiaHotspot','Read-LhmOsdSnapshot')) {
     $function=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)
     . ([scriptblock]::Create($function.Extent.Text))
 }
 $script:updates=New-Object System.Collections.Generic.List[string]
 function New-TestHardware($name,$type,$sensors) {
-    $hardware=[pscustomobject]@{Name=$name;HardwareType=$type;Sensors=$sensors;SubHardware=@()}
+    $hardware=[pscustomobject]@{Name=$name;HardwareType=$type;Identifier="/$type/0";Sensors=$sensors;SubHardware=@()}
     $hardware | Add-Member ScriptMethod Update { $script:updates.Add($this.Name); if ($this.Name -eq 'broken GPU') { throw 'fixture update failure' } }
     return $hardware
 }
 $cpu=New-TestHardware 'CPU' 'Cpu' @([pscustomobject]@{Name='Package';SensorType='Temperature';Value=61})
-$gpu=New-TestHardware 'GPU' 'GpuNvidia' @([pscustomobject]@{Name='GPU Core';SensorType='Load';Value=79},[pscustomobject]@{Name='GPU Core';SensorType='Temperature';Value=54})
-$broken=New-TestHardware 'broken GPU' 'GpuNvidia' @([pscustomobject]@{Name='GPU Core';SensorType='Load';Value=99})
+$gpu=New-TestHardware 'GPU' 'GpuNvidia' @([pscustomobject]@{Name='GPU Core';SensorType='Load';Value=79},[pscustomobject]@{Name='GPU Core';SensorType='Temperature';Value=54},[pscustomobject]@{Name='GPU Hot Spot';SensorType='Temperature';Value=66.25},[pscustomobject]@{Name='GPU Memory Junction';SensorType='Temperature';Value=96},[pscustomobject]@{Name='GPU Package';SensorType='Power';Value=312.44})
+$broken=New-TestHardware 'broken GPU' 'GpuNvidia' @([pscustomobject]@{Name='GPU Core';SensorType='Load';Value=99},[pscustomobject]@{Name='GPU Hot Spot';SensorType='Temperature';Value=101})
 $storage=New-TestHardware 'disk' 'Storage' @()
 $board=New-TestHardware 'board' 'Motherboard' @()
 $psu=New-TestHardware 'psu' 'Psu' @()
@@ -75,6 +75,12 @@ $result=Read-LhmOsdSnapshot ([pscustomobject]@{Hardware=@($cpu,$storage,$gpu,$bo
 if (($script:updates -join ',') -ne 'CPU,GPU,broken GPU') { throw 'OSD updated unrelated hardware' }
 if ($result.temperatures[0].value -ne 61 -or $result.gpu.Count -ne 2 -or $result.gpu[0].usage_percent.value -ne 79 -or $result.gpu[0].temperature_celsius.value -ne 54) { throw 'Incorrect OSD sensor selection' }
 if ($result.gpu[1].usage_percent.available) { throw 'Failed GPU update emitted an old reading' }
+if ($result.gpu[0].hotspot_temperature_celsius.value -ne 66.25 -or $result.gpu[0].power_watts.value -ne 312.4) { throw 'OSD GPU lacks hotspot or package power' }
+if ($result.gpu[1].hotspot_temperature_celsius.available -or $result.gpu[1].power_watts.available) { throw 'Failed GPU update emitted an old hotspot or power' }
+$script:updates.Clear()
+$result=Read-LhmOsdSnapshot ([pscustomobject]@{Hardware=@($cpu,$storage,$gpu,$board,$broken,$psu)}) $true | ConvertFrom-Json
+if (($script:updates -join ',') -ne 'GPU,broken GPU') { throw "GPU-only request updated $($script:updates -join ',')" }
+if ($result.temperatures.Count -ne 0 -or $result.gpu[0].hotspot_temperature_celsius.value -ne 66.25 -or $result.gpu[0].temperature_celsius.value -ne 54) { throw 'Incorrect GPU-only sensor selection' }
 Write-Output 'PASS: CPU/GPU-only sensor updates and partial failure'
 `
 	output, err := exec.Command(shell, "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()

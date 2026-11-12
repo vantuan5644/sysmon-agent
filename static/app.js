@@ -110,6 +110,9 @@ const state = {
   // while viewing it. Dim/shift stay with the serving agent: they describe
   // this display, whichever host is on it.
   hostThresholds: null,
+  // The GPU guard alarm hidden by a tap: until when, and for which host id.
+  gpuAlarmSnoozedUntilMS: 0,
+  gpuAlarmSnoozedHost: null,
   settings: {
     dim: false,
     shift: true,
@@ -126,7 +129,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v166";
+const dashboardBuild = "sysmon-static-v167";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -306,6 +309,10 @@ document.addEventListener("DOMContentLoaded", () => {
   $("hostSheetScrim").addEventListener("click", closeHostSheet);
   $("hostRescan").addEventListener("click", () => fetchHosts({ refresh: true }));
   document.addEventListener("keydown", handleHostSheetKeydown);
+  // A tap anywhere on the alarm hides it, the button included (its click
+  // bubbles here); the button is what keyboard and VoiceOver users reach.
+  $("gpuAlarm").addEventListener("click", snoozeGPUAlarm);
+  document.addEventListener("keydown", handleGPUAlarmKeydown);
   setupPager();
   reflectProcSort();
 
@@ -1472,6 +1479,9 @@ function resetHostView() {
   state.metricsInFlight = false;
   state.lastProcesses = null;
   state.hostThresholds = null;
+  // The previous host's alarm leaves with it; the next host's first frame
+  // shows its own (renderGPUAlarm).
+  $("gpuAlarm").hidden = true;
   state.staleDashboardBuild = "";
   state.statusIssueMessages = [];
   state.quotaSupported = true;
@@ -2176,6 +2186,7 @@ function render(metrics) {
   renderMetricTimestamp(metrics.timestamp, metrics.collection_duration_ms);
   renderMetricAlerts(metrics);
   renderCollectionErrors(metrics.collection_errors);
+  renderGPUAlarm(metrics);
 
   const cpuMetric = metricPercent(metrics.cpu_percent);
   const memoryMetric = capacityPercent(metrics.memory);
@@ -2613,9 +2624,10 @@ function renderMetricAlerts(metrics) {
 // repeated here: CPU/GPU/RAM usage lives on the outer rings, CPU die temp on
 // the CPU inner ring + detail line, GPU die temp on the GPU detail line, and GPU
 // VRAM on the GPU inner ring -- all of them turn red at their threshold, so
-// listing them again would just be noise. Only disks (no card) and auxiliary
-// temperature sensors (board, water, PSU, ...) that are not shown elsewhere
-// surface as alerts.
+// listing them again would just be noise. Only disks (no card), auxiliary
+// temperature sensors (board, water, PSU, ...) that are not shown elsewhere,
+// and the GPU guard's warn/critical verdict (addGPUGuardAlerts) surface as
+// alerts.
 function metricAlertMessages(metrics) {
   const messages = [];
   for (const disk of metrics?.disks || []) {
@@ -2641,7 +2653,142 @@ function metricAlertMessages(metrics) {
   }
   addPercentAlert(messages, "RAM commit", capacityPercent(metrics?.memory_commit), commitAlertPercent);
   addPercentAlert(messages, "Memory stall", numberMetric(metrics?.pressure?.memory_full), memoryStallAlertPercent);
+  addGPUGuardAlerts(messages, gpuGuardState(metrics));
   return messages;
+}
+
+// GPU guard (gpu_guard.go, internal/gpuguard). The agent judges its NVIDIA
+// GPU every two seconds, dashboard or not, with hold counts and hysteresis.
+// The page shows that verdict and never re-derives it from the raw hotspot,
+// so the phone and the host always agree on whether the card is critical.
+// The hotspot is not on any card's warn colour, so the warning is listed
+// here, which also puts the count on the alerts chip on every page; critical
+// adds the full-screen alarm (renderGPUAlarm).
+const gpuAlarmSnoozeMS = 60000;
+// The guard's defaults (gpuguard.DefaultConfig), used to colour the hotspot
+// on a host whose agent publishes no gpu_guard.
+const gpuGuardDefaultLines = { warn_c: 90, critical_c: 95 };
+
+function gpuGuardState(metrics) {
+  const guard = metrics?.gpu_guard;
+  return guard && typeof guard === "object" ? guard : null;
+}
+
+function gpuGuardAlarming(guard) {
+  return guard?.level === "warn" || guard?.level === "critical";
+}
+
+function addGPUGuardAlerts(messages, guard) {
+  if (!gpuGuardAlarming(guard)) {
+    return;
+  }
+  const reasons = Array.isArray(guard.reasons) ? guard.reasons : [];
+  const deltaWarn = reasons.includes("delta_warn");
+  const message = nonEmptyText(guard.message);
+  if (message) {
+    messages.push(message);
+  } else if (!deltaWarn || reasons.length > 1) {
+    messages.push(guard.level === "critical" ? "GPU critical temperature" : "GPU temperature warning");
+  }
+  // The guard's message names the temperature when both are on, so the
+  // contact warning needs its own line.
+  // Same wording as the guard's own (gpuguard deltaMessage).
+  if (deltaWarn && reasons.length > 1) {
+    const delta = numberMetric(guard.delta_celsius);
+    const line = finiteNumber(guard.thresholds?.delta_warn_c);
+    const amount = delta.available ? `${formatTemp(delta.value)} ` : "far ";
+    const limit = line !== null ? ` (warning at ${formatTemp(line)})` : "";
+    messages.push(`GPU hotspot is ${amount}above the core under load${limit}: poor thermal contact?`);
+  }
+}
+
+// gpuGuardLines are the hotspot's warn and critical lines for colouring.
+function gpuGuardLines(guard) {
+  const warn = finiteNumber(guard?.thresholds?.warn_c);
+  const crit = finiteNumber(guard?.thresholds?.critical_c);
+  return {
+    warn_c: warn ?? gpuGuardDefaultLines.warn_c,
+    critical_c: crit ?? gpuGuardDefaultLines.critical_c,
+  };
+}
+
+function renderGPUAlarm(metrics) {
+  const overlay = $("gpuAlarm");
+  if (!overlay) {
+    return;
+  }
+  const guard = gpuGuardState(metrics);
+  if (guard?.level !== "critical") {
+    // The episode is over: the next one must show at once.
+    state.gpuAlarmSnoozedUntilMS = 0;
+    overlay.hidden = true;
+    return;
+  }
+  const core = guard.source === "core";
+  const lead = numberMetric(core ? guard.core_celsius : guard.hotspot_celsius);
+  $("gpuAlarmHost").textContent = nonEmptyText(metrics.hostname) || "This host";
+  $("gpuAlarmTitle").textContent = lead.available
+    ? `GPU ${core ? "core" : "hotspot"} ${formatTemp(lead.value)}`
+    : "GPU overheating";
+  const coreTemp = numberMetric(guard.core_celsius);
+  const delta = numberMetric(guard.delta_celsius);
+  const power = numberMetric(guard.power_watts);
+  $("gpuAlarmReadings").textContent = joinDetail([
+    !core && coreTemp.available ? `core ${formatTemp(coreTemp.value)}` : "",
+    !core && delta.available ? `delta ${formatTemp(delta.value)}` : "",
+    power.available ? formatPower(power.value) : "",
+  ]) || "--";
+  $("gpuAlarmMessage").textContent = nonEmptyText(guard.message) || "GPU critical temperature";
+  $("gpuAlarmAction").textContent = gpuAlarmActionText(guard);
+  const snoozed = state.gpuAlarmSnoozedHost === state.hostID && nowMS() < state.gpuAlarmSnoozedUntilMS;
+  const wasHidden = overlay.hidden;
+  overlay.hidden = snoozed;
+  if (wasHidden && !snoozed) {
+    focusElement($("gpuAlarmDismiss"));
+  }
+}
+
+// gpuAlarmActionText says what the host did about it, in the guard's words:
+// warn mode only logs what act mode would do (last_action "would_...").
+function gpuAlarmActionText(guard) {
+  const failed = nonEmptyText(guard.action_error);
+  if (failed) {
+    return `The guard's action failed: ${failed}`;
+  }
+  if (guard.mode !== "act") {
+    switch (guard.last_action) {
+      case "would_stop_apps":
+        return "Warn mode: nothing changed. Act mode would end GPU apps now.";
+      case "would_limit_power":
+        return "Warn mode: nothing changed. Act mode would lower the power limit.";
+      default:
+        return "Warn mode: nothing changed on the host. Stop the GPU load.";
+    }
+  }
+  switch (guard.action) {
+    case "apps_stopped":
+      return "Power limit at minimum and GPU apps ended.";
+    case "power_limited":
+      return "Power limit at minimum. GPU apps end if it stays critical.";
+    default:
+      return "Stop the GPU load.";
+  }
+}
+
+function snoozeGPUAlarm() {
+  const overlay = $("gpuAlarm");
+  if (!overlay || overlay.hidden) {
+    return;
+  }
+  state.gpuAlarmSnoozedUntilMS = nowMS() + gpuAlarmSnoozeMS;
+  state.gpuAlarmSnoozedHost = state.hostID;
+  overlay.hidden = true;
+}
+
+function handleGPUAlarmKeydown(event) {
+  if (event?.key === "Escape" && !$("gpuAlarm").hidden) {
+    snoozeGPUAlarm();
+  }
 }
 
 // isPrimaryCardTemperatureSensor reports whether a temperature-sensor name is
@@ -3174,6 +3321,14 @@ function renderPrimaryCardDetails(metrics, primaryGPU) {
   if (gpuHotspot.available) {
     const hotspot = document.createElement("span");
     hotspot.className = "gpu-hotspot-detail";
+    // Coloured by the GPU guard's lines, apart from the core's warn colour on
+    // the rest of the line: the two are different sensors with different limits.
+    const lines = gpuGuardLines(gpuGuardState(metrics));
+    if (gpuHotspot.value >= lines.critical_c) {
+      hotspot.classList.add("crit");
+    } else if (gpuHotspot.value >= lines.warn_c) {
+      hotspot.classList.add("warn");
+    }
     hotspot.textContent = `${gpuTemp.available || gpuPower.available ? " · " : ""}Hotspot ${formatTemp(gpuHotspot.value)}`;
     if (!gpuTemp.available && !gpuPower.available) $("gpuDetail").textContent = "";
     $("gpuDetail").append(hotspot);

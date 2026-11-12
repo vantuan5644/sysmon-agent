@@ -543,7 +543,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v166",
+    dashboard_build: "sysmon-static-v167",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -561,7 +561,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v166",
+    dashboard_build: "sysmon-static-v167",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -994,12 +994,109 @@ const hotspotMetrics = sampleMetrics();
 hotspotMetrics.gpu.devices[0].hotspot_temperature_celsius = { available: true, value: 82, unit: "C" };
 context.render(hotspotMetrics);
 assert(document.getElementById("gpuDetail").textContent === "49\u00b0C \u00b7 112 W \u00b7 Hotspot 82\u00b0C", "GPU hotspot was not labeled");
-assert(document.getElementById("gpuDetail").children[0].className === "gpu-hotspot-detail", "hotspot did not use neutral styling");
+assert(document.getElementById("gpuDetail").children[0].className === "gpu-hotspot-detail", "hotspot below the guard's warn line did not use neutral styling");
 assert(!document.getElementById("gpuDetail").classList.contains("warn"), "hotspot added a core temperature warning");
+// The hotspot colours by the guard's lines (defaults 90/95 without gpu_guard),
+// and only its own span: the core reading beside it is a different sensor.
+hotspotMetrics.gpu.devices[0].hotspot_temperature_celsius = { available: true, value: 91, unit: "C" };
+context.render(hotspotMetrics);
+assert(document.getElementById("gpuDetail").children[0].className === "gpu-hotspot-detail warn", "hotspot over the default warn line was not coloured warn");
+assert(!document.getElementById("gpuDetail").classList.contains("warn"), "a hot hotspot coloured the core reading");
+hotspotMetrics.gpu.devices[0].hotspot_temperature_celsius = { available: true, value: 96, unit: "C" };
+context.render(hotspotMetrics);
+assert(document.getElementById("gpuDetail").children[0].className === "gpu-hotspot-detail crit", "hotspot over the default critical line was not coloured critical");
+hotspotMetrics.gpu_guard = { mode: "warn", level: "ok", source: "hotspot", thresholds: { warn_c: 85, critical_c: 97, delta_warn_c: 25 } };
+context.render(hotspotMetrics);
+assert(document.getElementById("gpuDetail").children[0].className === "gpu-hotspot-detail warn", "hotspot colour did not follow the guard's own lines");
+delete hotspotMetrics.gpu_guard;
 hotspotMetrics.gpu.devices[0].hotspot_temperature_celsius = { available: false, unit: "C" };
 context.render(hotspotMetrics);
 assert(document.getElementById("gpuDetail").textContent === "49\u00b0C \u00b7 112 W", "missing hotspot stayed visible");
 context.render(sampleMetrics());
+
+{
+  // GPU guard: warn lists the guard's message (so the chip shows on every
+  // page); critical also raises the full-screen alarm, which a tap hides for
+  // a minute while the host stays critical.
+  const guardFrame = (guard) => {
+    const metrics = sampleMetrics();
+    metrics.gpu_guard = {
+      mode: "warn",
+      source: "hotspot",
+      gpu: "NVIDIA GeForce RTX 4090",
+      hotspot_celsius: { available: true, value: 96.4, unit: "C" },
+      core_celsius: { available: true, value: 70, unit: "C" },
+      delta_celsius: { available: true, value: 26.4, unit: "C" },
+      power_watts: { available: true, value: 431.2, unit: "W" },
+      thresholds: { warn_c: 90, critical_c: 95, delta_warn_c: 25 },
+      action: "none",
+      updated_at: new Date(fakeNow).toISOString(),
+      ...guard,
+    };
+    return metrics;
+  };
+  const alarm = document.getElementById("gpuAlarm");
+  const alertTexts = () => Array.from(document.getElementById("alertsList").children).map((row) => row.textContent);
+
+  context.render(guardFrame({ level: "ok" }));
+  assert(alarm.hidden === true, "an ok guard showed the alarm");
+  assert(document.getElementById("alertsChip").hidden === true, "an ok guard raised an alert");
+
+  context.render(guardFrame({ level: "warn", reasons: ["hotspot_warn"], message: "GPU hotspot 91\u00b0C, warning at 90\u00b0C", hotspot_celsius: { available: true, value: 91, unit: "C" } }));
+  assert(alarm.hidden === true, "a guard warning showed the full-screen alarm");
+  assert(document.getElementById("alertsChip").hidden === false, "a guard warning did not raise the alerts chip");
+  assert(alertTexts()[0] === "GPU hotspot 91\u00b0C, warning at 90\u00b0C", `guard warning alert = ${alertTexts()[0]}`);
+
+  context.render(guardFrame({ level: "warn", reasons: ["delta_warn"], message: "GPU hotspot is 26\u00b0C above the core under load (warning at 25\u00b0C): poor thermal contact?" }));
+  assert(alertTexts().length === 1 && alertTexts()[0].endsWith("poor thermal contact?"), `contact-only warning = ${alertTexts()}`);
+
+  context.render(guardFrame({ level: "warn", reasons: ["hotspot_warn", "delta_warn"], message: "GPU hotspot 92\u00b0C, warning at 90\u00b0C" }));
+  assert(alertTexts().length === 2, `hotspot + contact warning listed ${alertTexts().length} rows`);
+  assert(alertTexts()[1] === "GPU hotspot is 26\u00b0C above the core under load (warning at 25\u00b0C): poor thermal contact?", `contact warning beside a hot hotspot = ${alertTexts()[1]}`);
+
+  const critical = { level: "critical", reasons: ["hotspot_critical"], message: "GPU hotspot 96\u00b0C, critical at 95\u00b0C", last_action: "would_limit_power" };
+  context.render(guardFrame(critical));
+  assert(alarm.hidden === false, "a critical guard did not show the alarm");
+  assert(document.getElementById("gpuAlarmHost").textContent === sampleMetrics().hostname, "the alarm did not name the host");
+  assert(document.getElementById("gpuAlarmTitle").textContent === "GPU hotspot 96\u00b0C", `alarm title = ${document.getElementById("gpuAlarmTitle").textContent}`);
+  assert(document.getElementById("gpuAlarmReadings").textContent === "core 70\u00b0C \u00b7 delta 26\u00b0C \u00b7 431 W", `alarm readings = ${document.getElementById("gpuAlarmReadings").textContent}`);
+  assert(document.getElementById("gpuAlarmMessage").textContent === "GPU hotspot 96\u00b0C, critical at 95\u00b0C", "the alarm lost the guard's message");
+  assert(document.getElementById("gpuAlarmAction").textContent === "Warn mode: nothing changed. Act mode would lower the power limit.", `warn-mode action = ${document.getElementById("gpuAlarmAction").textContent}`);
+  assert(alertTexts()[0] === "GPU hotspot 96\u00b0C, critical at 95\u00b0C", "a critical guard was not also listed as an alert");
+
+  context.render(guardFrame({ ...critical, mode: "act", action: "power_limited", last_action: "limit_power" }));
+  assert(document.getElementById("gpuAlarmAction").textContent === "Power limit at minimum. GPU apps end if it stays critical.", "act mode did not report the lowered limit");
+  context.render(guardFrame({ ...critical, mode: "act", action: "apps_stopped", last_action: "stop_apps" }));
+  assert(document.getElementById("gpuAlarmAction").textContent === "Power limit at minimum and GPU apps ended.", "act mode did not report the ended apps");
+  context.render(guardFrame({ ...critical, mode: "act", action: "power_limited", action_error: "nvidia-smi: Insufficient Permissions" }));
+  assert(document.getElementById("gpuAlarmAction").textContent === "The guard's action failed: nvidia-smi: Insufficient Permissions", "a failed action was not shown");
+  context.render(guardFrame({ ...critical, source: "core", core_celsius: { available: true, value: 89, unit: "C" }, hotspot_celsius: { available: false, unit: "C" }, delta_celsius: { available: false, unit: "C" } }));
+  assert(document.getElementById("gpuAlarmTitle").textContent === "GPU core 89\u00b0C", "a core-only alarm named the hotspot");
+  assert(document.getElementById("gpuAlarmReadings").textContent === "431 W", "a core-only alarm repeated the core as a reading");
+
+  // The button's click bubbles to the overlay in a browser; the fixture has no
+  // bubbling, so the tap lands on the overlay itself.
+  await alarm.click();
+  assert(alarm.hidden === true, "a tap did not hide the alarm");
+  context.render(guardFrame(critical));
+  assert(alarm.hidden === true, "the alarm came back inside its snooze minute");
+  assert(document.getElementById("alertsChip").hidden === false, "a snoozed alarm cleared the alert");
+  fakeNow += 61_000;
+  context.render(guardFrame(critical));
+  assert(alarm.hidden === false, "the alarm did not return after a minute while still critical");
+  await alarm.click();
+  context.render(guardFrame({ level: "warn", reasons: ["hotspot_warn"], message: "GPU hotspot 88\u00b0C, cooling after reaching the critical 95\u00b0C" }));
+  assert(alarm.hidden === true, "the alarm stayed after the guard left critical");
+  context.render(guardFrame(critical));
+  assert(alarm.hidden === false, "a snooze from the last episode hid the next one");
+  for (const callback of document.listeners.keydown || []) {
+    callback({ key: "Escape", preventDefault() {} });
+  }
+  assert(alarm.hidden === true, "Escape did not hide the alarm");
+  context.render(sampleMetrics());
+  assert(alarm.hidden === true && document.getElementById("alertsChip").hidden === true, "a host without a guard kept the alarm or its alert");
+  fakeNow -= 61_000;
+}
 
 assert(document.getElementById("netValue").textContent === "↓2.0KB/s", `NET gauge download = ${document.getElementById("netValue").textContent}`);
 assert(document.getElementById("netSub").textContent === "↑1.0KB/s", `NET gauge upload = ${document.getElementById("netSub").textContent}`);
@@ -1151,7 +1248,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v166, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v167, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1199,7 +1296,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v166; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v167; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1209,7 +1306,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v166",
+    dashboard_build: "sysmon-static-v167",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1219,7 +1316,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v166",
+    dashboard_build: "sysmon-static-v167",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1354,7 +1451,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v166", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v167", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -2944,7 +3041,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v166" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v167" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],

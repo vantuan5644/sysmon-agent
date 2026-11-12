@@ -3,10 +3,6 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"io"
-	"os"
 	"time"
 
 	"sysmon-agent/internal/gpuhotspot"
@@ -49,28 +45,5 @@ func mergeLinuxGPUHotspots(gpu GPUSet, path string, now time.Time) GPUSet {
 }
 
 func readLinuxGPUHotspots(path string, now time.Time) (gpuhotspot.Snapshot, error) {
-	var snapshot gpuhotspot.Snapshot
-	file, err := os.Open(path)
-	if err != nil {
-		return snapshot, fmt.Errorf("GPU hotspot helper unavailable: %w", err)
-	}
-	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, gpuhotspot.MaxBytes+1))
-	if err != nil || len(data) > gpuhotspot.MaxBytes {
-		return snapshot, fmt.Errorf("GPU hotspot helper file unreadable or oversized")
-	}
-	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return snapshot, fmt.Errorf("invalid GPU hotspot helper JSON: %w", err)
-	}
-	if len(snapshot.Devices) > gpuhotspot.MaxDevices {
-		return snapshot, fmt.Errorf("too many GPU hotspot devices")
-	}
-	age := now.Sub(snapshot.Timestamp)
-	if snapshot.Timestamp.IsZero() || age < -time.Second || age > gpuhotspot.FreshFor {
-		return snapshot, fmt.Errorf("GPU hotspot helper sample unavailable or stale")
-	}
-	if snapshot.Error != "" {
-		return snapshot, fmt.Errorf("GPU hotspot helper: %s", snapshot.Error)
-	}
-	return snapshot, nil
+	return gpuhotspot.ReadFile(path, now)
 }
