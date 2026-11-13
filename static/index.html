@@ -227,6 +227,7 @@
             <span id="pairingWindowNote" class="pairing-window-note">--</span>
           </div>
           <p id="pairingPanelError" class="pairing-panel-error" role="alert" hidden></p>
+          <p id="pairingAppHint" class="pairing-app-hint" hidden>--</p>
           <button id="pairAnotherBtn" class="pair-another" type="button">Pair another device</button>
         </section>
       </section>
@@ -334,6 +335,19 @@
   </div>
 
   <div id="pairScreen" class="pair-screen" role="dialog" aria-modal="true" aria-labelledby="pairTitle" aria-describedby="pairIntro" hidden>
+    <div id="pairInstall" class="pair-panel" hidden>
+      <svg class="icon pair-icon" aria-hidden="true"><use href="#icon-lock"></use></svg>
+      <h2 id="pairInstallTitle" class="pair-title">Add Sysmon to the Home Screen first</h2>
+      <p id="pairInstallIntro" class="pair-intro">On iPhone and iPad, an app on the Home Screen keeps its own pairing, apart from the browser's. Pair inside the app, and this device pairs once.</p>
+      <ol class="pair-steps">
+        <li>Open the Share menu and choose Add to Home Screen.</li>
+        <li>Open Sysmon from the Home Screen.</li>
+        <li id="pairInstallPinStep">Pair there with the PIN from the host.</li>
+      </ol>
+      <span id="pairInstallPin" class="pair-install-pin" hidden>--</span>
+      <p id="pairInstallNote" class="pair-help" aria-live="polite">--</p>
+      <button id="pairInstallBrowser" class="pair-cancel" type="button">Pair this browser instead</button>
+    </div>
     <form id="pairForm" class="pair-panel" novalidate>
       <svg class="icon pair-icon" aria-hidden="true"><use href="#icon-lock"></use></svg>
       <h2 id="pairTitle" class="pair-title">Pair this device</h2>

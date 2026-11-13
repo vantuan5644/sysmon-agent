@@ -45,6 +45,50 @@ func TestPreferredPairingBase(t *testing.T) {
 	}
 }
 
+// A Home Screen app keeps the address its QR code opened, so -pair says to
+// reserve a LAN address in the router; a Tailscale address or a name does not
+// move with DHCP, so it gets no such note.
+func TestPairCommandAdvisesReservingALocalAddress(t *testing.T) {
+	for link, want := range map[string]string{
+		"https://10.0.0.4:9199/":            "10.0.0.4",
+		"https://192.168.1.20:9199/#pair=1": "192.168.1.20",
+		"https://[fd7a:1:2::5]:9199/":       "fd7a:1:2::5",
+		"https://100.110.71.14:9199/":       "",
+		"https://host.example.ts.net:9443/": "",
+		"https://bblwin.local:9199/":        "",
+		"http://[::ffff:172.16.0.9]:9099/":  "172.16.0.9",
+		"https://8.8.8.8:9199/":             "",
+		"not a link at all\x7f":             "",
+	} {
+		got, ok := pairingLinkLocalAddress(link)
+		if got != want || ok != (want != "") {
+			t.Errorf("pairingLinkLocalAddress(%q) = %q, %v; want %q", link, got, ok, want)
+		}
+	}
+
+	settings := filepath.Join(t.TempDir(), "settings.json")
+	listen := listenConfig{bind: "127.0.0.1", port: 9099}
+	var out bytes.Buffer
+	if err := runPairingCommand(pairingCommand{open: true, link: "https://10.0.0.4:9199", qr: true}, settings, listen, &out); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "reserve 10.0.0.4 for it in the router's DHCP settings") {
+		t.Fatalf("a LAN link gave no DHCP note:\n%s", text)
+	}
+	if strings.Index(text, "DHCP") > strings.Index(text, "█") {
+		t.Fatalf("the DHCP note came after the code, which must stay last")
+	}
+
+	out.Reset()
+	if err := runPairingCommand(pairingCommand{open: true, link: "https://host.example.ts.net:9443", qr: true}, settings, listen, &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "DHCP") {
+		t.Fatalf("a Tailscale name got a DHCP note:\n%s", out.String())
+	}
+}
+
 func TestPairCommandDrawsTheLinkAsAQRCode(t *testing.T) {
 	settings := filepath.Join(t.TempDir(), "settings.json")
 	listen := listenConfig{bind: "127.0.0.1", port: 9099}
@@ -134,7 +178,7 @@ func TestPairingWindowCarriesALinkAndQRCode(t *testing.T) {
 	if window := open(loopback()); window.Link != "" || window.QR != nil || len(window.PIN) != 6 {
 		t.Fatalf("a loopback dashboard with no fallback got link %q and %d rows", window.Link, len(window.QR))
 	}
-	state.SetPairingLinkFallback(func() string { return "https://10.0.0.4:9099/" })
+	state.SetPairingLinkFallback(func() (string, string) { return "https://10.0.0.4:9099/", "" })
 	if window := open(loopback()); window.Link != "https://10.0.0.4:9099/#pair="+window.PIN || len(window.QR) == 0 {
 		t.Fatalf("a loopback dashboard got link %q, want the fallback", window.Link)
 	}

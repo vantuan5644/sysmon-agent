@@ -616,11 +616,18 @@ body.host-remote .host-controls {
   outline-offset: 2px;
 }
 
+/* The strip is one wrapping row: state, the build badges and the sample time,
+   then the host metadata on a line of its own. It used to be a grid with the
+   badges and the time in fixed columns of one row, so once they outgrew the
+   strip (a version longer than "0.2.0", or any phone) the badges ran off its
+   edge or the time was drawn over them. Now whatever does not fit starts the
+   next line. Nothing here may be clipped as the fix: the refresh button covers
+   the whole header, so a title on a strip item never shows on hover. */
 .status-strip {
-  display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr);
-  grid-template-areas: "state ver updated" "meta meta meta";
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  align-content: center;
   column-gap: 6px;
   row-gap: 3px;
   margin: 0;
@@ -640,15 +647,22 @@ body.host-remote .host-controls {
 /* Build-channel badge: tells you at a glance whether this host is running a
    shipped release or a hand-built binary. A dev build deliberately never
    self-updates, so the badge is also the explanation for why no update banner
-   ever appears there. */
+   ever appears there.
+
+   The version is whatever the build stamped (`git describe` gives
+   "v0.2.0-14-g52a0645-dirty"), so a badge too long for a line of its own
+   wraps inside itself rather than overflow. A 10px radius draws the same pill
+   as 999px on one line and keeps the corners clear of the text on two. */
 .agent-version {
-  flex: 0 0 auto;
-  white-space: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
   font-size: 0.72rem;
   font-weight: 600;
   letter-spacing: 0.02em;
   padding: 1px 6px;
-  border-radius: 999px;
+  border-radius: 10px;
   border: 1px solid transparent;
   color: var(--muted);
 }
@@ -667,40 +681,51 @@ body.host-remote .host-controls {
 
 /* The host's dashboard build ("v155") beside the channel badge. Every
    hand-built binary reads "dev", so this is what tells two of them apart.
-   Neutral styling, since it only identifies the build. */
+   Neutral styling, since it only identifies the build. Its auto margin pushes
+   the sample time to the end of the line when the two share one; a time that
+   wraps starts its own line at the left. */
 .agent-version.build-token {
+  margin-right: auto;
   color: var(--muted);
   border-color: var(--line);
   font-variant-numeric: tabular-nums;
 }
 
-/* Both badges share the strip's "ver" grid area at every breakpoint. */
+/* The two badges are a group in the markup only. As flex items of the strip
+   they wrap one at a time, so a long version can take a line while the build
+   token shares the next one with the time. */
 .build-badges {
-  grid-area: ver;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  min-width: 0;
+  display: contents;
 }
 
 #statusText {
-  grid-area: state;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
+/* Host metadata always takes the last line, full width. It stays one line
+   with an ellipsis: its "seen 9s" grows every second, and a line that wrapped
+   with it would make the header jump. */
 #agentMeta {
-  grid-area: meta;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-#updatedAt {
-  grid-area: updated;
-  justify-self: end;
+  order: 1;
+  flex: 1 1 100%;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* The sample time ("04:59:43 PM / 12s / 350ms") changes length with its age
+   and collection time, and a whole-loop collector (macOS) reports a new
+   duration on every pass. It reserves the longest of those, 25 characters of
+   the monospace face (formatTime, formatSampleAge, formatDurationMS), so
+   whether it fits beside the badges depends on the strip's width and not on
+   the frame; otherwise the header could change height every 1.5 s. On a strip
+   narrower than that it wraps at its separators instead of overflowing. */
+#updatedAt {
+  flex: 0 1 auto;
+  min-width: min(100%, 25ch);
+  overflow-wrap: anywhere;
 }
 
 .status-dot {
@@ -2037,14 +2062,6 @@ body.host-remote .host-controls {
   .top-actions {
     grid-column: 1 / -1;
   }
-
-  .status-strip {
-    grid-template-areas: "state ver ver" "meta meta meta" "updated updated updated";
-  }
-
-  #updatedAt {
-    justify-self: start;
-  }
 }
 
 @media (max-width: 360px) {
@@ -2451,6 +2468,13 @@ body.host-remote .host-controls {
   background: var(--panel);
 }
 
+/* The pairing screen holds two panels, the PIN form and, in a browser tab on
+   iPhone or iPad, the Home Screen card shown first; display: flex would
+   otherwise beat the hidden attribute. */
+.pair-panel[hidden] {
+  display: none;
+}
+
 .pair-icon {
   align-self: center;
   width: 40px;
@@ -2559,6 +2583,31 @@ body.host-remote .host-controls {
 
 .pair-how li + li {
   margin-top: 2px;
+}
+
+.pair-steps {
+  margin: 0;
+  padding-left: 1.3em;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.pair-steps li + li {
+  margin-top: 4px;
+}
+
+/* The PIN the Home Screen app is paired with, read off this screen. */
+.pair-install-pin {
+  align-self: center;
+  margin: 4px 0;
+  font-size: 2rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  font-variant-numeric: tabular-nums;
+}
+
+.pair-install-pin[hidden] {
+  display: none;
 }
 
 /* <code> would fall back to the browser's own monospace face. */
@@ -2746,6 +2795,17 @@ body.host-remote .host-controls {
   display: block;
   width: 100%;
   height: auto;
+}
+
+.pairing-app-hint {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.pairing-app-hint[hidden] {
+  display: none;
 }
 
 .pairing-panel-error {

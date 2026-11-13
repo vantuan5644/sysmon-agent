@@ -245,7 +245,6 @@ function verifyStaticLayout(fixturePath) {
     `grid-template-columns: repeat(24, minmax(0, 1fr));`,
     `.sparkline-bar.unavailable`,
     `@media (max-width: 480px)`,
-    `grid-template-areas:`,
     `@media (max-width: 360px)`,
     `min-width: 0;`,
     `@media (pointer: coarse)`,
@@ -275,17 +274,31 @@ function verifyStaticLayout(fixturePath) {
   ]) {
     assertIncludes(css, needle, "dashboard CSS");
   }
-  // The desktop status strip keeps state and timestamp together, with metadata
-  // on its own row. Narrow screens give the timestamp an additional row.
-  // Matched loosely so adding a strip column (the build badge added one) does
-  // not fail a layout that still satisfies the requirement.
-  if (!/"state( \w+)* updated"/.test(css)) {
-    throw new Error(`dashboard CSS missing a "state ... updated" status-strip grid row`);
+  // The status strip keeps state, build badges and timestamp in one row that
+  // wraps when they do not fit, with metadata on its own last line. Fixed grid
+  // columns there let a long version ("release 0.2.1-qr") and the timestamp
+  // overlap. static_test.go TestStatusStripWrapsInsteadOfOverlapping holds the
+  // details; this checks the shape the fixture renders with.
+  const stripRules = topLevelRules(css, ".status-strip");
+  if (!stripRules.includes("display: flex;") || !stripRules.includes("flex-wrap: wrap;")) {
+    throw new Error(`dashboard CSS status strip is not a wrapping row: ${JSON.stringify(stripRules)}`);
+  }
+  const metaRules = topLevelRules(css, "#agentMeta");
+  if (!metaRules.includes("flex: 1 1 100%;") || !metaRules.includes("order: 1;")) {
+    throw new Error(`dashboard CSS does not give the status metadata its own last line: ${JSON.stringify(metaRules)}`);
   }
   assertCount(html, `class="metric-card"`, 4, "primary metric cards");
   assertMinimumCount(html, `class="panel`, 6, "dashboard panels");
   assertNoViewportFontScaling(css);
   assertNarrowPhoneLayoutFits();
+}
+
+// The declarations of every unindented rule for selector (not those inside a
+// media query), joined.
+function topLevelRules(css, selector) {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`^${escaped} \\{\\n([^}]*)\\n\\}`, "gm");
+  return [...css.matchAll(pattern)].map((match) => match[1]).join("\n");
 }
 
 function assertIncludes(haystack, needle, label) {

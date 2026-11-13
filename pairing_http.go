@@ -261,6 +261,9 @@ type pairingWindowResponse struct {
 	// Both are left out when no address another device can reach is known.
 	Link string   `json:"link,omitempty"`
 	QR   []string `json:"qr,omitempty"`
+	// Address is set when Link opens the host's .local name: the LAN address
+	// that name answered with, for a device that cannot look the name up.
+	Address string `json:"address,omitempty"`
 }
 
 func writePairingOff(w http.ResponseWriter) {
@@ -428,10 +431,10 @@ func registerPairingRoutes(mux *http.ServeMux, state *RuntimeState) {
 			return
 		}
 		response := pairingWindowResponse{PIN: pin, PINDisplay: formatPIN(pin), ExpiresAt: expires}
-		if base := pairingLinkBaseForRequest(r, state.PairingLinkFallback()); base != "" {
+		if base, address := pairingLinkBaseForRequest(r, state.PairingLinkFallback()); base != "" {
 			if link, err := pairingLink(base, pin); err == nil {
 				if code, err := encodeQR(link); err == nil {
-					response.Link, response.QR = link, code.rows()
+					response.Link, response.QR, response.Address = link, code.rows(), address
 				}
 			}
 		}

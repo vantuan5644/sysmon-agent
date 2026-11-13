@@ -204,7 +204,7 @@ func main() {
 			log.Fatalf("pairing: %v", err)
 		}
 		state.SetPairing(store)
-		state.SetPairingLinkFallback(func() string { return preferredPairingBase(listen) })
+		state.SetPairingLinkFallback(func() (string, string) { return pairingBases(listen, dir) })
 	}
 	hostUpdate := hostSettingsUpdate(*refreshMS, *cpuWarn, *memWarn, *diskWarn, *gpuWarn, *tempWarn)
 	if !hostSettingsUpdateEmpty(hostUpdate) {

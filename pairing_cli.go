@@ -95,16 +95,17 @@ func runPairingCommand(cmd pairingCommand, settingsPath string, listen listenCon
 		fmt.Fprintf(out, "\nThe browser will warn about the agent's own certificate. Its SHA-256 is\n  %s\n", fingerprint)
 	}
 	if cmd.qr {
-		printPairingQR(out, cmd.link, listen, pin, until)
+		printPairingQR(out, cmd.link, dir, listen, pin, until)
 	}
 	return nil
 }
 
 // printPairingQR draws the pairing link last, so the code and the PIN under
 // it stay on screen in a console too short for the whole output.
-func printPairingQR(out io.Writer, base string, listen listenConfig, pin, until string) {
+func printPairingQR(out io.Writer, base, dir string, listen listenConfig, pin, until string) {
+	fallback := ""
 	if base == "" {
-		base = preferredPairingBase(listen)
+		base, fallback = pairingBases(listen, dir)
 	}
 	if base == "" {
 		return
@@ -116,6 +117,16 @@ func printPairingQR(out io.Writer, base string, listen listenConfig, pin, until 
 	code, err := encodeQR(link)
 	if err != nil {
 		return
+	}
+	if fallback != "" {
+		fmt.Fprintf(out, "\nThe code below opens %s, this host's name on the local network, which\n", mdnsLinkHost(link))
+		fmt.Fprintln(out, "stays the same when the router gives the host a new address. If it does not")
+		fmt.Fprintln(out, "open on the device (an Android phone with a VPN on cannot look such names up),")
+		fmt.Fprintf(out, "open %s there instead.\n", fallback)
+	} else if host, ok := pairingLinkLocalAddress(link); ok {
+		fmt.Fprintf(out, "\nThe code below opens %s, an address on the local network, and a Home Screen\n", host)
+		fmt.Fprintln(out, "app made from it keeps that address. If the router can give this host another")
+		fmt.Fprintf(out, "one, reserve %s for it in the router's DHCP settings (a DHCP reservation).\n", host)
 	}
 	fmt.Fprintf(out, "\nOr scan this with the device's camera. It opens %s with the PIN filled in:\n\n", pairingLinkAddress(link))
 	fmt.Fprint(out, code.terminal(2, "  "))
