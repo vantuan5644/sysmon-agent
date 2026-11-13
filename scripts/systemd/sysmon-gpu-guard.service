@@ -1,0 +1,41 @@
+[Unit]
+# Root helper that runs the GPU overheat guard on Linux, where the agent is
+# unprivileged and so cannot lower the power limit or end GPU apps itself. It
+# writes /run/sysmon-gpu-guard/state.json every two seconds; the agent reads
+# that file, shows it on the dashboard and raises desktop notifications.
+#
+# Install with scripts/install-gpu-guard.sh (dry-run by default), not by hand:
+# it also writes /etc/default/sysmon-gpu-guard with the mode.
+Description=Sysmon GPU overheat guard (NVIDIA hotspot)
+# Read the hotspot helper's file, and start after a unit that sets a power cap
+# at boot if the host has one by this name, so the cap is the limit an episode
+# puts back.
+After=sysmon-gpu-hotspot.service nvidia-power-limit.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+# SYSMON_GPU_GUARD=warn|act and the threshold variables; written by
+# scripts/install-gpu-guard.sh.
+EnvironmentFile=-/etc/default/sysmon-gpu-guard
+ExecStart=/usr/local/bin/sysmon-gpu-guard
+RuntimeDirectory=sysmon-gpu-guard
+RuntimeDirectoryMode=0755
+# Keeps the record of a lowered limit across a restart of this service; /run
+# itself still empties at boot, when the driver resets the limit anyway.
+RuntimeDirectoryPreserve=yes
+UMask=0022
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
