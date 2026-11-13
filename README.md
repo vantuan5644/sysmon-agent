@@ -139,14 +139,26 @@ same panel lists every paired device and removes any of them.
 
 The QR code carries the PIN in the address's `#pair=` part, which a browser never sends to
 the agent or a proxy, and the dashboard takes it out of the address bar once read. `-pair`
-draws the code when it writes to a terminal, or with `-pair-qr`, and points it at a private
-network address of the host; `-pair-url https://HOST:PORT` picks another. The Windows
-installer passes the Tailscale Serve address when the agent has one. Pair another device
-points its code at the address the dashboard itself is open at.
+draws the code when it writes to a terminal, or with `-pair-qr`; `-pair-url https://HOST:PORT`
+picks the address it opens. The Windows installer passes the Tailscale Serve address when the
+agent has one. Pair another device points its code at the address the dashboard itself is
+open at.
 
-An iPhone Home Screen app keeps its storage apart from Safari's, so pair it from inside the
-installed app. Browsers keep the pairing in a `sysmon_device` cookie (HttpOnly,
-SameSite=Strict) that lasts 400 days and is renewed on every visit.
+Otherwise the code opens the host's local network name, `HOSTNAME.local`, and so does Pair
+another device on a dashboard open at the host's private network address. A Home Screen app
+keeps the address its code opened, and that name stays the same when the router gives the
+host a new IP address. The agent checks first that the host answers for the name on that
+private address, that no other machine does, and that its certificate names it; if not, the
+code opens the address itself and `-pair` suggests reserving it in the router's DHCP
+settings. Under a `.local` code, `-pair` and the dashboard also show the address, for a
+device that cannot look such names up: Android before 12, or an Android phone with a VPN on
+(Tailscale's included).
+
+On an iPhone or iPad, a Home Screen app keeps its cookies apart from Safari's, so a pairing
+made in Safari does not carry over. When the code opens in Safari, the page asks you to add
+it to the Home Screen first and shows the PIN: open the new app and pair there, once.
+**Pair Safari instead** pairs the browser tab. Browsers keep the pairing in a `sysmon_device`
+cookie (HttpOnly, SameSite=Strict) that lasts 400 days and is renewed on every visit.
 
 On the host, with the same `-settings` path:
 
