@@ -6,6 +6,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"sysmon-agent/internal/gpuguard"
 )
 
 // laneCollector is implemented by platform collectors that support split-rate
@@ -81,6 +83,11 @@ type sampler struct {
 	// tell a fresh GPU/network reading from one a parked slow lane left behind.
 	lastSlowAt time.Time
 	history    *metricsHistory
+	// gpuGuard, when set, adds its newest state to every published snapshot
+	// as gpu_guard. It samples on its own two-second loop, so the alarm
+	// reaches the stream within one fast pass whether or not the slow lane
+	// is parked.
+	gpuGuard gpuGuardService
 
 	started bool
 	cancel  context.CancelFunc
@@ -197,6 +204,24 @@ func (s *sampler) Start() {
 	s.wg.Add(2)
 	go s.runFastLoop(ctx)
 	go s.runSlowLoop(ctx)
+}
+
+// SetGPUGuard makes every published snapshot carry the guard's state.
+func (s *sampler) SetGPUGuard(guard gpuGuardService) {
+	s.mu.Lock()
+	s.gpuGuard = guard
+	s.mu.Unlock()
+}
+
+// GPUGuardState is the guard's newest state, or nil without a guard.
+func (s *sampler) GPUGuardState() *gpuguard.State {
+	s.mu.Lock()
+	guard := s.gpuGuard
+	s.mu.Unlock()
+	if guard == nil {
+		return nil
+	}
+	return guard.State()
 }
 
 // Stop cancels the loops and waits for them to exit.
@@ -359,9 +384,11 @@ func (s *sampler) applyLaneAndPublish(patch func(*Metrics), started time.Time, s
 	}
 	slowFresh := !s.lastSlowAt.IsZero() && now.Sub(s.lastSlowAt) <= s.slowFreshWindow()
 	working := s.working
+	guard := s.gpuGuard
 	s.mu.Unlock()
 
 	final := finishMetrics(working, started)
+	attachGPUGuard(&final, guard)
 	s.history.observe(final, slowFresh)
 	data, err := json.Marshal(final)
 	if err != nil {
@@ -380,6 +407,10 @@ func (s *sampler) applyLaneAndPublish(patch func(*Metrics), started time.Time, s
 // publishWhole stores and broadcasts a full Metrics produced by the fallback
 // loop (collectors without lane support).
 func (s *sampler) publishWhole(metrics Metrics) {
+	s.mu.Lock()
+	guard := s.gpuGuard
+	s.mu.Unlock()
+	attachGPUGuard(&metrics, guard)
 	s.history.observe(metrics, true)
 	data, err := json.Marshal(metrics)
 	if err != nil {

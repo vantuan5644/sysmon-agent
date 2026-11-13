@@ -14,7 +14,7 @@ const agentBudgetArg = args.find((arg) => arg === "--agent-budget" || arg.starts
 const agentBudgetCores = agentBudgetArg ? parseAgentBudget(agentBudgetArg) : null;
 const baseURL = normalizeBaseURL(args.find((arg) => !arg.startsWith("--")) || defaultBaseURL);
 const timeoutMS = 5000;
-const dashboardBuild = "sysmon-static-v166";
+const dashboardBuild = "sysmon-static-v167";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,
@@ -375,6 +375,34 @@ function validateMetrics(metrics) {
   validateProcesses(metrics.processes);
   validateCollectionErrors(metrics.collection_errors);
   validateCollectionErrors(metrics.collection_notes, "metrics.collection_notes");
+  if (metrics.gpu_guard !== undefined) {
+    validateGPUGuard(metrics.gpu_guard);
+  }
+}
+
+// validateGPUGuard checks the GPU guard's state (internal/gpuguard State),
+// present when the agent runs with -gpu-guard warn or act.
+function validateGPUGuard(guard) {
+  const path = "metrics.gpu_guard";
+  assertObject(guard, path);
+  assert(["warn", "act"].includes(guard.mode), `${path}.mode = ${guard.mode}, want warn or act`);
+  assert(["ok", "warn", "critical", "unknown"].includes(guard.level), `${path}.level = ${guard.level}`);
+  assert(["hotspot", "core", "none"].includes(guard.source), `${path}.source = ${guard.source}`);
+  assert(["none", "power_limited", "apps_stopped"].includes(guard.action), `${path}.action = ${guard.action}`);
+  for (const [key, unit, max] of [["hotspot_celsius", "C", 150], ["core_celsius", "C", 150], ["delta_celsius", "C", 150], ["power_watts", "W", 2000]]) {
+    if (guard[key]?.available) {
+      validateNumberMetric(guard[key], `${path}.${key}`, { unit, allowUnavailable: true, min: key === "delta_celsius" ? -50 : 0, max });
+    }
+  }
+  assertObject(guard.thresholds, `${path}.thresholds`);
+  for (const key of ["warn_c", "critical_c", "delta_warn_c"]) {
+    assert(typeof guard.thresholds[key] === "number" && guard.thresholds[key] > 0, `${path}.thresholds.${key} must be a positive number`);
+  }
+  assert(guard.thresholds.critical_c > guard.thresholds.warn_c, `${path}.thresholds.critical_c must be above warn_c`);
+  if (guard.reasons !== undefined) {
+    assert(Array.isArray(guard.reasons), `${path}.reasons must be an array`);
+  }
+  assertTimestamp(guard.updated_at, `${path}.updated_at`, { allowStale: false });
 }
 
 // validateCPUCores checks the optional per-core utilization set. It degrades as
@@ -1120,6 +1148,19 @@ function sampleMetrics() {
     collection_notes: [
       "storage CT4000T710SSD8 capacity: no mounted filesystems",
     ],
+    gpu_guard: {
+      mode: "warn",
+      level: "ok",
+      source: "hotspot",
+      gpu: "NVIDIA GeForce RTX 4090",
+      hotspot_celsius: { available: true, value: 62.6, unit: "C" },
+      core_celsius: { available: true, value: 51, unit: "C" },
+      delta_celsius: { available: true, value: 11.6, unit: "C" },
+      power_watts: { available: true, value: 51.3, unit: "W" },
+      thresholds: { warn_c: 90, critical_c: 95, delta_warn_c: 25 },
+      action: "none",
+      updated_at: new Date().toISOString(),
+    },
   };
 }
 

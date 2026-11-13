@@ -150,7 +150,7 @@ func readCodexQuota(parent context.Context, binary, configDir string) ([]QuotaRo
 		binary = "codex"
 	}
 	cmd := exec.CommandContext(ctx, binary, "app-server", "--stdio")
-	hideCodexQuotaWindow(cmd)
+	hideChildWindow(cmd)
 	for _, value := range os.Environ() {
 		if !strings.EqualFold(strings.SplitN(value, "=", 2)[0], "CODEX_HOME") {
 			cmd.Env = append(cmd.Env, value)

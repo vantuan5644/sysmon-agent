@@ -305,6 +305,18 @@
       </div>
     </section>
   </div>
+
+  <div id="gpuAlarm" class="gpu-alarm" role="alertdialog" aria-modal="true" aria-labelledby="gpuAlarmTitle" aria-describedby="gpuAlarmMessage" hidden>
+    <div class="gpu-alarm-panel">
+      <svg class="icon gpu-alarm-icon" aria-hidden="true"><use href="#icon-warning"></use></svg>
+      <p id="gpuAlarmHost" class="gpu-alarm-host">--</p>
+      <h2 id="gpuAlarmTitle" class="gpu-alarm-title">GPU overheating</h2>
+      <p id="gpuAlarmReadings" class="gpu-alarm-readings">--</p>
+      <p id="gpuAlarmMessage" class="gpu-alarm-message">--</p>
+      <p id="gpuAlarmAction" class="gpu-alarm-action">--</p>
+      <button id="gpuAlarmDismiss" class="gpu-alarm-dismiss" type="button">Hide for 1 min</button>
+    </div>
+  </div>
   <script src="/app.js" defer></script>
 </body>
 </html>

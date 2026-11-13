@@ -5,6 +5,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"sysmon-agent/internal/gpuguard"
 )
 
 type NumberMetric struct {
@@ -297,14 +299,17 @@ type Metrics struct {
 	// MemoryCommit is Windows commit charge against the commit limit, and
 	// Pressure is Linux pressure stall information; each platform reports the
 	// other's as unavailable (pressure.go explains why).
-	MemoryCommit         CapacityMetric  `json:"memory_commit"`
-	Pressure             PressureSet     `json:"pressure"`
-	Disks                []DiskMetric    `json:"disks"`
-	Storage              StorageSet      `json:"storage"`
-	Network              NetworkSet      `json:"network"`
-	Tailscale            TailscaleStatus `json:"tailscale"`
-	Temperatures         TemperatureSet  `json:"temperatures"`
-	GPU                  GPUSet          `json:"gpu"`
+	MemoryCommit CapacityMetric  `json:"memory_commit"`
+	Pressure     PressureSet     `json:"pressure"`
+	Disks        []DiskMetric    `json:"disks"`
+	Storage      StorageSet      `json:"storage"`
+	Network      NetworkSet      `json:"network"`
+	Tailscale    TailscaleStatus `json:"tailscale"`
+	Temperatures TemperatureSet  `json:"temperatures"`
+	GPU          GPUSet          `json:"gpu"`
+	// GPUGuard is the GPU overheat guard's state (gpu_guard.go), absent when
+	// no guard runs on this host.
+	GPUGuard             *gpuguard.State `json:"gpu_guard,omitempty"`
 	Processes            ProcessSet      `json:"processes"`
 	CollectionDurationMS int64           `json:"collection_duration_ms"`
 	CollectionErrors     []string        `json:"collection_errors,omitempty"`

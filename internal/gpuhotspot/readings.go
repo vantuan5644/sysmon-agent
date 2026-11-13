@@ -3,8 +3,11 @@
 package gpuhotspot
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +27,35 @@ type Snapshot struct {
 	Timestamp time.Time `json:"timestamp"`
 	Devices   []Device  `json:"devices"`
 	Error     string    `json:"error,omitempty"`
+}
+
+// ReadFile reads and checks the helper's readings.json: bounded size and
+// device count, a timestamp no older than FreshFor, and no helper error.
+func ReadFile(path string, now time.Time) (Snapshot, error) {
+	var snapshot Snapshot
+	file, err := os.Open(path)
+	if err != nil {
+		return snapshot, fmt.Errorf("GPU hotspot helper unavailable: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, MaxBytes+1))
+	if err != nil || len(data) > MaxBytes {
+		return snapshot, fmt.Errorf("GPU hotspot helper file unreadable or oversized")
+	}
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return snapshot, fmt.Errorf("invalid GPU hotspot helper JSON: %w", err)
+	}
+	if len(snapshot.Devices) > MaxDevices {
+		return snapshot, fmt.Errorf("too many GPU hotspot devices")
+	}
+	age := now.Sub(snapshot.Timestamp)
+	if snapshot.Timestamp.IsZero() || age < -time.Second || age > FreshFor {
+		return snapshot, fmt.Errorf("GPU hotspot helper sample unavailable or stale")
+	}
+	if snapshot.Error != "" {
+		return snapshot, fmt.Errorf("GPU hotspot helper: %s", snapshot.Error)
+	}
+	return snapshot, nil
 }
 
 // NVIDIA prints an eight-digit PCI domain; sysfs prints four digits.
