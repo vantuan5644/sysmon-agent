@@ -543,7 +543,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v172",
+    dashboard_build: "sysmon-static-v173",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -561,7 +561,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v172",
+    dashboard_build: "sysmon-static-v173",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1248,7 +1248,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v172, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v173, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1296,7 +1296,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v172; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v173; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1306,7 +1306,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v172",
+    dashboard_build: "sysmon-static-v173",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1316,7 +1316,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v172",
+    dashboard_build: "sysmon-static-v173",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1451,7 +1451,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v172", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v173", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -3041,7 +3041,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v172" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v173" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],
@@ -3188,7 +3188,7 @@ async function runPairingCase({ pairState, onFetch, hash = "", standalone = true
   const pairDocument = new Document(html);
   // The fake DOM ignores the hidden attribute; start these the way the
   // markup does, so a "shown" assertion means app.js showed it.
-  for (const id of ["pairScreen", "pairInsecure", "pairError", "pairingPanel", "pairingWindowBox", "pairingWindowQr", "pairingPanelError", "hostPairScreen", "pairInstall", "pairInstallPin", "pairingAppHint"]) {
+  for (const id of ["pairScreen", "pairHost", "pairInsecure", "pairError", "pairingPanel", "pairingWindowBox", "pairingWindowQr", "pairingPanelError", "hostPairScreen", "pairInstall", "pairInstallPin", "pairingAppHint"]) {
     pairDocument.getElementById(id).hidden = true;
   }
   const jar = new Map(cookies);
@@ -3339,6 +3339,7 @@ async function submitPIN(run, pin) {
   assert(run.byId("pairWaiting").textContent === "A PIN is open on the host.", "an open PIN was not mentioned");
   assert(run.byId("pairSubmit").disabled !== true, "the Pair button was disabled on a secure connection");
   assert(run.byId("pairInsecure").hidden === true, "the plain-HTTP notice showed on a secure connection");
+  assert(run.byId("pairHost").hidden === true && run.byId("pairHow").hidden !== true, "a device on the network got the host's note");
 
   await submitPIN(run, "12345");
   assert(run.count("/api/pair", "POST") === 0, "a 5-digit PIN was sent");
@@ -3527,6 +3528,25 @@ async function submitPIN(run, pin) {
   await settlePairing();
   assert(run.byId("pairingWindowPin").textContent === "654 321", "the new PIN was not shown");
   assert(run.jar.get("sysmon_pair_pin") === "654321", "the new PIN was not left for the Home Screen app");
+}
+
+for (const [userAgent, how] of [
+  ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36", "open Start, Sysmon Agent, Pair a device"],
+  ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36", "run sysmon-agent -pair as the agent's user"],
+]) {
+  // A browser on the host itself (localhost): the form says first where this
+  // machine's PIN comes from, in place of the list for other devices.
+  const run = await runPairingCase({
+    pairState: { pairing: "required", paired: false, local: true, secure: true, window_open: false, dashboard_build: "" },
+    standalone: false,
+    userAgent,
+    maxTouchPoints: 0,
+  });
+  assert(run.byId("pairScreen").hidden === false && run.byId("pairForm").hidden === false, "the host's own tab showed no PIN form");
+  assert(run.byId("pairHost").hidden === false, "the host's own tab got no note on where its PIN comes from");
+  assert(run.byId("pairHost").textContent.startsWith("This is the host.") && run.byId("pairHost").textContent.includes(how), `the host's note did not say ${how}: ${run.byId("pairHost").textContent}`);
+  assert(run.byId("pairHow").hidden === true && run.byId("pairHowTitle").hidden === true, "the host's own tab kept the list for other devices");
+  assert(run.byId("pairInsecure").hidden === true, "a local tab got the plain-HTTP notice");
 }
 
 {
