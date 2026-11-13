@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -271,12 +272,12 @@ func TestWindowsInstallerPairing(t *testing.T) {
 		`-Action Pair -PauseAtEnd`,
 		// The PIN shows in a console after Finish, with its QR code, so the
 		// install itself opens no pairing window.
-		`-Action Install -SkipPair$6'`,
+		`-Action Install -SkipPair -KeepServiceArguments$6'`,
 		`!define MUI_FINISHPAGE_RUN_TEXT "Pair a device now"`,
 		`!define MUI_FINISHPAGE_RUN_FUNCTION PairDeviceNow`,
 		`Function PairDeviceNow`,
 		`Page custom GpuGuardPage GpuGuardPageLeave`,
-		`StrCpy $6 "$6 -GpuGuard $GpuGuardMode"`,
+		`StrCpy $6 " -GpuGuard $GpuGuardMode"`,
 		`StrCpy $6 "$6 -GpuHotspotWarn $GpuHotspotWarn"`,
 		`StrCpy $6 "$6 -GpuHotspotCrit $GpuHotspotCrit"`,
 		`StrCpy $6 "$6 -GpuDeltaWarn $GpuDeltaWarn"`,
@@ -345,6 +346,141 @@ if ((Get-ServiceArgument '' 'settings') -ne $null) { throw 'empty' }
 	out, err := exec.CommandContext(ctx, pwsh, "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
 	if err != nil {
 		t.Fatalf("PowerShell fixtures: %v: %s", err, out)
+	}
+}
+
+// The setup wizard upgrades with -KeepServiceArguments: whatever it does not
+// name keeps the installed service's value, so an upgrade leaves the port, the
+// settings folder and the flags set earlier with the script alone. The wizard
+// runs Windows PowerShell 5.1, so this runs there too when it is installed.
+func TestWindowsInstallerKeepsServiceArguments(t *testing.T) {
+	shells := []string{}
+	for _, name := range []string{"pwsh", "powershell"} {
+		if path, err := exec.LookPath(name); err == nil {
+			shells = append(shells, path)
+		}
+	}
+	if len(shells) == 0 {
+		t.Skip("PowerShell is needed to run the installer's functions")
+	}
+	data, err := os.ReadFile("install-windows.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := strings.ReplaceAll(string(data), "\r\n", "\n")
+	start := strings.Index(source, "param(\n")
+	end := strings.Index(source[start:], "\n)\n")
+	if start < 0 || end < 0 {
+		t.Fatal("install-windows.ps1: no param block")
+	}
+	params := source[start : start+end+3]
+	functions := sliceFunction(t, source, "Get-ServiceArgument") + "\n}\n" + sliceFunction(t, source, "Use-ServiceArguments") + "\n}\n"
+	script := "[CmdletBinding()]\n" + params + `$ErrorActionPreference = 'Stop'
+$WarningPreference = 'SilentlyContinue'
+` + functions + `
+function Get-ServiceCommandLine { return $script:CommandLine }
+function Reset {
+    $script:Port = 9099; $script:Bind = '0.0.0.0'; $script:Pairing = 'required'
+    $script:SettingsPath = 'C:\ProgramData\SysmonAgent\settings.json'
+    $script:ClaudeConfigDir = 'C:\Users\me\.claude'; $script:CodexConfigDir = 'C:\Users\me\.codex'
+    $script:ClaudeQuotaPoll = [switch]$false; $script:CodexQuotaPoll = [switch]$false
+    $script:CodexBinary = ''; $script:TempWarn = 0; $script:GpuGuard = ''
+    $script:GpuHotspotWarn = 0; $script:GpuHotspotCrit = 0; $script:GpuDeltaWarn = 0; $script:GpuGuardSpare = ''
+}
+function Check($what, $got, $want) { if ($got -ne $want) { throw "${what}: got '$got', want '$want'" } }
+
+# What the wizard names wins; everything else comes from the service.
+Reset
+$script:CommandLine = '"C:\Program Files\Sysmon Agent\sysmon-agent.exe" -bind "127.0.0.1" -port 9199 -settings "C:\ProgramData\Sysmon Agent Two\settings.json" -pairing required -claude-config-dir "C:\Users\me\.claude" -claude-quota-poll -temp-warn 85 -gpu-guard off -gpu-hotspot-crit 93 -gpu-guard-spare "Code.exe"'
+$script:GivenParameters = @('Action', 'SkipPair', 'KeepServiceArguments', 'GpuGuard', 'GpuHotspotWarn', 'GpuHotspotCrit', 'GpuDeltaWarn')
+$script:GpuGuard = 'act'
+Use-ServiceArguments
+Check port $Port 9199
+Check bind $Bind '127.0.0.1'
+Check settings $SettingsPath 'C:\ProgramData\Sysmon Agent Two\settings.json'
+Check claude $ClaudeConfigDir 'C:\Users\me\.claude'
+Check 'claude poll' ([bool]$ClaudeQuotaPoll) $true
+Check 'codex dir, missing from the line' $CodexConfigDir ''
+Check 'codex poll' ([bool]$CodexQuotaPoll) $false
+Check 'temp warn' $TempWarn 85
+Check 'named guard' $GpuGuard 'act'
+Check 'named crit' $GpuHotspotCrit 0
+Check spare $GpuGuardSpare 'Code.exe'
+if ($Port -isnot [int]) { throw 'port lost its type' }
+
+# A value the parameter refuses stays at the default, with a warning.
+Reset
+$script:CommandLine = '"C:\x\sysmon-agent.exe" -bind "0.0.0.0" -port 99999 -settings "C:\s.json" -pairing maybe -gpu-guard loud'
+$script:GivenParameters = @('Action')
+Use-ServiceArguments
+Check 'port out of range' $Port 9099
+Check 'unknown pairing' $Pairing 'required'
+Check 'unknown guard' $GpuGuard ''
+Check settings $SettingsPath 'C:\s.json'
+
+# A line from before pairing has no -pairing: the default stays.
+Reset
+$script:CommandLine = '"C:\x\sysmon-agent.exe" -bind "0.0.0.0" -port 9099 -settings "C:\s.json"'
+Use-ServiceArguments
+Check 'old line pairing' $Pairing 'required'
+
+# No service yet: nothing changes.
+Reset
+$script:CommandLine = $null
+Use-ServiceArguments
+Check 'fresh claude' $ClaudeConfigDir 'C:\Users\me\.claude'
+Check 'fresh port' $Port 9099
+'ok'
+`
+	file := filepath.Join(t.TempDir(), "keep.ps1")
+	if err := os.WriteFile(file, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, shell := range shells {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		cmd := exec.CommandContext(ctx, shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", file)
+		// The param block's defaults read it, and Linux has none.
+		cmd.Env = append(os.Environ(), "USERPROFILE="+t.TempDir())
+		out, err := cmd.CombinedOutput()
+		cancel()
+		if err != nil || !strings.Contains(string(out), "ok") {
+			t.Fatalf("%s: %v: %s", shell, err, out)
+		}
+	}
+}
+
+// Windows PowerShell 5.1 splits a native argument that holds quotes at its
+// spaces, so sc.exe config refused the wizard's binPath= and the service kept
+// its old command line. The wizard also has to start the 64-bit PowerShell
+// and keep what it does not name.
+func TestWindowsInstallerChangesServiceWithoutScExe(t *testing.T) {
+	data, err := os.ReadFile("install-windows.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(string(data), "\r\n", "\n")
+	if strings.Contains(script, "binPath=") {
+		t.Error("install-windows.ps1 still passes binPath= to sc.exe")
+	}
+	if !strings.Contains(script, "Invoke-CimMethod -MethodName Change -Arguments @{ PathName = $binaryPath;") {
+		t.Error("install-windows.ps1 does not change the service through Win32_Service.Change")
+	}
+	nsi, err := os.ReadFile(filepath.Join("dist", "installer.nsi"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wizard := strings.ReplaceAll(string(nsi), "\r\n", "\n")
+	for _, needle := range []string{
+		"  ${DisableX64FSRedirection}\n  nsExec::ExecToLog '\"$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"$INSTDIR\\install-windows.ps1\" -Action Install -SkipPair -KeepServiceArguments$6'",
+		"  StrCpy $6 \" -GpuGuard $GpuGuardMode\"",
+		"\"URL\" \"http://localhost:$ServicePort/\"",
+	} {
+		if !strings.Contains(wizard, needle) {
+			t.Errorf("installer.nsi lacks %q", needle)
+		}
+	}
+	if strings.Contains(wizard, "nsExec::ExecToLog 'powershell.exe") {
+		t.Error("installer.nsi still starts the 32-bit powershell.exe")
 	}
 }
 

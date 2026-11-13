@@ -27,6 +27,11 @@ param(
     # it and offers Pair a device now on its last page instead, which shows the
     # PIN and its QR code in a console rather than in the install log.
     [switch]$SkipPair,
+    # On an upgrade, every parameter not named here keeps the value the
+    # installed service runs with: its port, its settings folder and with it the
+    # paired devices, and any flag set earlier with this script. The setup
+    # wizard passes it, with the GPU guard page's values named.
+    [switch]$KeepServiceArguments,
     # Warn threshold for cpu_temperature, in Celsius (50-90; 0 keeps whatever
     # is already saved). The 70 default suits a package or die reading, but on
     # AMD the canonical sensor is Tctl, a control temperature that short
@@ -1410,6 +1415,63 @@ function Use-ServiceEndpoint {
     }
 }
 
+# Use-ServiceArguments gives each parameter the caller did not name the value
+# the installed service's command line holds (-KeepServiceArguments). A flag
+# missing from it stands for the parameter's empty value: no folder, 0 (the
+# agent's default) or a switch left off. Bind, Port, SettingsPath and Pairing
+# are on every command line this script writes, so one missing from an older
+# line keeps this script's default instead.
+function Use-ServiceArguments {
+    $commandLine = Get-ServiceCommandLine
+    if (-not $commandLine) {
+        return
+    }
+    $flags = [ordered]@{
+        Bind = 'bind'
+        Port = 'port'
+        SettingsPath = 'settings'
+        Pairing = 'pairing'
+        ClaudeConfigDir = 'claude-config-dir'
+        CodexConfigDir = 'codex-config-dir'
+        CodexBinary = 'codex-binary'
+        TempWarn = 'temp-warn'
+        GpuGuard = 'gpu-guard'
+        GpuHotspotWarn = 'gpu-hotspot-warn'
+        GpuHotspotCrit = 'gpu-hotspot-crit'
+        GpuDeltaWarn = 'gpu-delta-warn'
+        GpuGuardSpare = 'gpu-guard-spare'
+    }
+    $alwaysWritten = @('Bind', 'Port', 'SettingsPath', 'Pairing')
+    foreach ($name in @($flags.Keys)) {
+        if ($script:GivenParameters -contains $name) {
+            continue
+        }
+        $current = (Get-Variable -Name $name -Scope Script).Value
+        $value = Get-ServiceArgument $commandLine $flags[$name]
+        if ($null -eq $value) {
+            if ($alwaysWritten -contains $name) {
+                continue
+            }
+            $value = if ($current -is [int]) { 0 } else { '' }
+        }
+        try {
+            if ($current -is [int]) {
+                $value = [int]$value
+            }
+            # The parameter's own validation runs on this assignment too.
+            Set-Variable -Name $name -Scope Script -Value $value -ErrorAction Stop
+        } catch {
+            Write-Warning "Not keeping the service's -$($flags[$name]) $value, which this script does not accept; -$name stays at $current."
+        }
+    }
+    foreach ($pair in @(@('ClaudeQuotaPoll', 'claude-quota-poll'), @('CodexQuotaPoll', 'codex-quota-poll'))) {
+        if ($script:GivenParameters -notcontains $pair[0]) {
+            $on = $commandLine -match ('(?:^|\s)-{1,2}' + [regex]::Escape($pair[1]) + '(?:\s|$)')
+            Set-Variable -Name $pair[0] -Scope Script -Value ([switch]$on)
+        }
+    }
+}
+
 # Get-ServiceArgument reads one flag from the installed service's command line,
 # so Pair and Status act on the folder and port the service really uses rather
 # than on this script's defaults.
@@ -1624,6 +1686,9 @@ function Show-PairingStatus {
 
 function Install-Agent {
     Assert-Admin
+    if ($KeepServiceArguments) {
+        Use-ServiceArguments
+    }
 
     $settingsDir = Split-Path -Parent $SettingsPath
     if ($settingsDir) {
@@ -1636,7 +1701,15 @@ function Install-Agent {
         if ($service.Status -ne 'Stopped') {
             Stop-Service -Name $ServiceName -Force
         }
-        & sc.exe config $ServiceName binPath= $binaryPath start= auto DisplayName= $DisplayName | Out-Null
+        # Win32_Service.Change, not sc.exe config: Windows PowerShell 5.1, which
+        # the setup wizard runs, hands sc.exe a service path that holds quotes
+        # split at its spaces. sc.exe then refused it, and the service kept its
+        # old command line while Install went on as if it had changed.
+        $result = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" |
+            Invoke-CimMethod -MethodName Change -Arguments @{ PathName = $binaryPath; StartMode = 'Automatic'; DisplayName = $DisplayName }
+        if ($result.ReturnValue -ne 0) {
+            throw "Could not change the $ServiceName service's command line: Win32_Service.Change returned $($result.ReturnValue)."
+        }
     } else {
         New-Service -Name $ServiceName -DisplayName $DisplayName -BinaryPathName $binaryPath -StartupType Automatic | Out-Null
     }

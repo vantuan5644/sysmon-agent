@@ -766,7 +766,9 @@ which rebuilds the service command line on every install:
 
 A reinstall without `-GpuGuard` goes back to the default, `warn`. The setup wizard asks for
 the mode and the three lines on a page of its own and starts from what the installed service
-runs with, so an upgrade keeps them, `-GpuGuardSpare` included. A silent install takes them as
+runs with. Everything else the service runs with stays as it was on a wizard upgrade
+(`-KeepServiceArguments`): the port, the settings folder and so the paired devices, and any
+flag set earlier with the script, `-GpuGuardSpare` included. A silent install takes them as
 switches: `SysmonAgent-Setup.exe /S /GPUGUARD=act /GPUHOTSPOTWARN=88 /GPUHOTSPOTCRIT=93
 /GPUDELTAWARN=20`. The hotspot comes from the
 LibreHardwareMonitor bridge; with `nvidia-smi` alone the guard runs on the core. The host alarm

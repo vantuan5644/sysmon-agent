@@ -66,7 +66,7 @@ Var GpuGuardMode
 Var GpuHotspotWarn
 Var GpuHotspotCrit
 Var GpuDeltaWarn
-Var GpuGuardSpare
+Var ServicePort
 ; The installed service's command line, empty on a fresh install.
 Var PreviousImagePath
 ; 1 when the installed service already ran with -pairing, so its devices
@@ -174,28 +174,34 @@ Section "!${APPNAME} (required)" SecCore
   WriteRegDWORD HKLM "${UNINSTKEY}" "NoRepair" 1
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
-  ; Only the guard settings that differ from the agent's defaults are passed,
-  ; so the service command line stays as short as the choice allows.
-  StrCpy $6 ""
-  ${If} $GpuGuardMode != "warn"
-    StrCpy $6 "$6 -GpuGuard $GpuGuardMode"
-  ${EndIf}
+  ; The page's values, every time: -KeepServiceArguments keeps whatever is not
+  ; named, so a value put back to its default must be named too. 0 leaves a
+  ; line to the agent's default, which then follows a later change of it.
+  StrCpy $6 " -GpuGuard $GpuGuardMode"
   ${If} $GpuHotspotWarn != 90
     StrCpy $6 "$6 -GpuHotspotWarn $GpuHotspotWarn"
+  ${Else}
+    StrCpy $6 "$6 -GpuHotspotWarn 0"
   ${EndIf}
   ${If} $GpuHotspotCrit != 95
     StrCpy $6 "$6 -GpuHotspotCrit $GpuHotspotCrit"
+  ${Else}
+    StrCpy $6 "$6 -GpuHotspotCrit 0"
   ${EndIf}
   ${If} $GpuDeltaWarn != 20
     StrCpy $6 "$6 -GpuDeltaWarn $GpuDeltaWarn"
-  ${EndIf}
-  ${If} $GpuGuardSpare != ""
-    StrCpy $6 '$6 -GpuGuardSpare "$GpuGuardSpare"'
+  ${Else}
+    StrCpy $6 "$6 -GpuDeltaWarn 0"
   ${EndIf}
 
   DetailPrint "Registering and starting the ${SERVICE_NAME} service..."
-  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-windows.ps1" -Action Install -SkipPair$6'
+  ; The 64-bit Windows PowerShell. The 32-bit one this installer would start
+  ; reads $env:ProgramFiles as Program Files (x86), where the script's own
+  ; Tailscale lookup then misses C:\Program Files\Tailscale.
+  ${DisableX64FSRedirection}
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-windows.ps1" -Action Install -SkipPair -KeepServiceArguments$6'
   Pop $0 ; install-windows.ps1 exit code
+  ${EnableX64FSRedirection}
 
   ; The running service is the source of truth. install-windows.ps1 now
   ; downgrades a slow first-boot readiness check and firewall hiccups to
@@ -224,7 +230,7 @@ Section "Start Menu shortcut" SecStartMenu
   CreateDirectory "$SMPROGRAMS\${APPNAME}"
   ; Internet-shortcut (.url) is the most reliable way to open the default
   ; browser at the dashboard from a Start Menu / Desktop icon.
-  WriteINIStr "$SMPROGRAMS\${APPNAME}\${APPNAME} Dashboard.url" "InternetShortcut" "URL" "${SERVICE_URL}"
+  WriteINIStr "$SMPROGRAMS\${APPNAME}\${APPNAME} Dashboard.url" "InternetShortcut" "URL" "http://localhost:$ServicePort/"
   WriteINIStr "$SMPROGRAMS\${APPNAME}\${APPNAME} Dashboard.url" "InternetShortcut" "IconFile" "$INSTDIR\sysmon-agent.exe"
   WriteINIStr "$SMPROGRAMS\${APPNAME}\${APPNAME} Dashboard.url" "InternetShortcut" "IconIndex" "0"
   ; Prints a new 10-minute pairing PIN. The script asks for elevation itself
@@ -234,7 +240,7 @@ SectionEnd
 
 Section "Desktop shortcut" SecDesktop
   SetOutPath "$INSTDIR"
-  WriteINIStr "$DESKTOP\${APPNAME} Dashboard.url" "InternetShortcut" "URL" "${SERVICE_URL}"
+  WriteINIStr "$DESKTOP\${APPNAME} Dashboard.url" "InternetShortcut" "URL" "http://localhost:$ServicePort/"
   WriteINIStr "$DESKTOP\${APPNAME} Dashboard.url" "InternetShortcut" "IconFile" "$INSTDIR\sysmon-agent.exe"
   WriteINIStr "$DESKTOP\${APPNAME} Dashboard.url" "InternetShortcut" "IconIndex" "0"
 SectionEnd
@@ -282,7 +288,7 @@ Function .onInit
   StrCpy $GpuHotspotWarn 90
   StrCpy $GpuHotspotCrit 95
   StrCpy $GpuDeltaWarn 20
-  StrCpy $GpuGuardSpare ""
+  StrCpy $ServicePort 9099
   StrCpy $PairedBefore 0
   StrCpy $ServiceRunning 0
 
@@ -294,7 +300,7 @@ Function .onInit
     !insertmacro ReadServiceFlag "-gpu-hotspot-warn " " " $GpuHotspotWarn
     !insertmacro ReadServiceFlag "-gpu-hotspot-crit " " " $GpuHotspotCrit
     !insertmacro ReadServiceFlag "-gpu-delta-warn " " " $GpuDeltaWarn
-    !insertmacro ReadServiceFlag '-gpu-guard-spare "' '"' $GpuGuardSpare
+    !insertmacro ReadServiceFlag "-port " " " $ServicePort
     ClearErrors
     ${WordFind} "$PreviousImagePath" " -pairing " "E+1}" $R0
     ${IfNot} ${Errors}
@@ -448,7 +454,9 @@ Section "Uninstall"
   ; binary is still present (install-windows.ps1 resolves it via $PSScriptRoot).
   IfFileExists "$INSTDIR\install-windows.ps1" 0 +3
     DetailPrint "Removing the SysmonAgent service..."
-    nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-windows.ps1" -Action Uninstall'
+    ${DisableX64FSRedirection}
+    nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-windows.ps1" -Action Uninstall'
+    ${EnableX64FSRedirection}
 
   Delete "$INSTDIR\sysmon-agent.exe"
   Delete "$INSTDIR\install-windows.ps1"
