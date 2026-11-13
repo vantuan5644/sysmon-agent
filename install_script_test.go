@@ -221,7 +221,7 @@ func TestWindowsInstallerPairing(t *testing.T) {
 		`'Pair' { Use-ServiceEndpoint; Invoke-AgentPair }`,
 		`'Status' { Use-ServiceEndpoint; Show-Status }`,
 		`$script:GivenParameters = @($PSBoundParameters.Keys)`,
-		`on its More status page (the second dot),`,
+		`at the bottom of its second page (swipe,`,
 		`function Invoke-AgentPair`,
 		`function Invoke-AgentCommand`,
 		`$pairArguments = @('-pair')`,

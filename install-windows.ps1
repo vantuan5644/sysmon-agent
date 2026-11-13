@@ -1605,8 +1605,8 @@ function Invoke-AgentPair {
         # everything checked from this machine passes.
         Show-LanFirewallStatus
         Write-Host ''
-        Write-Host 'A paired dashboard can pair more devices: on its More status page (the second dot),'
-        Write-Host 'Paired devices, Pair another device.'
+        Write-Host 'A paired dashboard can pair more devices: at the bottom of its second page (swipe,'
+        Write-Host 'or tap the second dot), Paired devices, Pair another device.'
         Write-Host ''
         $pairArguments = @('-pair')
         # The QR code opens the Tailscale Serve address when there is one: the

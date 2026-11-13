@@ -133,9 +133,11 @@ data and control route answers `401 {"error":"pairing_required"}`. This is the d
    the PIN filled in, so you check the device's name and press **Pair**. Or open one of the
    addresses `-pair` prints and type the PIN.
 
-After the first one, a paired dashboard can pair more: on its **More status** page (the
-second dot), **Paired devices → Pair another device** shows a new PIN and its QR code. The
-same panel lists every paired device and removes any of them.
+After the first one, a paired dashboard can pair more: swipe to its second page (or tap the
+second dot at the bottom), and at the bottom of it **Paired devices → Pair another device**
+shows a new PIN and its QR code. The same panel lists every paired device and removes any of
+them. A browser on the host itself gets the PIN form too, and it opens with where that
+machine's PIN comes from.
 
 The QR code carries the PIN in the address's `#pair=` part, which a browser never sends to
 the agent or a proxy, and the dashboard takes it out of the address bar once read. `-pair`
