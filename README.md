@@ -48,6 +48,8 @@ all of them.
   session, weekly, per-model weeklies, usage credits), Codex quota, and a seven-day token
   chart for each. Reads the local files both tools already write; hidden unless you point
   the agent at a config directory.
+- 🔒 **Paired devices only** — data and controls reach only the phones and browsers you
+  pair with a PIN, over HTTPS. See [Pairing](#pairing).
 - ♻️ **Graceful degradation** — a sensor that can't be read shows `unavailable` with a
   reason; it never breaks the rest of the dashboard.
 - 🐧 🪟 **Cross-platform** — Linux (`/proc` + sysfs + RAPL) and Windows (native Win32 APIs +
@@ -63,7 +65,8 @@ Download the latest **`SysmonAgent-Setup-<version>.exe`** from the
 [**Releases page**](https://github.com/vantuan5644/sysmon-agent/releases/latest) and
 double-click it. The wizard installs a background service, opens the firewall, and adds a
 dashboard shortcut. The build is unsigned, so Windows SmartScreen shows a one-time
-**"Windows protected your PC" → More info → Run anyway**.
+**"Windows protected your PC" → More info → Run anyway**. The wizard's log ends with a
+**pairing PIN** and the addresses to open on your phone; see [Pairing](#pairing).
 
 ### Linux / build from source
 
@@ -72,11 +75,14 @@ Needs **Go 1.22+** (only to build — a prebuilt binary has no Go requirement).
 ```bash
 git clone https://github.com/vantuan5644/sysmon-agent system-monitor
 cd system-monitor
-./build.sh                 # -> ./sysmon-agent
-./sysmon-agent             # serves on 0.0.0.0:9099
+./build.sh                                     # -> ./sysmon-agent
+./sysmon-agent -settings ./settings.json       # serves on 0.0.0.0:9099
+./sysmon-agent -pair -settings ./settings.json # in a second terminal: a PIN for one device
 ```
 
-Open `http://HOST_IP:9099/` from any device on the same network.
+Open `https://HOST_IP:9099/` on a device on the same network, accept the certificate warning
+once, and enter the PIN. See [Pairing](#pairing) for why it is HTTPS and how to avoid the
+warning.
 
 ### Add it to your phone
 
@@ -90,12 +96,114 @@ sudo tailscale serve --bg --https=9443 http://127.0.0.1:9099
 ```
 
 Open `https://TAILSCALE_HOST:9443/` on the device → **Add to Home Screen** (Safari) or
-**Install app** (Chrome) → set the device's auto-lock to *Never* for an always-on monitor.
+**Install app** (Chrome) → open the installed app and pair it there with a PIN (an iPhone app
+does not share Safari's pairing) → set the device's auto-lock to *Never* for an always-on
+monitor.
 Any other HTTPS reverse proxy (Caddy, nginx, Cloudflare Tunnel) works too. On Windows,
 `install-windows.ps1 -Action Install -TailscaleServe` sets up the same Serve route; after the
 one-click setup, run it from an elevated PowerShell as
 `& "C:\Program Files\Sysmon Agent\install-windows.ps1" -Action Install -TailscaleServe`.
 Watching several machines? Add just one of them; the others are a tap away inside the app.
+
+---
+
+## Pairing
+
+The agent shows its data and runs its controls only for devices you have paired with it.
+Anyone else who reaches the port gets the dashboard's empty shell and a PIN form, and every
+data and control route answers `401 {"error":"pairing_required"}`. This is the default; see
+[Turning it off](#turning-it-off) for the open behaviour of earlier releases.
+
+### Pair a device
+
+1. **Get a PIN on the host.** It is 6 digits, valid for 10 minutes and for one device; five
+   wrong tries close it.
+   - **Windows:** the setup wizard ends its log with one. For another, open **Start → Sysmon
+     Agent → Pair a device**, or run `install-windows.ps1 -Action Pair` from an elevated
+     PowerShell.
+   - **Linux:** run `-pair` as the agent's own user, with the same `-settings` path it runs
+     with:
+     ```bash
+     sysmon-agent -pair -settings ~/.local/state/sysmon-agent/settings.json   # user unit
+     sudo -u YOUR_USERNAME sysmon-agent -pair -settings /var/lib/sysmon-agent/settings.json   # system unit
+     ```
+2. **Open the dashboard on the device** at one of the addresses `-pair` prints, enter the PIN
+   and a name for the device.
+
+After the first one, a paired dashboard can pair more: **Paired devices → Pair another
+device** on its status page shows a new PIN. The same panel lists every paired device and
+removes any of them.
+
+An iPhone Home Screen app keeps its storage apart from Safari's, so pair it from inside the
+installed app. Browsers keep the pairing in a `sysmon_device` cookie (HttpOnly,
+SameSite=Strict) that lasts 400 days and is renewed on every visit.
+
+On the host, with the same `-settings` path:
+
+```bash
+sysmon-agent -pair-list                # paired devices, with id, kind and last use
+sysmon-agent -pair-revoke <id>         # remove one; it stops working within a few seconds
+sysmon-agent -pair-token <name>        # a bearer token for scripts, shown once
+```
+
+A script sends its token as `Authorization: Bearer <token>`. A running agent rereads its
+paired devices every 2 seconds, so a revoke or a new token from the command line works
+without a restart. On Windows, `install-windows.ps1 -Action Status` run elevated lists the
+paired devices too.
+
+Pairing state lives in a `pairing` folder beside the settings file: each device as a SHA-256
+hash of its token, an open PIN as a salted hash, and the agent's certificate. The agent makes
+the folder readable by its own account only (`0700` on Linux; SYSTEM, Administrators and the
+owner on Windows). Without `-settings`, pairings are kept in memory and end when the agent
+stops.
+
+### HTTPS on the network
+
+Over plain HTTP, anyone on the network could copy a device's cookie, and anyone in the path
+could change the dashboard's code. So when pairing is required and the agent listens on a
+network address, it serves other devices over **HTTPS on the same port** (`-network-tls
+auto`):
+
+- The agent makes its own certificate (valid 825 days, renewed automatically). Each device
+  shows a certificate warning once. `-pair` prints the certificate's SHA-256 so you can
+  compare it with the one the browser shows. `-cert` and `-key` use your own instead.
+- A device that opens `http://HOST:9099/` is sent to `https://HOST:9099/`, and pairing is
+  refused over plain HTTP from the network.
+- On the host itself, `http://127.0.0.1:9099` and `http://localhost:9099` keep working
+  unchanged. A local request that came through no proxy can read the dashboard without
+  pairing; changing settings and running controls still needs a paired device.
+
+**Tailscale Serve is the better path where Tailscale is installed.** The device then gets a
+certificate it already trusts, with no warning, and an iPhone Home Screen app installs from
+it. Bind the agent to loopback and publish it:
+
+```bash
+./sysmon-agent -bind 127.0.0.1 -settings ./settings.json
+sudo tailscale serve --bg --https=9443 http://127.0.0.1:9099
+```
+
+On Windows, `install-windows.ps1 -Action Install -TailscaleServe` does the same. On a
+loopback bind the agent leaves its own HTTPS off.
+
+**Behind another reverse proxy** (Caddy, nginx, a tunnel), make sure it sends
+`X-Forwarded-For`, and `X-Forwarded-Proto: https` for HTTPS (nginx: `proxy_set_header
+X-Forwarded-For $proxy_add_x_forwarded_for;`). The agent treats a loopback request that
+carries no proxy header as local, so a proxy that adds none makes every client look local.
+
+### Upgrading from a release before pairing
+
+An agent that updates itself, or is updated with `-Action Update`, keeps its old service
+command line. That line has no `-pairing` flag, so the new agent requires pairing, and every
+dashboard shows the PIN form until it is paired. On Linux, a new binary under an old unit
+file does the same. Get a PIN as above. Devices that used
+`http://HOST:9099/` are sent to `https://` and see the certificate warning once.
+
+### Turning it off
+
+`-pairing off` (env `SYSMON_PAIRING=off`; on Windows, Install with `-Pairing off`) restores
+the open behaviour: every device that reaches the port can read the dashboard and use the
+Lock, mute and other controls, all over plain HTTP. Use it only where you trust every device
+that can reach the port.
 
 ---
 
@@ -155,6 +263,27 @@ agents on older releases still appear; a feature an older build lacks only blank
   (env `SYSMON_PEERS`), for machines outside Tailscale. The same list can go on every host;
   an entry pointing at the agent itself is dropped.
 
+### Hosts that require pairing
+
+A host that requires pairing refuses the agent your app was installed from until that agent
+is paired with it, so the host list shows it with a **Locked** badge. Choosing it asks for
+that host's PIN: get one on that host as in [Pair a device](#pair-a-device). The serving
+agent sends the PIN to the host, receives a token named `<serving host> relay`, keeps it in
+its own `pairing` folder, and sends it on every request it forwards to that host. The token
+never reaches the browser.
+
+- **The pairing belongs to the serving agent.** Every device paired with the serving agent
+  can then view that host and use its controls. To undo it, remove the `<serving host>
+  relay` entry on the host (its Paired devices panel, or `-pair-revoke <id>`).
+- A host reachable only over plain HTTP on the network is refused, since its PIN and token
+  would cross the network readable. Publish it with Tailscale Serve, or let its own HTTPS
+  answer.
+- For a host with its own certificate, the PIN dialog shows the certificate's SHA-256.
+  Compare it with the line `-pair` prints on that host before pairing. The serving agent
+  then accepts that certificate and no other for that host. If it changes, the host is
+  listed as locked with "certificate changed since it was paired", and pairing it again
+  takes a new PIN and another comparison.
+
 ### Network and safety
 
 - The dashboard names a host only by id. The agent looks the address up in its own list and
@@ -165,7 +294,7 @@ agents on older releases still appear; a feature an older build lacks only blank
   like a local one.
 - Between agents, a tailnet address keeps traffic inside Tailscale's encrypted tunnel. A
   pinned `http://` LAN address is plain HTTP on your LAN, the same as opening that agent
-  directly.
+  directly; a host that requires pairing answers it with its own HTTPS.
 - Discovery runs only when a dashboard asks for the host list (page load, opening the list,
   or a list over five minutes old), at most once every 10 seconds, with a 2.5-second timeout
   per request.
@@ -202,20 +331,22 @@ Above every page:
 <details>
 <summary><b>Run options &amp; endpoints</b></summary>
 
-Defaults bind all interfaces on port `9099` (good for a trusted LAN or a Tailscale network).
+Defaults bind all interfaces on port `9099`, with pairing required, so other devices get
+HTTPS and a PIN form ([Pairing](#pairing)).
 
 ```bash
-./sysmon-agent                                       # 0.0.0.0:9099
-./sysmon-agent -bind 127.0.0.1 -port 9099
-./sysmon-agent -settings ./settings.json
-./sysmon-agent -tls -cert ./cert.pem -key ./key.pem  # optional direct TLS (proxy is preferred)
+./sysmon-agent -settings ./settings.json             # 0.0.0.0:9099, pairings kept in ./pairing/
+./sysmon-agent -bind 127.0.0.1 -port 9099            # loopback only, for Tailscale Serve or a proxy
+./sysmon-agent -pair -settings ./settings.json       # print a PIN for the running agent, then exit
+./sysmon-agent -tls -cert ./cert.pem -key ./key.pem  # direct TLS with your own certificate
+./sysmon-agent -pairing off                          # open to every device, plain HTTP
 SYSMON_BIND=127.0.0.1 SYSMON_PORT=9099 ./sysmon-agent
 ```
 
 | Endpoint | Purpose |
 | --- | --- |
 | `/` | the dashboard |
-| `/healthz` | cheap process liveness |
+| `/healthz` | cheap process liveness (open without pairing) |
 | `/readyz` | proves metrics are actually collectable |
 | `/api/status` | agent metadata + active display settings |
 | `/api/metrics` | the live metrics payload |
@@ -228,10 +359,19 @@ SYSMON_BIND=127.0.0.1 SYSMON_PORT=9099 ./sysmon-agent
 | `/api/settings` | GET or POST display settings (dim, screen shift, update check) |
 | `/api/control` | POST a host control: mic, camera, media, speaker, lock |
 | `/api/update` | POST to self-update (Windows service only) |
+| `/api/pair/state` | whether this device is paired (open without pairing) |
+| `/api/pair` | POST a PIN and a device name to pair this device (HTTPS or this machine only) |
+| `/api/pair/devices` | GET the paired devices, or `DELETE /api/pair/devices/{id}` to remove one |
+| `/api/pair/window` | POST to show a PIN for another device |
+| `/api/pair/logout` | POST to unpair this device |
+| `/api/hosts/{id}/pair` | POST another host's PIN to pair this agent with it |
+
+With pairing required, every route except `/`, the dashboard's static files,
+`/healthz` and `/api/pair/state` answers `401` to a device that is not paired. Requests from
+the host itself to `127.0.0.1` may read without pairing.
 
 When bound to a wildcard like `0.0.0.0`, startup logs print likely dashboard URLs
-(Tailscale addresses first), skipping virtual/container interfaces. Open the port through
-the firewall only on trusted LAN or Tailscale networks.
+(Tailscale addresses first), skipping virtual/container interfaces.
 </details>
 
 <details>
@@ -250,7 +390,10 @@ value keeps the saved default.
 | `-refresh-ms` / `SYSMON_REFRESH_MS` | {250,500,1000,2000} | dashboard refresh interval |
 | `-cpu-warn` / `-mem-warn` / `-disk-warn` / `-gpu-warn` (`SYSMON_CPU_WARN`, …) | 50–90 | utilization warn thresholds (%) |
 | `-temp-warn` / `SYSMON_TEMP_WARN` | 50–90 (°C) | temperature warn threshold |
-| `-settings` / `SYSMON_SETTINGS` | path | optional JSON file for persisted settings |
+| `-settings` / `SYSMON_SETTINGS` | path | optional JSON file for persisted settings; pairings live in a `pairing` folder beside it |
+| `-pairing` / `SYSMON_PAIRING` | `required` (default), `off` | only paired devices reach data and controls, or every device does |
+| `-network-tls` / `SYSMON_NETWORK_TLS` | `auto` (default), `on`, `off` | HTTPS for other devices on the same port; `auto` is on when pairing is required and the bind is not loopback |
+| `-pair` / `-pair-list` / `-pair-revoke ID` / `-pair-token NAME` | | show a PIN, list or remove paired devices, or make a script token, for the agent using the same `-settings`, then exit |
 | `-claude-config-dir` / `SYSMON_CLAUDE_CONFIG_DIR` | path | Claude Code config dir for the AI usage page (default `$CLAUDE_CONFIG_DIR`, then `$HOME/.claude`; missing = Claude section hidden) |
 | `-claude-quota-poll` / `SYSMON_CLAUDE_QUOTA_POLL` | bool, off | also poll `api.anthropic.com` for quota instead of only reading local files |
 | `-codex-config-dir` / `SYSMON_CODEX_CONFIG_DIR` | path | Codex config dir for the AI usage page (default `$CODEX_HOME`, then `$HOME/.codex`; missing = Codex section hidden) |
@@ -259,7 +402,7 @@ value keeps the saved default.
 | `-peers` / `SYSMON_PEERS` | `[name=]URL,…` | other agents to list in the host picker |
 | `-peer-discovery` / `SYSMON_PEER_DISCOVERY` | bool, on | find agents on the tailnet when the host list is opened |
 | `-no-update-check` / `SYSMON_UPDATE_CHECK=0` | off | turn off the update check and self-update |
-| `-tls` / `SYSMON_TLS` | bool | enable direct TLS with `-cert`/`-key` (`SYSMON_CERT`/`SYSMON_KEY`) |
+| `-tls` / `SYSMON_TLS` | bool | serve TLS to every client with `-cert`/`-key` (`SYSMON_CERT`/`SYSMON_KEY`), this machine included |
 | `-self-check` / `-wait-health` / `-wait-ready` | bool | run in-process checks, or wait for a running agent's health or readiness, then exit |
 | `-version` | | print the version and exit |
 | `SYSMON_LHM_DAEMON` (Windows) | on | `0` uses the one-shot LibreHardwareMonitor bridge: slower, and no drive temperatures |
@@ -287,7 +430,12 @@ sudo install -m0755 sysmon-agent /usr/local/bin/sysmon-agent
 install -m0644 deploy/sysmon-agent.user.service ~/.config/systemd/user/sysmon-agent.service
 systemctl --user enable --now sysmon-agent.service
 sudo loginctl enable-linger "$USER"
+sysmon-agent -pair -settings ~/.local/state/sysmon-agent/settings.json   # a PIN for the first device
 ```
+
+Both units bind `127.0.0.1` for Tailscale Serve or a reverse proxy. For a system unit, run
+`-pair` as the unit's `User=` (`sudo -u YOUR_USERNAME sysmon-agent -pair -settings
+/var/lib/sysmon-agent/settings.json`): a PIN written by root is unreadable to the agent.
 
 [`run-linux.sh`](run-linux.sh) rebuilds, reinstalls to `/usr/local/bin`, and restarts the
 right unit. Don't add `ProtectSystem`/`PrivateDevices`/`ProtectKernelModules` — they break
@@ -329,7 +477,9 @@ integration — the same binary is both console app and service). From an elevat
 .\install-windows.ps1 -Action Install
 .\install-windows.ps1 -Action Install -TempWarn 85   # AMD: Tctl idles hot, 70 C warns constantly
 .\install-windows.ps1 -Action Install -TailscaleServe  # also publish https://<machine>.<tailnet>.ts.net:9443
-.\install-windows.ps1 -Action Status      # checks /readyz, reports settings, AI usage sources, Serve
+.\install-windows.ps1 -Action Pair        # a new pairing PIN (also: Start, Sysmon Agent, Pair a device)
+.\install-windows.ps1 -Action Install -Pairing off  # open to every device, as before pairing
+.\install-windows.ps1 -Action Status      # checks /readyz, reports settings, pairing, AI usage sources, Serve
 .\install-windows.ps1 -Action Update      # download + verify + swap + rollback
 .\install-windows.ps1 -Action Uninstall
 ```
@@ -357,6 +507,9 @@ production, or CPU power and board temps degrade.
 3. **Re-run the installer.** `SysmonAgent-Setup-<ver>.exe` stops the running service and
    waits for it to release the binary before overwriting, so upgrading in place works
    without uninstalling first.
+
+Coming from a release before pairing, see
+[Upgrading from a release before pairing](#upgrading-from-a-release-before-pairing).
 
 Self-update is confined to the **LocalSystem Windows service** — console runs and Linux
 hosts refuse it (HTTP 501) and should use the installer or the systemd/package path. Every
