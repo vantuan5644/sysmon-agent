@@ -130,9 +130,9 @@ data and control route answers `401 {"error":"pairing_required"}`. This is the d
 2. **Open the dashboard on the device** at one of the addresses `-pair` prints, enter the PIN
    and a name for the device.
 
-After the first one, a paired dashboard can pair more: **Paired devices → Pair another
-device** on its status page shows a new PIN. The same panel lists every paired device and
-removes any of them.
+After the first one, a paired dashboard can pair more: on its **More status** page (the
+second dot), **Paired devices → Pair another device** shows a new PIN. The same panel lists
+every paired device and removes any of them.
 
 An iPhone Home Screen app keeps its storage apart from Safari's, so pair it from inside the
 installed app. Browsers keep the pairing in a `sysmon_device` cookie (HttpOnly,

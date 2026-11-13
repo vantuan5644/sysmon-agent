@@ -216,7 +216,10 @@ func TestWindowsInstallerPairing(t *testing.T) {
 		"[ValidateSet('required', 'off')]\n    [string]$Pairing = 'required',",
 		`-settings $(Quote-Arg $SettingsPath) -pairing $Pairing"`,
 		`[switch]$PauseAtEnd`,
-		`'Pair' { Invoke-AgentPair }`,
+		`'Pair' { Use-ServiceEndpoint; Invoke-AgentPair }`,
+		`'Status' { Use-ServiceEndpoint; Show-Status }`,
+		`$script:GivenParameters = @($PSBoundParameters.Keys)`,
+		`on its More status page (the second dot),`,
 		`function Invoke-AgentPair`,
 		`function Invoke-AgentCommand`,
 		`Invoke-AgentCommand @('-pair')`,
@@ -292,6 +295,49 @@ $old = '"C:\Program Files\Sysmon Agent\sysmon-agent.exe" -bind "0.0.0.0" -port 9
 if ((Get-ServicePairingMode $old) -ne 'required') { throw 'an install from before pairing runs the agent default' }
 if ((Get-ServicePairingMode ($old + ' -pairing off')) -ne 'off') { throw 'off' }
 if ((Get-ServiceArgument '' 'settings') -ne $null) { throw 'empty' }
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, pwsh, "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell fixtures: %v: %s", err, out)
+	}
+}
+
+// Status and Pair run without -Port on a host whose service uses another one,
+// such as a second agent beside the first. They must read that service, and
+// list its own Tailscale Serve address rather than the agent's on 9099, while
+// a -Port the caller names still wins.
+func TestWindowsInstallerUsesServiceEndpoint(t *testing.T) {
+	pwsh, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("PowerShell 7 is needed to run the installer's functions")
+	}
+	data, err := os.ReadFile("install-windows.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := strings.ReplaceAll(string(data), "\r\n", "\n")
+	functions := sliceFunction(t, source, "Get-ServiceArgument") + "\n}\n" + sliceFunction(t, source, "Use-ServiceEndpoint") + "\n}\n"
+	script := `$ErrorActionPreference = 'Stop'
+` + functions + `
+$script:CommandLine = '"C:\Program Files\Sysmon Agent\sysmon-agent.exe" -bind "127.0.0.1" -port 9199 -settings "C:\ProgramData\SysmonAgentPublic\settings.json"'
+function Get-ServiceCommandLine { return $script:CommandLine }
+
+$script:Port = 9099; $script:Bind = '0.0.0.0'; $script:GivenParameters = @('Action')
+Use-ServiceEndpoint
+if ($Port -ne 9199) { throw "port: $Port" }
+if ($Bind -ne '127.0.0.1') { throw "bind: $Bind" }
+
+$script:Port = 9300; $script:Bind = '0.0.0.0'; $script:GivenParameters = @('Action', 'Port', 'Bind')
+Use-ServiceEndpoint
+if ($Port -ne 9300) { throw "a named -Port lost: $Port" }
+if ($Bind -ne '0.0.0.0') { throw "a named -Bind lost: $Bind" }
+
+$script:CommandLine = $null
+$script:Port = 9099; $script:Bind = '0.0.0.0'; $script:GivenParameters = @()
+Use-ServiceEndpoint
+if ($Port -ne 9099 -or $Bind -ne '0.0.0.0') { throw 'no service changed the defaults' }
 `
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

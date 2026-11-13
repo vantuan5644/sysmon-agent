@@ -98,6 +98,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# The parameters the caller named. Status and Pair take the rest of -Bind and
+# -Port from the installed service (Use-ServiceEndpoint).
+$script:GivenParameters = @($PSBoundParameters.Keys)
+
 function Assert-Admin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -1239,6 +1243,30 @@ function Get-ServiceCommandLine {
     return $null
 }
 
+# Use-ServiceEndpoint points Status and Pair at the installed service: a -Port
+# or -Bind the caller did not name comes from the service's command line. With
+# the script defaults they would read whatever answers on port 9099, or list
+# the Tailscale Serve address of another agent there, for a service that runs
+# on another port.
+function Use-ServiceEndpoint {
+    $commandLine = Get-ServiceCommandLine
+    if (-not $commandLine) {
+        return
+    }
+    if ($script:GivenParameters -notcontains 'Port') {
+        $value = Get-ServiceArgument $commandLine 'port'
+        if ($value -match '^\d+$') {
+            $script:Port = [int]$value
+        }
+    }
+    if ($script:GivenParameters -notcontains 'Bind') {
+        $value = Get-ServiceArgument $commandLine 'bind'
+        if ($value) {
+            $script:Bind = $value
+        }
+    }
+}
+
 # Get-ServiceArgument reads one flag from the installed service's command line,
 # so Pair and Status act on the folder and port the service really uses rather
 # than on this script's defaults.
@@ -1368,7 +1396,8 @@ function Invoke-AgentPair {
         Invoke-AgentCommand @('-pair')
         Show-TailscaleServeAdvice
         Write-Host ''
-        Write-Host 'A paired dashboard can pair more devices: Settings, Paired devices, Pair another device.'
+        Write-Host 'A paired dashboard can pair more devices: on its More status page (the second dot),'
+        Write-Host 'Paired devices, Pair another device.'
     } finally {
         if ($PauseAtEnd) {
             Write-Host ''
@@ -1885,9 +1914,9 @@ try {
     switch ($Action) {
         'Install' { Install-Agent }
         'Uninstall' { Uninstall-Agent }
-        'Status' { Show-Status }
+        'Status' { Use-ServiceEndpoint; Show-Status }
         'Update' { Update-Agent }
-        'Pair' { Invoke-AgentPair }
+        'Pair' { Use-ServiceEndpoint; Invoke-AgentPair }
     }
 } catch {
     # Surface a clear, non-zero exit only for genuine failures (cannot register
