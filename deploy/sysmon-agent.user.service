@@ -15,6 +15,9 @@
 #   systemctl --user enable --now sysmon-agent.service
 #   sudo loginctl enable-linger "$USER"   # also run at boot, before/without login
 #
+# Pair a device (pairing is on by default; see "Pairing" in README.md):
+#   sysmon-agent -pair -settings ~/.local/state/sysmon-agent/settings.json
+#
 # Controls also need: wireplumber (wpctl) or pulseaudio (pactl), playerctl,
 # and a session that honors loginctl lock-session (KDE/GNOME Wayland do).
 Description=System Monitor Agent (sysmon-agent, user session)
@@ -26,8 +29,12 @@ Type=simple
 Environment=SYSMON_BIND=127.0.0.1
 Environment=SYSMON_PORT=9099
 Environment=SYSMON_START_READY_TIMEOUT=20s
+# Only devices paired with a PIN reach the dashboard's data and controls. off
+# opens them to every device that reaches the port, as before pairing existed.
+#Environment=SYSMON_PAIRING=off
 
-# For a user unit, StateDirectory is created under $XDG_STATE_HOME (~/.local/state)
+# For a user unit, StateDirectory is created under $XDG_STATE_HOME (~/.local/state).
+# Paired devices and the agent's certificate live in its pairing/ folder.
 StateDirectory=sysmon-agent
 Environment=SYSMON_SETTINGS=%S/sysmon-agent/settings.json
 

@@ -6,7 +6,8 @@
 ;   - elevates (RequestExecutionLevel admin) and runs install-windows.ps1,
 ;     which registers + starts the SysmonAgent service, opens the firewall,
 ;     and waits for /readyz
-;   - adds Start Menu / Desktop shortcuts to the dashboard
+;   - adds Start Menu / Desktop shortcuts to the dashboard, and a Start Menu
+;     "Pair a device" shortcut that prints a new pairing PIN
 ;   - registers a clean uninstaller (Add/Remove Programs)
 ;
 ; The installer REUSES the existing install-windows.ps1 for all service /
@@ -58,6 +59,10 @@ InstallDirRegKey HKLM "${REGKEY}" "InstallDir"
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
+; Stay on the install log when it finishes: install-windows.ps1 ends it with the
+; pairing PIN for the first device, which an auto-advance would hide.
+!define MUI_FINISHPAGE_NOAUTOCLOSE
+!define MUI_FINISHPAGE_TEXT "Sysmon Agent is installed.$\r$\n$\r$\nOther devices see its data only once they are paired. The PIN for the first one was at the end of the install log. For another PIN later, open Start, Sysmon Agent, Pair a device, or use Pair another device on a dashboard that is already paired."
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_WELCOME
@@ -166,6 +171,9 @@ Section "Start Menu shortcut" SecStartMenu
   WriteINIStr "$SMPROGRAMS\${APPNAME}\${APPNAME} Dashboard.url" "InternetShortcut" "URL" "${SERVICE_URL}"
   WriteINIStr "$SMPROGRAMS\${APPNAME}\${APPNAME} Dashboard.url" "InternetShortcut" "IconFile" "$INSTDIR\sysmon-agent.exe"
   WriteINIStr "$SMPROGRAMS\${APPNAME}\${APPNAME} Dashboard.url" "InternetShortcut" "IconIndex" "0"
+  ; Prints a new 10-minute pairing PIN. The script asks for elevation itself
+  ; and waits for Enter, so the PIN stays on screen.
+  CreateShortCut "$SMPROGRAMS\${APPNAME}\Pair a device.lnk" "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-windows.ps1" -Action Pair -PauseAtEnd' "$INSTDIR\sysmon-agent.exe" 0
 SectionEnd
 
 Section "Desktop shortcut" SecDesktop
@@ -211,6 +219,7 @@ Section "Uninstall"
   RMDir "$INSTDIR"
 
   Delete "$SMPROGRAMS\${APPNAME}\${APPNAME} Dashboard.url"
+  Delete "$SMPROGRAMS\${APPNAME}\Pair a device.lnk"
   RMDir  "$SMPROGRAMS\${APPNAME}"
   Delete "$DESKTOP\${APPNAME} Dashboard.url"
 

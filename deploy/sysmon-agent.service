@@ -21,6 +21,10 @@
 #
 # Publish to the tailnet for the PWA (recommended):
 #   sudo tailscale serve --bg --https=9443 http://127.0.0.1:9099
+#
+# Pair a device (pairing is on by default; see "Pairing" in README.md). Run it
+# as the User= below, since a PIN written by root is unreadable to the agent:
+#   sudo -u YOUR_USERNAME sysmon-agent -pair -settings /var/lib/sysmon-agent/settings.json
 Description=System Monitor Agent (sysmon-agent)
 After=network-online.target
 Wants=network-online.target
@@ -36,8 +40,12 @@ User=YOUR_USERNAME
 Environment=SYSMON_BIND=127.0.0.1
 Environment=SYSMON_PORT=9099
 Environment=SYSMON_START_READY_TIMEOUT=20s
+# Only devices paired with a PIN reach the dashboard's data and controls. off
+# opens them to every device that reaches the port, as before pairing existed.
+#Environment=SYSMON_PAIRING=off
 
-# systemd creates/owns /var/lib/sysmon-agent for the User above (path-agnostic state)
+# systemd creates/owns /var/lib/sysmon-agent for the User above (path-agnostic state).
+# Paired devices and the agent's certificate live in its pairing/ folder.
 StateDirectory=sysmon-agent
 Environment=SYSMON_SETTINGS=/var/lib/sysmon-agent/settings.json
 

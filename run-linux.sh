@@ -21,6 +21,11 @@
 #   ./run-linux.sh -p 9100         # override port (default 9099)
 #   ./run-linux.sh -b 0.0.0.0      # override bind (default 127.0.0.1)
 #
+# The foreground run uses the installed unit's settings path (or
+# SYSMON_SETTINGS), so its paired devices are the service's, and `-pair` with
+# that path gives a PIN for it. SYSMON_PAIRING=off in the environment turns
+# pairing off for the foreground run.
+#
 # Scope auto-detects from the installed unit when -s/-u are not given.
 set -euo pipefail
 
@@ -31,6 +36,7 @@ INSTALL_PATH="${SYSMON_INSTALL_PATH:-/usr/local/bin/sysmon-agent}"
 BIND="${SYSMON_BIND:-127.0.0.1}"
 PORT="${SYSMON_PORT:-9099}"
 READY_TIMEOUT="${SYSMON_WAIT_READY:-15s}"
+SETTINGS="${SYSMON_SETTINGS:-}"
 SCOPE=""
 NO_BUILD=0
 FOREGROUND=0
@@ -82,6 +88,26 @@ if [[ -z "$SCOPE" ]]; then
     fi
 fi
 
+# The settings path the units use, so a foreground run shares the service's
+# paired devices.
+if [[ -z "$SETTINGS" ]]; then
+    case "$SCOPE" in
+        user)   SETTINGS="${XDG_STATE_HOME:-$HOME/.local/state}/sysmon-agent/settings.json" ;;
+        system) SETTINGS=/var/lib/sysmon-agent/settings.json ;;
+    esac
+fi
+
+pair_hint() {
+    [[ -n "$SETTINGS" ]] || return 0
+    local prefix=""
+    if [[ "$SCOPE" == system ]]; then
+        local unit_user
+        unit_user="$(systemctl show -p User --value sysmon-agent.service 2>/dev/null || true)"
+        [[ -n "$unit_user" && "$unit_user" != "$(id -un)" ]] && prefix="sudo -u $unit_user "
+    fi
+    echo "    pair a device: ${prefix}$INSTALL_PATH -pair -settings $SETTINGS"
+}
+
 # sc runs systemctl in the resolved scope (sudo only for the system manager).
 sc() {
     if [[ "$SCOPE" == user ]]; then
@@ -121,8 +147,9 @@ if [[ "$FOREGROUND" -eq 1 ]]; then
         sc stop sysmon-agent.service || true
         trap 'echo; echo "==> Restarting service ($SCOPE)"; sc restart sysmon-agent.service' EXIT
     fi
-    echo "==> Foreground (Ctrl+C to stop): $INSTALL_PATH -bind $BIND -port $PORT"
-    "$INSTALL_PATH" -bind "$BIND" -port "$PORT"
+    echo "==> Foreground (Ctrl+C to stop): $INSTALL_PATH -bind $BIND -port $PORT${SETTINGS:+ -settings $SETTINGS}"
+    pair_hint
+    "$INSTALL_PATH" -bind "$BIND" -port "$PORT" ${SETTINGS:+-settings "$SETTINGS"}
     exit 0
 fi
 
@@ -139,6 +166,7 @@ sc restart sysmon-agent.service
 echo "==> Waiting for readiness (timeout $READY_TIMEOUT)"
 if "$INSTALL_PATH" -wait-ready -bind "$BIND" -port "$PORT" -wait-ready-timeout "$READY_TIMEOUT"; then
     echo "    ready: http://$BIND:$PORT/"
+    pair_hint
 else
     echo "    NOT ready - inspect with: $(journal_hint)" >&2
     exit 1

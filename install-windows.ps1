@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Install', 'Uninstall', 'Status', 'Update')]
+    [ValidateSet('Install', 'Uninstall', 'Status', 'Update', 'Pair')]
     [string]$Action = 'Install',
 
     [ValidatePattern('^[A-Za-z0-9_.-]+$')]
@@ -11,6 +11,18 @@ param(
     [ValidateRange(1, 300)]
     [int]$ReadinessTimeoutSeconds = 45,
     [string]$SettingsPath = "$env:ProgramData\SysmonAgent\settings.json",
+    # Device pairing. required (the default) shows this host's data and
+    # controls only to devices paired with a PIN: Install prints one at the end,
+    # -Action Pair prints a new one, and a paired dashboard can pair more.
+    # Other devices then reach the agent over HTTPS on the same port, with a
+    # certificate the agent makes itself, so browsers warn once unless they come
+    # through Tailscale Serve. off lets anyone who reaches the port read and
+    # control this host, as before pairing existed.
+    [ValidateSet('required', 'off')]
+    [string]$Pairing = 'required',
+    # Pair-only: wait for Enter before the window closes. The Start menu
+    # shortcut uses it, so the PIN stays on screen.
+    [switch]$PauseAtEnd,
     # Warn threshold for cpu_temperature, in Celsius (50-90; 0 keeps whatever
     # is already saved). The 70 default suits a package or die reading, but on
     # AMD the canonical sensor is Tctl, a control temperature that short
@@ -111,7 +123,7 @@ function Quote-Arg([string]$Value) {
 
 function Get-BinaryPath {
     $agent = Get-AgentPath
-    $binPath = "$(Quote-Arg $agent) -bind $(Quote-Arg $Bind) -port $Port -settings $(Quote-Arg $SettingsPath)"
+    $binPath = "$(Quote-Arg $agent) -bind $(Quote-Arg $Bind) -port $Port -settings $(Quote-Arg $SettingsPath) -pairing $Pairing"
     if ($ClaudeConfigDir) {
         $binPath += " -claude-config-dir $(Quote-Arg $ClaudeConfigDir)"
         # Nested deliberately: the quota checker returns early without a config
@@ -295,6 +307,18 @@ function Get-CandidateDeviceHosts {
         ForEach-Object { $_.Host }
 }
 
+function Test-LoopbackBind([string]$Value) {
+    $hostValue = $Value.Trim().Trim('[', ']').ToLowerInvariant()
+    return $hostValue -eq 'localhost' -or $hostValue -eq '::1' -or $hostValue.StartsWith('127.')
+}
+
+# Test-NetworkTls mirrors the agent's -network-tls auto: with pairing required
+# and a bind other devices can reach, they get HTTPS on the same port, and
+# plain HTTP stays for this machine only.
+function Test-NetworkTls {
+    return $Pairing -eq 'required' -and -not (Test-LoopbackBind $Bind)
+}
+
 function Get-DeviceUrls {
     $bindHost = $Bind.Trim('[', ']')
     switch ($bindHost.ToLowerInvariant()) {
@@ -307,21 +331,25 @@ function Get-DeviceUrls {
         '::1' { $hosts = @() }
         default { $hosts = @($bindHost) }
     }
+    $scheme = if (Test-NetworkTls) { 'https' } else { 'http' }
     $hosts |
         Where-Object { Test-UsableDeviceHost $_ } |
         Select-Object -First 5 |
-        ForEach-Object { "http://$(Format-UrlHost $_):$Port/" }
+        ForEach-Object { "${scheme}://$(Format-UrlHost $_):$Port/" }
 }
 
 function Show-DeviceHandoff {
-    Write-Host ''
-    Write-Host 'Sysmon device URLs:'
-    $urls = @(Get-DeviceUrls)
-    if ($urls.Count -gt 0) {
-        $urls | ForEach-Object { Write-Host "  $_" }
-    } else {
-        Write-Host '  No direct LAN URL detected for the current bind address.'
-        Write-Host '  Use -Bind 0.0.0.0 on a trusted LAN, or pass -DeviceUrl to verify-deployed-windows.ps1.'
+    param([switch]$SkipUrls)
+    if (-not $SkipUrls) {
+        Write-Host ''
+        Write-Host 'Sysmon device URLs:'
+        $urls = @(Get-DeviceUrls)
+        if ($urls.Count -gt 0) {
+            $urls | ForEach-Object { Write-Host "  $_" }
+        } else {
+            Write-Host '  No direct LAN URL detected for the current bind address.'
+            Write-Host '  Use -Bind 0.0.0.0 to reach it from other devices, or pass -DeviceUrl to verify-deployed-windows.ps1.'
+        }
     }
 
     Write-Host ''
@@ -408,11 +436,23 @@ function Wait-AgentReadyAdvisory {
     # readiness window while sensor drivers load, so a slow warmup must not fail
     # the install (and force a manual re-run); the service self-heals and its
     # recovery actions restart it if it ever crashes.
+    if (Test-SingleNetworkBind) {
+        Write-Host "Readiness check skipped: with pairing required, the agent on $Bind answers only paired devices. Status checks need -Bind 0.0.0.0 or a loopback bind."
+        return
+    }
     try {
         Wait-AgentReady
     } catch {
         Write-Warning "The service is installed and running, but did not report ready within ${ReadinessTimeoutSeconds}s. This is normal on the first boot while sensor drivers load; it should become ready shortly. Check 'install-windows.ps1 -Action Status' if it does not. Details: $($_.Exception.Message)"
     }
+}
+
+# Test-SingleNetworkBind: bound to one network address, the agent has no
+# loopback listener, and with pairing required it shows data on a network
+# address only to paired devices, so this script cannot read it.
+function Test-SingleNetworkBind {
+    $healthHost = Resolve-HealthHost
+    return (Test-NetworkTls) -and -not (Test-LoopbackBind $healthHost)
 }
 
 function Show-AgentReadiness {
@@ -1185,6 +1225,195 @@ function Show-TailscaleServeStatus {
     Write-Warning "Tailscale Serve does not publish this agent. Home Screen apps and other agents expect https://<machine>.<tailnet>.ts.net:$TailscaleServePort/. Fix: re-run Install with -TailscaleServe."
 }
 
+function Test-IsAdmin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-ServiceCommandLine {
+    $service = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+    if ($service) {
+        return [string]$service.PathName
+    }
+    return $null
+}
+
+# Get-ServiceArgument reads one flag from the installed service's command line,
+# so Pair and Status act on the folder and port the service really uses rather
+# than on this script's defaults.
+function Get-ServiceArgument([string]$CommandLine, [string]$Flag) {
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        return $null
+    }
+    $pattern = '(?:^|\s)-{1,2}' + [regex]::Escape($Flag) + '(?:=|\s+)(?:"([^"]*)"|(\S+))'
+    $match = [regex]::Match($CommandLine, $pattern)
+    if (-not $match.Success) {
+        return $null
+    }
+    if ($match.Groups[1].Success) {
+        return $match.Groups[1].Value
+    }
+    return $match.Groups[2].Value
+}
+
+# Get-ServicePairingMode is what the service runs with: its -pairing flag, or
+# the agent's own default (required) when the command line has none, as on an
+# install made before pairing existed.
+function Get-ServicePairingMode([string]$CommandLine) {
+    $mode = Get-ServiceArgument $CommandLine 'pairing'
+    if ([string]::IsNullOrWhiteSpace($mode)) {
+        return 'required'
+    }
+    return $mode.ToLowerInvariant()
+}
+
+# Invoke-AgentCommand runs one of the installed agent's pairing flags with the
+# service's own settings, bind and port, and prints what it says. Native stderr
+# under ErrorActionPreference=Stop throws in Windows PowerShell 5.1, so it runs
+# with Continue and is judged by its exit code.
+function Invoke-AgentCommand([string[]]$Arguments) {
+    $commandLine = Get-ServiceCommandLine
+    if (-not $commandLine) {
+        throw "Service $ServiceName is not installed. Run -Action Install first."
+    }
+    $agent = Get-InstalledExePath
+    if (-not $agent -or -not (Test-Path -LiteralPath $agent)) {
+        throw "Could not find the agent executable of service $ServiceName."
+    }
+    $settings = Get-ServiceArgument $commandLine 'settings'
+    if ([string]::IsNullOrWhiteSpace($settings)) {
+        throw "Service $ServiceName runs without -settings, so its paired devices live in memory only and cannot be changed from here. Re-run Install to give it a settings path."
+    }
+    $all = @($Arguments) + @('-settings', $settings, '-pairing', (Get-ServicePairingMode $commandLine))
+    foreach ($flag in 'bind', 'port', 'network-tls') {
+        $value = Get-ServiceArgument $commandLine $flag
+        if ($value) {
+            $all += @("-$flag", $value)
+        }
+    }
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $agent @all 2>&1 | ForEach-Object { Write-Host "$_" }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($exitCode -ne 0) {
+        throw "sysmon-agent $($Arguments -join ' ') failed with exit code $exitCode."
+    }
+}
+
+# Test-TailscaleServePortTaken is true when Serve already answers on
+# -TailscaleServePort, for something other than this agent: -TailscaleServe
+# would replace it.
+function Test-TailscaleServePortTaken([string]$TailscaleCli) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $raw = & $TailscaleCli serve status --json 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $raw) {
+            return $false
+        }
+        $config = ($raw -join "`n") | ConvertFrom-Json
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    return [bool]($config.TCP -and $config.TCP.PSObject.Properties[[string]$TailscaleServePort])
+}
+
+function Show-TailscaleServeAdvice {
+    $tailscale = Find-TailscaleCli
+    if (-not $tailscale) {
+        return
+    }
+    $urls = @(Get-TailscaleServeUrls $tailscale)
+    Write-Host ''
+    if ($urls.Count -gt 0) {
+        Write-Host 'Over Tailscale Serve, with a certificate browsers already trust:'
+        $urls | ForEach-Object { Write-Host "  $_" }
+        return
+    }
+    Write-Host 'Tailscale is installed. For an https address that browsers trust without a warning,'
+    Write-Host 'which an iPhone Home Screen app also needs, publish the agent on your tailnet by'
+    Write-Host 're-running Install with the same options as before, plus:'
+    if (Test-TailscaleServePortTaken $tailscale) {
+        Write-Host "  -TailscaleServe -TailscaleServePort <a free port>   (HTTPS port $TailscaleServePort already serves something else)"
+    } else {
+        Write-Host '  -TailscaleServe'
+    }
+}
+
+# Invoke-AgentPair opens a 10-minute pairing window on the running service and
+# prints its PIN. Started from the Start menu shortcut, it asks for elevation.
+function Invoke-AgentPair {
+    if (-not (Test-IsAdmin)) {
+        if ($PauseAtEnd) {
+            $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Quote-Arg $PSCommandPath),
+                '-Action', 'Pair', '-ServiceName', $ServiceName, '-PauseAtEnd')
+            Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $arguments
+            return
+        }
+        Assert-Admin
+    }
+    try {
+        $mode = Get-ServicePairingMode (Get-ServiceCommandLine)
+        if ($mode -eq 'off') {
+            Write-Warning "Pairing is off for $ServiceName, so any device that reaches it sees its data and controls without a PIN. Re-run Install without -Pairing off to require pairing."
+            return
+        }
+        Invoke-AgentCommand @('-pair')
+        Show-TailscaleServeAdvice
+        Write-Host ''
+        Write-Host 'A paired dashboard can pair more devices: Settings, Paired devices, Pair another device.'
+    } finally {
+        if ($PauseAtEnd) {
+            Write-Host ''
+            Read-Host 'Press Enter to close' | Out-Null
+        }
+    }
+}
+
+function Show-PairingStatus {
+    if (Test-SingleNetworkBind) {
+        Write-Host "Pairing: required. Bound to $Bind, the agent cannot be read from here."
+        return
+    }
+    $stateUrl = "$(Get-AgentBaseUrl)/api/pair/state"
+    try {
+        $state = Invoke-RestMethod -Method Get -Uri $stateUrl -TimeoutSec 5
+    } catch {
+        $code = $null
+        if ($_.Exception.Response) {
+            $code = [int]$_.Exception.Response.StatusCode
+        }
+        if ($code -eq 404) {
+            Write-Host 'Pairing: this agent predates pairing, so any device that reaches the port sees its data.'
+        } else {
+            Write-Warning "Pairing check failed at ${stateUrl}: $($_.Exception.Message)"
+        }
+        return
+    }
+    if ($state.pairing -ne 'required') {
+        Write-Warning "Pairing: $($state.pairing). Any device that reaches the port sees this host's data and controls. Re-run Install without -Pairing off to require pairing."
+        return
+    }
+    $window = if ($state.window_open) { 'a pairing window is open' } else { 'no pairing window is open' }
+    Write-Host "Pairing: required, $window. New PIN: install-windows.ps1 -Action Pair"
+    if (Test-IsAdmin) {
+        try {
+            Invoke-AgentCommand @('-pair-list')
+        } catch {
+            Write-Warning "Could not list paired devices: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Host '  Run Status elevated to list the paired devices.'
+    }
+}
+
 function Install-Agent {
     Assert-Admin
 
@@ -1235,7 +1464,22 @@ function Install-Agent {
     Get-Service -Name $ServiceName
     Show-LhmLibraryStatus
     Show-PwshStatus
-    Show-DeviceHandoff
+    if ($Pairing -ne 'required') {
+        Show-DeviceHandoff
+        Write-Warning "Pairing is off: any device that reaches port $Port sees this host's data and can use its controls. Re-run Install without -Pairing off to require pairing."
+        return
+    }
+    # The PIN goes last, where the setup wizard's log ends. -pair lists the
+    # device URLs itself.
+    Show-DeviceHandoff -SkipUrls
+    Write-Host ''
+    Write-Host 'Pair your first device:'
+    try {
+        Invoke-AgentPair
+    } catch {
+        Write-Warning "The service is installed, but no pairing PIN could be made. Run install-windows.ps1 -Action Pair from an elevated PowerShell. Details: $($_.Exception.Message)"
+        Show-DeviceHandoff
+    }
 }
 
 function Uninstall-Agent {
@@ -1266,6 +1510,7 @@ function Show-Status {
         Show-LhmLibraryStatus
         Show-PwshStatus
         Show-DashboardSettings
+        Show-PairingStatus
         Show-GpuGuardStatus
         Show-QuotaStatus
         Show-CodexUsageStatus
@@ -1624,6 +1869,15 @@ function Update-Agent {
     Show-LhmLibraryStatus
     Show-PwshStatus
     Show-DashboardSettings
+    Show-PairingStatus
+    # An install from before pairing has no -pairing flag, so the new agent
+    # applies its default and every dashboard asks for a PIN.
+    if (-not (Get-ServiceArgument (Get-ServiceCommandLine) 'pairing')) {
+        Write-Host ''
+        Write-Host 'This agent now requires pairing: each dashboard shows a PIN form until it is paired.'
+        Write-Host 'Get a PIN with:  install-windows.ps1 -Action Pair'
+        Write-Host 'To keep it open as before, re-run Install with -Pairing off.'
+    }
 }
 
 
@@ -1633,6 +1887,7 @@ try {
         'Uninstall' { Uninstall-Agent }
         'Status' { Show-Status }
         'Update' { Update-Agent }
+        'Pair' { Invoke-AgentPair }
     }
 } catch {
     # Surface a clear, non-zero exit only for genuine failures (cannot register

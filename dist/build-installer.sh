@@ -105,7 +105,7 @@ echo "    sums:  $SUMS"
 sed 's/^/           /' "$SUMS"
 echo
 echo "    Test on a Windows host: double-click to install, then open"
-echo "    http://localhost:9099/  (or your PC's LAN IP from a phone)."
+echo "    http://localhost:9099/  (from a phone: https://<PC's LAN IP>:9099/ and the PIN the install log ends with)."
 echo
 echo "    Publish ALL THREE assets - the update engines refuse a release"
 echo "    without SHA256SUMS.txt:"

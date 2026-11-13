@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWindowsInstallerDefaults(t *testing.T) {
@@ -44,7 +47,7 @@ func TestWindowsInstallerDefaults(t *testing.T) {
 		`function Get-DeviceUrls`,
 		`function Show-DeviceHandoff`,
 		`Get-NetIPAddress`,
-		`http://$(Format-UrlHost $_):$Port/`,
+		`${scheme}://$(Format-UrlHost $_):$Port/`,
 		`Sysmon device URLs:`,
 		`Final Sysmon device verification:`,
 		`.\verify-deployed-windows.ps1 -HoldSeconds 120`,
@@ -171,7 +174,7 @@ func TestWindowsInstallerUpdateAction(t *testing.T) {
 	}
 	script := string(data)
 	for _, needle := range []string{
-		`[ValidateSet('Install', 'Uninstall', 'Status', 'Update')]`,
+		`[ValidateSet('Install', 'Uninstall', 'Status', 'Update', 'Pair')]`,
 		`[string]$UpdateVersion`,
 		`[switch]$Force`,
 		`[switch]$DryRun`,
@@ -196,6 +199,105 @@ func TestWindowsInstallerUpdateAction(t *testing.T) {
 	}
 	if t.Failed() {
 		t.FailNow()
+	}
+}
+
+// The public installer requires pairing by default: the service gets
+// -pairing required, Install ends with a PIN, -Action Pair makes another, and
+// Status and Update say what the agent runs with. Every flag the installer hands
+// the agent must be one the agent defines, or the service would not start.
+func TestWindowsInstallerPairing(t *testing.T) {
+	data, err := os.ReadFile("install-windows.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(string(data), "\r\n", "\n")
+	for _, needle := range []string{
+		"[ValidateSet('required', 'off')]\n    [string]$Pairing = 'required',",
+		`-settings $(Quote-Arg $SettingsPath) -pairing $Pairing"`,
+		`[switch]$PauseAtEnd`,
+		`'Pair' { Invoke-AgentPair }`,
+		`function Invoke-AgentPair`,
+		`function Invoke-AgentCommand`,
+		`Invoke-AgentCommand @('-pair')`,
+		`Invoke-AgentCommand @('-pair-list')`,
+		`Start-Process -FilePath 'powershell.exe' -Verb RunAs`,
+		`function Show-PairingStatus`,
+		`function Show-TailscaleServeAdvice`,
+		`function Test-NetworkTls`,
+		`$scheme = if (Test-NetworkTls) { 'https' } else { 'http' }`,
+		`Show-DeviceHandoff -SkipUrls`,
+		`Pair your first device:`,
+		`This agent now requires pairing`,
+	} {
+		if !strings.Contains(script, needle) {
+			t.Errorf("install-windows.ps1 missing %q", needle)
+		}
+	}
+	// The PIN is the last thing Install prints, so it is what the setup
+	// wizard's log ends on.
+	install := script[strings.Index(script, "function Install-Agent"):]
+	install = install[:strings.Index(install, "\nfunction ")]
+	if !strings.HasSuffix(strings.TrimSpace(install[:strings.LastIndex(install, "Invoke-AgentPair")]), "try {") {
+		t.Errorf("Install-Agent does not end with the pairing PIN")
+	}
+
+	mainGo, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, flag := range []string{"pairing", "pair", "pair-list", "network-tls", "settings", "bind", "port"} {
+		if !regexp.MustCompile(`flag\.[A-Za-z]+\("` + regexp.QuoteMeta(flag) + `"`).Match(mainGo) {
+			t.Errorf("install-windows.ps1 passes -%s, which main.go does not define", flag)
+		}
+	}
+
+	nsis, err := os.ReadFile("dist/installer.nsi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{
+		`!define MUI_FINISHPAGE_NOAUTOCLOSE`,
+		`Pair a device.lnk`,
+		`-Action Pair -PauseAtEnd`,
+	} {
+		if !strings.Contains(string(nsis), needle) {
+			t.Errorf("dist/installer.nsi missing %q", needle)
+		}
+	}
+}
+
+// Pair and Status read the service's own command line, which sc.exe stores
+// with each value quoted the way Get-BinaryPath wrote it.
+func TestWindowsInstallerReadsServiceArguments(t *testing.T) {
+	pwsh, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("PowerShell 7 is needed to run the installer's functions")
+	}
+	data, err := os.ReadFile("install-windows.ps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := strings.ReplaceAll(string(data), "\r\n", "\n")
+	functions := sliceFunction(t, source, "Get-ServiceArgument") + "\n}\n" + sliceFunction(t, source, "Get-ServicePairingMode") + "\n}\n"
+	script := `$ErrorActionPreference = 'Stop'
+` + functions + `
+$line = '"C:\Program Files\Sysmon Agent\sysmon-agent.exe" -bind "0.0.0.0" -port 9199 -settings "C:\ProgramData\Sysmon Agent Two\settings.json" -pairing required -gpu-guard off'
+if ((Get-ServiceArgument $line 'settings') -ne 'C:\ProgramData\Sysmon Agent Two\settings.json') { throw 'settings' }
+if ((Get-ServiceArgument $line 'bind') -ne '0.0.0.0') { throw 'bind' }
+if ((Get-ServiceArgument $line 'port') -ne '9199') { throw 'port' }
+if ((Get-ServiceArgument $line 'pair') -ne $null) { throw '-pair matched -pairing' }
+if ((Get-ServicePairingMode $line) -ne 'required') { throw 'mode' }
+$old = '"C:\Program Files\Sysmon Agent\sysmon-agent.exe" -bind "0.0.0.0" -port 9099 -settings "C:\ProgramData\SysmonAgent\settings.json"'
+if ((Get-ServicePairingMode $old) -ne 'required') { throw 'an install from before pairing runs the agent default' }
+if ((Get-ServicePairingMode ($old + ' -pairing off')) -ne 'off') { throw 'off' }
+if ((Get-ServiceArgument '' 'settings') -ne $null) { throw 'empty' }
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, pwsh, "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell fixtures: %v: %s", err, out)
 	}
 }
 
@@ -268,7 +370,7 @@ func TestWindowsInstallerGPUGuard(t *testing.T) {
 		`$binPath += " -gpu-guard-spare $(Quote-Arg $GpuGuardSpare)"`,
 		`must be below -GpuHotspotCrit ($effectiveCrit).`,
 		`function Show-GpuGuardStatus`,
-		"Show-DashboardSettings\n        Show-GpuGuardStatus\n",
+		"Show-DashboardSettings\n        Show-PairingStatus\n        Show-GpuGuardStatus\n",
 	} {
 		if !strings.Contains(script, needle) {
 			t.Errorf("install-windows.ps1 missing %q", needle)
