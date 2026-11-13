@@ -516,8 +516,8 @@ LocalSystem does not share your `PATH`.
 <summary><b>NVIDIA GPU hotspot temperature</b></summary>
 
 The GPU card adds `Hotspot NN°C` to its detail line when the hotspot sensor can be read
-(`gpu.devices[].hotspot_temperature_celsius` in `/api/metrics`). It has no warning threshold
-yet.
+(`gpu.devices[].hotspot_temperature_celsius` in `/api/metrics`). The span is coloured at the
+GPU overheat guard's warn and critical lines (below), which are what raise the alarms.
 
 **Windows** needs nothing extra: the LibreHardwareMonitor bridge already reads `GPU Hot Spot`.
 When two GPUs share a model name the reading stays unavailable, rather than risk showing it
@@ -549,6 +549,71 @@ Two kernel settings can stand in the way, and the dry-run reports both:
   script prints the change to make by hand. Either way, reboot to activate it.
 - Kernel lockdown, usually turned on by Secure Boot, blocks `/dev/mem` outright. The script
   warns about it and leaves it alone.
+</details>
+
+<details>
+<summary><b>GPU overheat guard (NVIDIA)</b></summary>
+
+The agent checks the NVIDIA hotspot every 2 seconds, whether or not a dashboard is open, and
+publishes the result as `gpu_guard` in `/api/metrics`.
+
+| Level | When (defaults) | What happens |
+|---|---|---|
+| warn | hotspot at 90 °C or more for 3 samples | alerts chip on every dashboard page, hotspot coloured, desktop notification |
+| warn | hotspot 20 °C or more above the core for 60 s at 150 W or more | the same, as "poor thermal contact?" |
+| critical | hotspot at 95 °C or more for 3 samples | full-screen alarm on the dashboard, alarm on the host, the action below |
+
+A large hotspot-to-core gap under load usually means the thermal paste has pumped out or the
+cooler has lost contact; a healthy RTX 4090 runs about 10 °C apart. Without a hotspot reading the
+guard judges the core temperature instead, with warn at 83 °C and critical at 88 °C, and says
+so in the issues panel.
+
+`-gpu-guard` picks what it does:
+
+- `warn` (the default): alarms only. The log shows what `act` would have done.
+- `act`: the alarms, then at critical the power limit drops to the card's minimum, and if it is
+  still critical 10 seconds later every process using the GPU is ended, again every 10 seconds
+  while it stays critical. The desktop, terminals, sysmon and streaming hosts (Sunshine,
+  Apollo) are spared; add names with `-gpu-guard-spare`. The previous limit, including one you
+  set yourself, comes back after 5 minutes below 80 °C.
+- `off`.
+
+Tune the lines with `-gpu-hotspot-warn` (70-105), `-gpu-hotspot-crit` (80-110) and
+`-gpu-delta-warn` (10-40). The full-screen alarm hides for 60 seconds on a tap and comes back
+while the GPU stays critical; it follows the host the dashboard is showing.
+
+**Windows.** The service does all of it as LocalSystem. Pass the settings to the installer,
+which rebuilds the service command line on every install:
+
+```powershell
+.\install-windows.ps1 -GpuGuard act                       # or warn / off
+.\install-windows.ps1 -GpuGuard act -GpuHotspotWarn 88 -GpuHotspotCrit 93 -GpuGuardSpare "obs64"
+.\install-windows.ps1 -Action Status                      # prints the guard's line
+```
+
+A reinstall without `-GpuGuard` goes back to the default, `warn`. The hotspot comes from the
+LibreHardwareMonitor bridge; with `nvidia-smi` alone the guard runs on the core. The host alarm
+is a message box on the console session, which a full-screen exclusive game can hide.
+
+**Linux.** The agent is unprivileged, so it cannot change the power limit or end other users'
+processes. A root helper, `sysmon-gpu-guard`, runs the guard and writes
+`/run/sysmon-gpu-guard/state.json`; the agent shows that state and raises the notification
+(`notify-send`, so it needs the per-user unit). The helper reads the hotspot from
+`sysmon-gpu-hotspot` (above) and runs on the core without it.
+
+```bash
+GOOS=linux GOARCH=amd64 go build -trimpath -o sysmon-gpu-guard ./cmd/gpu-guard
+scripts/install-gpu-guard.sh                            # dry-run: shows what it would do
+sudo scripts/install-gpu-guard.sh --mode warn --apply   # or --mode act
+cat /run/sysmon-gpu-guard/state.json
+sudo scripts/install-gpu-guard.sh --uninstall --apply
+```
+
+The mode lives in `/etc/default/sysmon-gpu-guard`, along with the helper's own threshold
+settings (`SYSMON_GPU_HOTSPOT_WARN`, `SYSMON_GPU_HOTSPOT_CRIT`, `SYSMON_GPU_DELTA_WARN`,
+`SYSMON_GPU_GUARD_SPARE`); the agent's threshold flags do not apply there. If a unit sets your
+power cap at boot, name it `nvidia-power-limit.service` or add it to the helper unit's
+`After=`, so the guard starts after it and restores that cap.
 </details>
 
 <details>
