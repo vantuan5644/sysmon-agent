@@ -133,7 +133,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v169"`,
+		`const STATIC_CACHE = "sysmon-static-v172"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -399,8 +399,10 @@ func TestDashboardShowsMetricSampleAge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(css), `#updatedAt`) || !strings.Contains(string(css), `white-space: nowrap;`) {
-		t.Fatal("styles.css missing nowrap rule for metric sample age")
+	// The sample age changes length as it renders; a stable width keeps that
+	// from reflowing the header (TestStatusStripWrapsInsteadOfOverlapping).
+	if !strings.Contains(topLevelCSSRule(t, string(css), "#updatedAt"), `min-width: min(100%, 25ch);`) {
+		t.Fatal("styles.css missing the stable-width rule for metric sample age")
 	}
 }
 
@@ -413,7 +415,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 5000;`,
-		`const dashboardBuild = "sysmon-static-v169";`,
+		`const dashboardBuild = "sysmon-static-v172";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -1351,18 +1353,17 @@ func TestMobileStatusMetadataRemainsVisible(t *testing.T) {
 	if strings.Contains(css, "#agentMeta {\n    display: none;") {
 		t.Fatal("mobile CSS hides agent status metadata")
 	}
-	// The point of the mobile layout is that the metadata gets its own full-width
-	// row rather than being squeezed (or hidden) next to the state and timestamp.
-	// Match the meta row generically so adding a status-strip column (the build
-	// badge added one) doesn't break the test while the intent still holds.
-	metaRow := regexp.MustCompile(`"meta( meta)+"`)
-	if !metaRow.MatchString(css) {
-		t.Fatal("styles.css has no full-width \"meta ...\" grid row for the mobile status metadata")
+	// The point of the layout is that the metadata gets its own full-width line
+	// rather than being squeezed (or hidden) next to the state and timestamp. The
+	// strip is a wrapping flex row, so that line is the metadata's 100% basis,
+	// and its order puts it after the time at every width.
+	meta := topLevelCSSRule(t, css, "#agentMeta")
+	for _, decl := range []string{`order: 1;`, `flex: 1 1 100%;`} {
+		if !strings.Contains(meta, decl) {
+			t.Fatalf("#agentMeta must take a full-width last line of the status strip; missing %q in %q", decl, meta)
+		}
 	}
 	for _, needle := range []string{
-		`grid-template-areas:`,
-		`#agentMeta {`,
-		`grid-area: meta;`,
 		`.status-dot.warn {`,
 		`.status-dot.paused {`,
 		`.status-refresh:focus-visible {`,
@@ -1372,6 +1373,71 @@ func TestMobileStatusMetadataRemainsVisible(t *testing.T) {
 			t.Fatalf("styles.css missing mobile status metadata rule %q", needle)
 		}
 	}
+}
+
+// The status strip once put the state, build badges and sample time in fixed
+// grid columns of one row. A version longer than "0.2.0" ("release 0.2.1-qr",
+// a git-describe build) then left them no room: the time was drawn over the
+// badges on desktop and the badges ran past the screen edge on a phone. The
+// strip must wrap instead, and must not fix it by clipping, because the
+// refresh button covers the header and a title there can never show.
+func TestStatusStripWrapsInsteadOfOverlapping(t *testing.T) {
+	data, err := staticFS.ReadFile("static/styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(data)
+
+	strip := topLevelCSSRule(t, css, ".status-strip")
+	for _, decl := range []string{`display: flex;`, `flex-wrap: wrap;`} {
+		if !strings.Contains(strip, decl) {
+			t.Fatalf(".status-strip must be a wrapping row; missing %q in %q", decl, strip)
+		}
+	}
+	if strings.Contains(strip, "grid-template") {
+		t.Fatalf(".status-strip is back on fixed grid tracks, which overlap once the badges outgrow them: %q", strip)
+	}
+
+	// A badge longer than its own line wraps inside itself.
+	badge := topLevelCSSRule(t, css, ".agent-version")
+	for _, decl := range []string{`max-width: 100%;`, `overflow-wrap: anywhere;`} {
+		if !strings.Contains(badge, decl) {
+			t.Fatalf(".agent-version must wrap within the strip; missing %q in %q", decl, badge)
+		}
+	}
+	if strings.Contains(badge, "nowrap") || strings.Contains(badge, "ellipsis") {
+		t.Fatalf(".agent-version must wrap, not overflow or clip, a long version: %q", badge)
+	}
+	// The two badges wrap one at a time, as items of the strip.
+	if group := topLevelCSSRule(t, css, ".build-badges"); !strings.Contains(group, `display: contents;`) {
+		t.Fatalf(".build-badges must not hold both badges on one unbreakable line: %q", group)
+	}
+
+	// The sample time keeps a stable width, so its per-frame length changes
+	// (0ms, 782ms) cannot move it between lines and make the header jump, and
+	// it wraps rather than overflow on a strip narrower than that width.
+	timer := topLevelCSSRule(t, css, "#updatedAt")
+	if !strings.Contains(timer, `min-width: min(100%, 25ch);`) {
+		t.Fatalf("#updatedAt must reserve the width of its longest form; got %q", timer)
+	}
+	if strings.Contains(timer, "nowrap") || strings.Contains(timer, "justify-self") {
+		t.Fatalf("#updatedAt must wrap on a narrow strip, not overflow it: %q", timer)
+	}
+}
+
+// topLevelCSSRule returns the declarations of every unindented rule for
+// selector (the base rules, not those inside a media query), joined.
+func topLevelCSSRule(t *testing.T, css, selector string) string {
+	t.Helper()
+	matches := regexp.MustCompile(`(?m)^`+regexp.QuoteMeta(selector)+` \{\n([^}]*)\n\}`).FindAllStringSubmatch(css, -1)
+	if matches == nil {
+		t.Fatalf("styles.css has no top-level %s rule", selector)
+	}
+	bodies := make([]string, 0, len(matches))
+	for _, match := range matches {
+		bodies = append(bodies, match[1])
+	}
+	return strings.Join(bodies, "\n")
 }
 
 func TestMobileHeaderControlsStayCompact(t *testing.T) {

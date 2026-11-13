@@ -335,6 +335,22 @@ window.addEventListener("load", function () {
       };
     }),
   };
+  // The status strip with its longest content at once, measured after
+  // everything above: a git-describe version, a four-digit build token and a
+  // 12-hour clock. When the strip had fixed grid columns, these drew over one
+  // another on a desktop and ran off a phone screen.
+  document.getElementById("agentVersion").textContent = "release v0.2.0-14-g52a0645-dirty";
+  document.getElementById("buildToken").textContent = "v1700";
+  document.getElementById("updatedAt").textContent = "12:59:59 PM / 59m / 1.3s";
+  var stripRect = document.querySelector(".status-strip").getBoundingClientRect();
+  report.statusStrip = {
+    left: stripRect.left, right: stripRect.right,
+    documentWidth: document.documentElement.scrollWidth,
+    items: ["statusText", "agentVersion", "buildToken", "updatedAt", "agentMeta"].map(function (id) {
+      var rect = document.getElementById(id).getBoundingClientRect();
+      return { id: id, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+    }),
+  };
   var node = document.createElement("div");
   node.id = "PROBE";
   node.textContent = JSON.stringify(report);
@@ -422,6 +438,22 @@ function assertPagerInvariants(m) {
       header.statusRight > m.viewportWidth || header.identityBottom <= header.statusTop ||
       header.statusBottom <= header.identityTop) {
     throw new Error("Machine identity and status must share a row without overlap: " + JSON.stringify(header));
+  }
+  const strip = m.statusStrip;
+  strip.items.forEach((item, index) => {
+    if (item.left < strip.left - 0.5 || item.right > strip.right + 0.5) {
+      throw new Error("Status strip item runs outside the strip: " + JSON.stringify(strip));
+    }
+    for (const other of strip.items.slice(index + 1)) {
+      const overlapX = Math.min(item.right, other.right) - Math.max(item.left, other.left);
+      const overlapY = Math.min(item.bottom, other.bottom) - Math.max(item.top, other.top);
+      if (overlapX > 0.5 && overlapY > 0.5) {
+        throw new Error(`Status strip items ${item.id} and ${other.id} overlap: ` + JSON.stringify(strip));
+      }
+    }
+  });
+  if (strip.documentWidth > m.viewportWidth) {
+    throw new Error("A long agent version widens the page: " + JSON.stringify(strip));
   }
   if (m.controlsInPager || m.controlsBottom > m.pagerTop + 1 || m.controls.length !== 5) {
     throw new Error("Host controls must remain above every page with five buttons");

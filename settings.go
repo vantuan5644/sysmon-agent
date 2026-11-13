@@ -134,7 +134,7 @@ type RuntimeState struct {
 	pairing       *pairingStore
 	// pairingLinkFallback is where a "Pair another device" QR code points
 	// when the dashboard runs on loopback (pairing_link.go).
-	pairingLinkFallback func() string
+	pairingLinkFallback pairingLinkFallback
 }
 
 func NewRuntimeState(settingsPath string) (*RuntimeState, error) {

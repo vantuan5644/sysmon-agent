@@ -51,8 +51,15 @@ const state = {
   pairedDevices: [],
   pairedDevicesInFlight: false,
   pairingWindow: null,
-  // The PIN a pairing link carried (#pair=123456), taken at load.
+  // The PIN a pairing link carried (#pair=123456), taken at load, and
+  // whether there was one, which outlives the PIN once it is used.
   pairingLinkPIN: "",
+  pairingLinkSeen: false,
+  // On iPhone and iPad a browser tab shows the Home Screen card before the
+  // PIN form; this is the "Pair this browser instead" choice.
+  pairInBrowser: false,
+  // The PIN form is filled in and focused once, the first time it shows.
+  pairFormReady: false,
   pairingArmedID: "",
   pairingArmTimer: null,
   lastProcesses: null,
@@ -148,7 +155,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v169";
+const dashboardBuild = "sysmon-static-v172";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -303,6 +310,7 @@ const $ = (id) => document.getElementById(id);
 
 document.addEventListener("DOMContentLoaded", () => {
   state.pairingLinkPIN = takePairingLinkPIN();
+  state.pairingLinkSeen = Boolean(state.pairingLinkPIN);
   $("pauseBtn").addEventListener("click", togglePause);
   $("wakeBtn").addEventListener("click", toggleWakeLock);
   $("dimBtn").addEventListener("click", () => updateSettings({ dim: !state.settings.dim }, "settings_dim"));
@@ -334,6 +342,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("gpuAlarm").addEventListener("click", snoozeGPUAlarm);
   document.addEventListener("keydown", handleGPUAlarmKeydown);
   $("pairForm").addEventListener("submit", submitPairing);
+  $("pairInstallBrowser").addEventListener("click", pairThisBrowser);
   $("pairAnotherBtn").addEventListener("click", openPairingWindow);
   $("hostPairForm").addEventListener("submit", submitHostPair);
   $("hostPairCancel").addEventListener("click", cancelHostPair);
@@ -5692,17 +5701,110 @@ function applyPairingState(pairing) {
 
 // takePairingLinkPIN reads the PIN a pairing link carries, from the QR code
 // that -pair and Pair another device show, and takes it out of the address
-// bar so it stays out of the history and a Home Screen app's address.
+// bar so it stays out of the history and a Home Screen app's address. With no
+// link it falls back to the PIN a browser tab left for the Home Screen app.
 function takePairingLinkPIN() {
   const match = /^#pair=(\d{6})$/.exec(String(window.location?.hash || ""));
   if (!match) {
-    return "";
+    return readPairingCarryPIN();
   }
   try {
     window.history?.replaceState?.(null, "", `${window.location?.pathname || "/"}${window.location?.search || ""}`);
   } catch {
   }
   return match[1];
+}
+
+// iPhone and iPad give an app added to the Home Screen its own cookies, apart
+// from the browser's, so a device paired in the browser is not paired in the
+// app made from it, and pairing both took two PINs. A browser tab there shows
+// the Home Screen card instead of the PIN form and leaves the PIN in a
+// short-lived cookie: if iOS copies the browser's cookies into the new app,
+// the app finds the PIN filled in; if not, the card shows it for typing. The
+// cookie holds a PIN this device already has, readable only by this origin,
+// and the agent ignores it (its own cookie is sysmon_device).
+const pairingCarryCookie = "sysmon_pair_pin";
+const pairingCarrySeconds = 600;
+
+function readPairingCarryPIN() {
+  let cookies = "";
+  try {
+    cookies = String(window.document?.cookie || "");
+  } catch {
+    return "";
+  }
+  const match = new RegExp(`(?:^|;\\s*)${pairingCarryCookie}=(\\d{6})(?:;|$)`).exec(cookies);
+  if (!match) {
+    return "";
+  }
+  if (isStandaloneDisplay()) {
+    // The app has it now; a later launch must not find it again.
+    writePairingCarryPIN("");
+  }
+  return match[1];
+}
+
+function writePairingCarryPIN(pin) {
+  const value = pin ? `${pin}; Max-Age=${pairingCarrySeconds}` : "; Max-Age=0";
+  const secure = window.location?.protocol === "https:" ? "; Secure" : "";
+  try {
+    window.document.cookie = `${pairingCarryCookie}=${value}; Path=/; SameSite=Strict${secure}`;
+  } catch {
+  }
+}
+
+function isAppleMobileBrowserTab() {
+  if (isStandaloneDisplay()) {
+    return false;
+  }
+  const ua = String(window.navigator?.userAgent || "");
+  const touch = Number(window.navigator?.maxTouchPoints || 0) > 1;
+  return /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && touch);
+}
+
+function appleMobileBrowserName() {
+  const ua = String(window.navigator?.userAgent || "");
+  if (/CriOS\//.test(ua)) return "Chrome";
+  if (/FxiOS\//.test(ua)) return "Firefox";
+  if (/EdgiOS\//.test(ua)) return "Edge";
+  return "Safari";
+}
+
+function formatPairingPIN(pin) {
+  return `${pin.slice(0, 3)} ${pin.slice(3)}`;
+}
+
+// renderPairingInstall fills the Home Screen card. The PIN shows only while
+// the window it belongs to is open; once it is used (by the app, most
+// likely) or expires, the card says so and the cookie goes.
+function renderPairingInstall() {
+  const browser = appleMobileBrowserName();
+  const pin = state.pairing?.window_open ? state.pairingLinkPIN : "";
+  $("pairInstallIntro").textContent = `On iPhone and iPad, an app on the Home Screen keeps its own pairing, apart from ${browser}'s. Pair inside the app, and this device pairs once.`;
+  $("pairInstallBrowser").textContent = `Pair ${browser} instead`;
+  $("pairInstallPin").hidden = !pin;
+  writePairingCarryPIN(pin);
+  if (pin) {
+    $("pairInstallPin").textContent = formatPairingPIN(pin);
+    $("pairInstallPinStep").textContent = "Pair there with this PIN. It may be filled in already.";
+    $("pairInstallNote").textContent = "The PIN works for one device.";
+    return;
+  }
+  $("pairInstallPinStep").textContent = "Pair there with the PIN from the host.";
+  if (state.pairingLinkSeen) {
+    $("pairInstallNote").textContent = "The PIN from the link has been used or has expired. If Sysmon on the Home Screen shows the dashboard, it is paired and this tab can be closed. If not, get a new PIN on the host.";
+  } else if (state.pairing?.window_open) {
+    $("pairInstallNote").textContent = "A PIN is open on the host.";
+  } else {
+    $("pairInstallNote").textContent = "To get a PIN: on Windows, open Start, Sysmon Agent, Pair a device; on Linux, run sysmon-agent -pair; or choose Pair another device on a paired dashboard.";
+  }
+}
+
+function pairThisBrowser() {
+  state.pairInBrowser = true;
+  // The PIN is for this tab now; the app must not find it later.
+  writePairingCarryPIN("");
+  showPairingScreen();
 }
 
 function pairingWaitingText() {
@@ -5741,17 +5843,27 @@ function showPairingScreen() {
   $("pairName").disabled = insecure;
   $("pairSubmit").disabled = insecure;
   $("pairWaiting").textContent = pairingWaitingText();
+  // Plain HTTP cannot pair the app either, so its notice wins over the card.
+  const installFirst = !insecure && !state.pairInBrowser && isAppleMobileBrowserTab();
+  $("pairInstall").hidden = !installFirst;
+  $("pairForm").hidden = installFirst;
+  screen.setAttribute("aria-labelledby", installFirst ? "pairInstallTitle" : "pairTitle");
+  screen.setAttribute("aria-describedby", installFirst ? "pairInstallIntro" : "pairIntro");
+  if (installFirst) {
+    renderPairingInstall();
+  }
   screen.hidden = false;
   // Nothing behind the screen may take focus or reach a screen reader.
   closeHostSheet();
   setShellInert(true);
-  if (firstShow) {
+  if (!installFirst && !state.pairFormReady) {
+    state.pairFormReady = true;
     if (!$("pairName").value) {
       $("pairName").value = guessDeviceName();
     }
-    const linkPIN = state.pairingLinkPIN;
+    const linkPIN = state.pairing?.window_open ? state.pairingLinkPIN : "";
     if (linkPIN && !$("pairPin").value) {
-      $("pairPin").value = `${linkPIN.slice(0, 3)} ${linkPIN.slice(3)}`;
+      $("pairPin").value = formatPairingPIN(linkPIN);
     }
     if (!insecure) {
       focusElement(linkPIN ? $("pairSubmit") : $("pairPin"));
@@ -5786,6 +5898,7 @@ async function submitPairing(event) {
     }
     if (response.ok) {
       paired = true;
+      writePairingCarryPIN("");
       $("pairSubmit").textContent = "Paired";
       window.location.reload();
       return;
@@ -5917,14 +6030,24 @@ function renderPairingPanel() {
     pinBox.hidden = false;
     $("pairingWindowPin").textContent = pinWindow.pin_display || pinWindow.pin || "--";
     const until = formatClockTime(expiresMS);
+    // A code that opens the host's .local name comes with the LAN address
+    // the name answered with, for a device that cannot look the name up.
+    const address = typeof pinWindow.address === "string" ? pinWindow.address.replace(/\/$/, "") : "";
     $("pairingWindowNote").textContent = renderPairingQR($("pairingWindowQr"), pinWindow.qr)
-      ? `For one device, until ${until}. Scan the code with that device's camera, or enter the PIN on its pairing screen.`
+      ? `For one device, until ${until}. Scan the code with that device's camera, or enter the PIN on its pairing screen.${address ? ` If the code does not open on that device, go to ${address} there.` : ""}`
       : `For one device, until ${until}. Enter it on that device's pairing screen.`;
     $("pairAnotherBtn").textContent = "New PIN";
   } else {
     state.pairingWindow = null;
     pinBox.hidden = true;
     $("pairAnotherBtn").textContent = "Pair another device";
+  }
+  // A paired browser tab on iPhone or iPad: its Home Screen app is a device of
+  // its own, and this is how it gets a PIN without a trip to the host.
+  const appHint = $("pairingAppHint");
+  appHint.hidden = !isAppleMobileBrowserTab();
+  if (!appHint.hidden) {
+    appHint.textContent = `An app on the Home Screen keeps its own pairing, apart from ${appleMobileBrowserName()}'s. To add one: choose Pair another device, then Share, Add to Home Screen, open the app and pair it with the PIN.`;
   }
 }
 
@@ -6079,6 +6202,10 @@ async function openPairingWindow() {
       throw new Error(String(body?.error || "").trim() || `HTTP ${response.status}`);
     }
     state.pairingWindow = body;
+    if (isAppleMobileBrowserTab() && /^\d{6}$/.test(String(body?.pin || ""))) {
+      // For the Home Screen app made from this tab next, if iOS copies cookies.
+      writePairingCarryPIN(body.pin);
+    }
     renderPairingPanel();
   } catch (error) {
     showPairingPanelError(`Could not open a pairing PIN: ${error?.message || "request failed"}`);

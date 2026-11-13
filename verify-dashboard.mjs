@@ -543,7 +543,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v169",
+    dashboard_build: "sysmon-static-v172",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -561,7 +561,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v169",
+    dashboard_build: "sysmon-static-v172",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1248,7 +1248,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v169, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v172, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1296,7 +1296,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v169; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v172; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1306,7 +1306,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v169",
+    dashboard_build: "sysmon-static-v172",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1316,7 +1316,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v169",
+    dashboard_build: "sysmon-static-v172",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1451,7 +1451,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v169", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v172", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -3041,7 +3041,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v169" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v172" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],
@@ -3179,13 +3179,33 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
 // pairing ones until the device pairs. Each case runs app.js in a context of
 // its own, with its own fetch stub, timers and storage, so the main run's
 // request counts and interval inventory are untouched.
-async function runPairingCase({ pairState, onFetch, hash = "" }) {
+const iPhoneSafariUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
+
+// standalone: whether app.js sees a Home Screen app (the default) or a
+// browser tab. cookies seeds document.cookie, which here is a small jar that
+// honours Max-Age=0.
+async function runPairingCase({ pairState, onFetch, hash = "", standalone = true, cookies = [], userAgent = iPhoneSafariUA, maxTouchPoints = 5 }) {
   const pairDocument = new Document(html);
   // The fake DOM ignores the hidden attribute; start these the way the
   // markup does, so a "shown" assertion means app.js showed it.
-  for (const id of ["pairScreen", "pairInsecure", "pairError", "pairingPanel", "pairingWindowBox", "pairingWindowQr", "pairingPanelError", "hostPairScreen"]) {
+  for (const id of ["pairScreen", "pairInsecure", "pairError", "pairingPanel", "pairingWindowBox", "pairingWindowQr", "pairingPanelError", "hostPairScreen", "pairInstall", "pairInstallPin", "pairingAppHint"]) {
     pairDocument.getElementById(id).hidden = true;
   }
+  const jar = new Map(cookies);
+  const cookieWrites = [];
+  Object.defineProperty(pairDocument, "cookie", {
+    get: () => [...jar].map(([name, value]) => `${name}=${value}`).join("; "),
+    set: (text) => {
+      cookieWrites.push(String(text));
+      const [pair, ...attributes] = String(text).split(";").map((part) => part.trim());
+      const [name, value = ""] = pair.split("=");
+      if (attributes.some((attribute) => /^max-age=0$/i.test(attribute))) {
+        jar.delete(name);
+      } else {
+        jar.set(name, value);
+      }
+    },
+  });
   const intervals = new Map();
   const timeouts = new Map();
   let nextId = 1;
@@ -3199,6 +3219,8 @@ async function runPairingCase({ pairState, onFetch, hash = "" }) {
     now: 1_000_000,
     pairState,
     intervals,
+    jar,
+    cookieWrites,
     byId: (id) => pairDocument.getElementById(id),
     count: (path, method = "GET") => run.requests.filter((request) => request.path === path && request.method === method).length,
   };
@@ -3206,10 +3228,11 @@ async function runPairingCase({ pairState, onFetch, hash = "" }) {
     ...context,
     document: pairDocument,
     navigator: {
-      userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
-      maxTouchPoints: 5,
+      userAgent,
+      maxTouchPoints,
       sendBeacon: () => true,
     },
+    matchMedia: (query) => ({ matches: standalone && query === "(display-mode: standalone)" }),
     localStorage: {
       getItem: (key) => storage.get(key) ?? null,
       setItem: (key, value) => {
@@ -3383,6 +3406,130 @@ async function submitPIN(run, pin) {
 }
 
 {
+  // An iPhone browser tab opened from the QR code. Its Home Screen app keeps
+  // cookies of its own, so pairing the tab would leave the app to pair again:
+  // the Home Screen card comes first, with the PIN on it and in a cookie the
+  // app may inherit, and nothing is posted.
+  const open = { pairing: "required", paired: false, local: false, secure: true, window_open: true, dashboard_build: "" };
+  const run = await runPairingCase({ hash: "#pair=276769", standalone: false, pairState: open });
+  assert(run.byId("pairInstall").hidden === false && run.byId("pairForm").hidden === true, "an iPhone browser tab did not show the Home Screen card first");
+  assert(run.byId("pairScreen").getAttribute("aria-labelledby") === "pairInstallTitle" && run.byId("pairScreen").getAttribute("aria-describedby") === "pairInstallIntro", "the dialog was not labelled by the Home Screen card");
+  assert(run.byId("pairInstallPin").hidden === false && run.byId("pairInstallPin").textContent === "276 769", `the card showed the PIN as ${JSON.stringify(run.byId("pairInstallPin").textContent)}`);
+  assert(run.byId("pairInstallIntro").textContent.includes("apart from Safari's"), `the card's intro read ${run.byId("pairInstallIntro").textContent}`);
+  assert(run.byId("pairInstallBrowser").textContent === "Pair Safari instead", `the way out read ${run.byId("pairInstallBrowser").textContent}`);
+  assert(run.jar.get("sysmon_pair_pin") === "276769", "the PIN was not left for the Home Screen app");
+  const carry = run.cookieWrites.find((write) => write.startsWith("sysmon_pair_pin=276769"));
+  assert(carry && /Max-Age=600/.test(carry) && /Path=\//.test(carry) && /SameSite=Strict/.test(carry), `the carried PIN was written as ${carry}`);
+  assert(run.addressChanges.length === 1 && run.addressChanges[0] === "/", "the link's PIN stayed in the address the app is made from");
+  assert(run.count("/api/pair", "POST") === 0, "the card paired the browser tab");
+  assert(run.byId("shell").inert === true && run.intervals.size === 0, "the card left the dashboard running behind it");
+
+  // Back in the tab after pairing inside the app: the PIN has closed.
+  run.pairState = { ...open, window_open: false };
+  run.document.dispatch("visibilitychange");
+  await settlePairing();
+  assert(run.reloads === 0, "the unpaired tab reloaded");
+  assert(run.byId("pairInstall").hidden === false, "the card went away with the PIN");
+  assert(run.byId("pairInstallPin").hidden === true, "a used PIN stayed on the card");
+  assert(run.byId("pairInstallNote").textContent.includes("used or has expired"), `the card's note read ${run.byId("pairInstallNote").textContent}`);
+  assert(!run.jar.has("sysmon_pair_pin"), "a used PIN stayed in the cookie");
+}
+
+{
+  // "Pair Safari instead": the PIN form, filled in from the link, and the
+  // PIN leaves the cookie, since this tab uses it.
+  const run = await runPairingCase({
+    hash: "#pair=276769",
+    standalone: false,
+    pairState: { pairing: "required", paired: false, local: false, secure: true, window_open: true, dashboard_build: "" },
+    onFetch: (path, options) => (path === "/api/pair" && options.method === "POST" ? response({ device: { id: "aaa", name: "iPhone Safari", kind: "browser" } }) : null),
+  });
+  await run.byId("pairInstallBrowser").click();
+  await settlePairing();
+  assert(run.byId("pairForm").hidden === false && run.byId("pairInstall").hidden === true, "Pair Safari instead did not show the PIN form");
+  assert(run.byId("pairScreen").getAttribute("aria-labelledby") === "pairTitle", "the dialog kept the card's label");
+  assert(run.byId("pairPin").value === "276 769", `the form was filled in with ${JSON.stringify(run.byId("pairPin").value)}`);
+  assert(run.byId("pairName").value === "iPhone Safari", `the device name guess was ${JSON.stringify(run.byId("pairName").value)}`);
+  assert(run.focused === "pairSubmit", `focus went to ${run.focused}, want the Pair button`);
+  assert(!run.jar.has("sysmon_pair_pin"), "the PIN stayed in the cookie after the tab took it");
+  await run.byId("pairForm").dispatch("submit");
+  await settlePairing();
+  const attempt = run.requests.find((request) => request.path === "/api/pair" && request.method === "POST");
+  assert(attempt && JSON.parse(attempt.body).pin === "276769", "Pair Safari instead did not send the link's PIN");
+  assert(run.reloads === 1, "pairing the tab did not reload into the dashboard");
+}
+
+{
+  // The Home Screen app, when iOS copied the tab's cookies into it: the PIN
+  // is filled in, and taken out of the cookie so no later launch reuses it.
+  const run = await runPairingCase({
+    cookies: [["sysmon_pair_pin", "123456"]],
+    pairState: { pairing: "required", paired: false, local: false, secure: true, window_open: true, dashboard_build: "" },
+  });
+  assert(run.byId("pairForm").hidden === false && run.byId("pairInstall").hidden === true, "the Home Screen app was shown the Home Screen card");
+  assert(run.byId("pairPin").value === "123 456", `the app filled in ${JSON.stringify(run.byId("pairPin").value)}`);
+  assert(run.byId("pairWaiting").textContent.startsWith("PIN filled in"), `the note read ${run.byId("pairWaiting").textContent}`);
+  assert(!run.jar.has("sysmon_pair_pin"), "the app left the carried PIN in its cookie");
+  assert(run.addressChanges.length === 0, "a carried PIN touched the address bar");
+}
+
+{
+  // The card is for iPhone and iPad: a desktop browser and an Android tab
+  // pair in place, as before.
+  for (const [userAgent, maxTouchPoints] of [
+    ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36", 0],
+    ["Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36", 5],
+  ]) {
+    const run = await runPairingCase({
+      hash: "#pair=276769",
+      standalone: false,
+      userAgent,
+      maxTouchPoints,
+      pairState: { pairing: "required", paired: false, local: false, secure: true, window_open: true, dashboard_build: "" },
+    });
+    assert(run.byId("pairForm").hidden === false && run.byId("pairInstall").hidden === true, `${userAgent.slice(13, 40)} was shown the Home Screen card`);
+    assert(run.byId("pairPin").value === "276 769", `${userAgent.slice(13, 40)} did not fill the PIN in`);
+    assert(!run.jar.has("sysmon_pair_pin"), `${userAgent.slice(13, 40)} left a PIN cookie`);
+  }
+}
+
+{
+  // Plain HTTP on an iPhone tab: the app made from it could not pair either,
+  // so the notice shows in place of the card.
+  const run = await runPairingCase({
+    standalone: false,
+    pairState: { pairing: "required", paired: false, local: false, secure: false, window_open: true, dashboard_build: "" },
+  });
+  assert(run.byId("pairInstall").hidden === true && run.byId("pairForm").hidden === false && run.byId("pairInsecure").hidden === false, "plain HTTP on an iPhone tab hid the notice behind the card");
+}
+
+{
+  // A paired iPhone browser tab: Paired devices says how its Home Screen app
+  // gets paired, and a new PIN from it is left for that app.
+  const run = await runPairingCase({
+    standalone: false,
+    pairState: { pairing: "required", paired: true, local: false, secure: true, window_open: false, dashboard_build: "" },
+    onFetch: (path, options) => {
+      const method = options.method || "GET";
+      if (path === "/api/pair/devices" && method === "GET") {
+        return response({ devices: [{ id: "aaa", name: "iPhone Safari", kind: "browser", current: true }] });
+      }
+      if (path === "/api/pair/window" && method === "POST") {
+        return response({ pin: "654321", pin_display: "654 321", expires_at: new Date(Date.now() + 600000).toISOString() });
+      }
+      return response({ error: "not found" }, 404);
+    },
+  });
+  assert(run.byId("pairScreen").hidden === true, "a paired iPhone tab saw the pairing screen");
+  assert(run.byId("pairingAppHint").hidden === false && run.byId("pairingAppHint").textContent.includes("Add to Home Screen"), "a paired iPhone tab did not say how to pair its Home Screen app");
+  assert(!run.jar.has("sysmon_pair_pin"), "a paired tab left a PIN cookie before any PIN was asked for");
+  await run.byId("pairAnotherBtn").click();
+  await settlePairing();
+  assert(run.byId("pairingWindowPin").textContent === "654 321", "the new PIN was not shown");
+  assert(run.jar.get("sysmon_pair_pin") === "654321", "the new PIN was not left for the Home Screen app");
+}
+
+{
   // Plain HTTP across the network: the agent will not pair over it, and the
   // screen says so before a PIN is typed.
   const run = await runPairingCase({
@@ -3401,6 +3548,7 @@ async function submitPIN(run, pin) {
     { id: "aaa", name: "iPhone app", kind: "browser", created: "2026-11-13T09:00:00Z", last_seen: "2026-11-13T10:00:00Z", current: true },
     { id: "bbb", name: "ci", kind: "token", created: "2026-11-12T09:00:00Z" },
   ];
+  let windowsOpened = 0;
   const run = await runPairingCase({
     pairState: { pairing: "required", paired: true, local: false, secure: true, window_open: false, dashboard_build: "" },
     onFetch: (path, options, current) => {
@@ -3415,11 +3563,16 @@ async function submitPIN(run, pin) {
         return response({ removed });
       }
       if (path === "/api/pair/window" && method === "POST") {
+        // The first window's code opens the host's .local name, so it carries
+        // the LAN address; a later one opens the address itself.
+        windowsOpened += 1;
+        const named = windowsOpened === 1;
         return response({
           pin: "123456",
           pin_display: "123 456",
           expires_at: new Date(Date.now() + 600000).toISOString(),
-          link: "https://10.0.0.4:9099/#pair=123456",
+          link: named ? "https://bblwin.local:9099/#pair=123456" : "https://10.0.0.4:9099/#pair=123456",
+          ...(named ? { address: "https://10.0.0.4:9099/" } : {}),
           qr: Array.from({ length: 21 }, (_, y) => Array.from({ length: 21 }, (_, x) => ((x === 0 || (x + y) % 3 === 0) ? "1" : "0")).join("")),
         });
       }
@@ -3434,6 +3587,7 @@ async function submitPIN(run, pin) {
   assert(run.byId("shell").inert !== true, "a paired device's app was made inert");
   assert(run.intervals.size > 0, "a paired device's dashboard started no timers");
   assert(run.byId("pairingPanel").hidden === false, "Paired devices stayed hidden on a paired device");
+  assert(run.byId("pairingAppHint").hidden === true, "the Home Screen app was told how to add a Home Screen app");
   assert(run.byId("pairingSummary").textContent === "2 devices", `the summary read ${run.byId("pairingSummary").textContent}`);
   assert(list.children.length === 2, `Paired devices listed ${list.children.length} rows, want 2`);
   assert(list.children[0].textContent.includes("this device"), "the current device was not marked");
@@ -3466,7 +3620,12 @@ async function submitPIN(run, pin) {
     // Row 0 has its dark run at x 0, then single modules every third column.
     assert(modules.getAttribute("d").startsWith("M4 4h1v1h-1zM7 4h1v1h-1z"), `the QR path starts ${modules.getAttribute("d").slice(0, 40)}`);
     assert(run.byId("pairingWindowNote").textContent.includes("Scan the code with that device's camera"), "the note did not mention the code");
+    assert(run.byId("pairingWindowNote").textContent.endsWith("If the code does not open on that device, go to https://10.0.0.4:9099 there."), `a code opening the .local name did not give the address: ${run.byId("pairingWindowNote").textContent}`);
   }
+  await run.byId("pairAnotherBtn").click();
+  await settlePairing();
+  assert(run.count("/api/pair/window", "POST") === 2, "New PIN opened no window");
+  assert(!run.byId("pairingWindowNote").textContent.includes("go to"), `a code opening the address named another one: ${run.byId("pairingWindowNote").textContent}`);
 
   // Viewing a peer hides this agent's list, and a 401 the peer gives about
   // itself must not lock this agent's app.

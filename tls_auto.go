@@ -165,7 +165,7 @@ func newAgentCertificate(now time.Time) (certPEM, keyPEM []byte, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	hostname, _ := os.Hostname()
+	hostname, _ := pairingHostname()
 	hostname = strings.TrimSpace(hostname)
 	dnsNames := []string{"localhost"}
 	if hostname != "" && !strings.EqualFold(hostname, "localhost") {
