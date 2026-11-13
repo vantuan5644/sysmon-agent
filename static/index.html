@@ -223,6 +223,7 @@
           <div id="pairingWindowBox" class="pairing-window" aria-live="polite" hidden>
             <span class="pairing-window-label">PIN for a new device</span>
             <span id="pairingWindowPin" class="pairing-window-pin">--</span>
+            <div id="pairingWindowQr" class="pairing-window-qr" hidden></div>
             <span id="pairingWindowNote" class="pairing-window-note">--</span>
           </div>
           <p id="pairingPanelError" class="pairing-panel-error" role="alert" hidden></p>
@@ -346,7 +347,12 @@
       <p id="pairNameHelp" class="pair-help">Shown in the list of paired devices, so you can tell them apart.</p>
       <button id="pairSubmit" class="pair-submit" type="submit">Pair</button>
       <p id="pairWaiting" class="pair-help" aria-live="polite">--</p>
-      <p class="pair-help">To get a PIN, run <code>sysmon-agent -pair</code> on the host, or open Paired devices on a dashboard that is already paired and choose Pair another device.</p>
+      <p class="pair-help">To get a PIN:</p>
+      <ul class="pair-help pair-how">
+        <li>On Windows, open Start, Sysmon Agent, Pair a device.</li>
+        <li>On Linux, run <code>sysmon-agent -pair</code> as the agent's user.</li>
+        <li>On a dashboard already paired, choose Pair another device on its second page, More status.</li>
+      </ul>
     </form>
   </div>
 

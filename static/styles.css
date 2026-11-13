@@ -2553,6 +2553,14 @@ body.host-remote .host-controls {
   line-height: 1.5;
 }
 
+.pair-how {
+  padding-left: 1.2em;
+}
+
+.pair-how li + li {
+  margin-top: 2px;
+}
+
 /* <code> would fall back to the browser's own monospace face. */
 .pair-help code {
   color: var(--text);
@@ -2723,6 +2731,21 @@ body.host-remote .host-controls {
   font-size: 2rem;
   font-weight: 800;
   letter-spacing: 0.12em;
+}
+
+/* Black on white in either theme, as a camera reads it; the quiet zone is
+   inside the SVG. */
+.pairing-window-qr {
+  width: min(200px, 60vw);
+  margin: 6px 0 2px;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.pairing-window-qr svg {
+  display: block;
+  width: 100%;
+  height: auto;
 }
 
 .pairing-panel-error {

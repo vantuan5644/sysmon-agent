@@ -543,7 +543,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v168",
+    dashboard_build: "sysmon-static-v169",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -561,7 +561,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v168",
+    dashboard_build: "sysmon-static-v169",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1248,7 +1248,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v168, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v169, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1296,7 +1296,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v168; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v169; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1306,7 +1306,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v168",
+    dashboard_build: "sysmon-static-v169",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1316,7 +1316,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v168",
+    dashboard_build: "sysmon-static-v169",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1451,7 +1451,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v168", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v169", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -3041,7 +3041,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v168" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v169" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],
@@ -3179,11 +3179,11 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
 // pairing ones until the device pairs. Each case runs app.js in a context of
 // its own, with its own fetch stub, timers and storage, so the main run's
 // request counts and interval inventory are untouched.
-async function runPairingCase({ pairState, onFetch }) {
+async function runPairingCase({ pairState, onFetch, hash = "" }) {
   const pairDocument = new Document(html);
   // The fake DOM ignores the hidden attribute; start these the way the
   // markup does, so a "shown" assertion means app.js showed it.
-  for (const id of ["pairScreen", "pairInsecure", "pairError", "pairingPanel", "pairingWindowBox", "pairingPanelError", "hostPairScreen"]) {
+  for (const id of ["pairScreen", "pairInsecure", "pairError", "pairingPanel", "pairingWindowBox", "pairingWindowQr", "pairingPanelError", "hostPairScreen"]) {
     pairDocument.getElementById(id).hidden = true;
   }
   const intervals = new Map();
@@ -3194,6 +3194,8 @@ async function runPairingCase({ pairState, onFetch }) {
     document: pairDocument,
     requests: [],
     reloads: 0,
+    addressChanges: [],
+    focused: "",
     now: 1_000_000,
     pairState,
     intervals,
@@ -3217,8 +3219,15 @@ async function runPairingCase({ pairState, onFetch }) {
     location: {
       host: "10.0.0.4:9099",
       pathname: "/",
+      search: "",
+      hash,
       reload: () => {
         run.reloads += 1;
+      },
+    },
+    history: {
+      replaceState: (_state, _title, address) => {
+        run.addressChanges.push(address);
       },
     },
     addEventListener: () => {},
@@ -3259,6 +3268,11 @@ async function runPairingCase({ pairState, onFetch }) {
   };
   pairContext.window = pairContext;
   run.context = pairContext;
+  for (const id of ["pairPin", "pairSubmit"]) {
+    pairDocument.getElementById(id).focus = () => {
+      run.focused = id;
+    };
+  }
   vm.runInNewContext(app, pairContext, { filename: "static/app.js" });
   pairDocument.dispatch("DOMContentLoaded");
   await settlePairing();
@@ -3332,6 +3346,43 @@ async function submitPIN(run, pin) {
 }
 
 {
+  // A pairing link (the QR code's #pair=) fills the PIN in, leaves the address
+  // bar without it, and puts the focus on Pair.
+  const run = await runPairingCase({
+    hash: "#pair=276769",
+    pairState: { pairing: "required", paired: false, local: false, secure: true, window_open: true, dashboard_build: "" },
+    onFetch: (path, options) => {
+      if (path === "/api/pair" && options.method === "POST") {
+        return response({ device: { id: "aaa", name: "iPhone", kind: "browser" } });
+      }
+      return null;
+    },
+  });
+  assert(run.addressChanges.length === 1 && run.addressChanges[0] === "/", `the link's PIN stayed in the address bar (${JSON.stringify(run.addressChanges)})`);
+  assert(run.byId("pairPin").value === "276 769", `the link filled in ${JSON.stringify(run.byId("pairPin").value)}`);
+  assert(run.byId("pairWaiting").textContent.startsWith("PIN filled in from the link"), `the note read ${run.byId("pairWaiting").textContent}`);
+  assert(run.focused === "pairSubmit", `focus went to ${run.focused}, want the Pair button`);
+  await run.byId("pairForm").dispatch("submit");
+  await settlePairing();
+  const attempt = run.requests.find((request) => request.path === "/api/pair" && request.method === "POST");
+  assert(attempt && JSON.parse(attempt.body).pin === "276769", "the link's PIN was not sent");
+  assert(run.reloads === 1, "pairing from a link did not reload into the dashboard");
+}
+
+{
+  // A link whose PIN has closed fills nothing in; a malformed one is ignored.
+  for (const [hash, pairState] of [
+    ["#pair=276769", { pairing: "required", paired: false, local: false, secure: true, window_open: false, dashboard_build: "" }],
+    ["#pair=27676", { pairing: "required", paired: false, local: false, secure: true, window_open: true, dashboard_build: "" }],
+  ]) {
+    const run = await runPairingCase({ hash, pairState });
+    assert(run.byId("pairPin").value === "" || run.byId("pairPin").value === undefined, `${hash} with ${pairState.window_open ? "an open" : "a closed"} window filled in ${run.byId("pairPin").value}`);
+    assert(!run.byId("pairWaiting").textContent.startsWith("PIN filled in"), `${hash} claimed a filled-in PIN`);
+    assert(run.focused === "pairPin", `${hash}: focus went to ${run.focused}, want the PIN field`);
+  }
+}
+
+{
   // Plain HTTP across the network: the agent will not pair over it, and the
   // screen says so before a PIN is typed.
   const run = await runPairingCase({
@@ -3364,7 +3415,13 @@ async function submitPIN(run, pin) {
         return response({ removed });
       }
       if (path === "/api/pair/window" && method === "POST") {
-        return response({ pin: "123456", pin_display: "123 456", expires_at: new Date(Date.now() + 600000).toISOString() });
+        return response({
+          pin: "123456",
+          pin_display: "123 456",
+          expires_at: new Date(Date.now() + 600000).toISOString(),
+          link: "https://10.0.0.4:9099/#pair=123456",
+          qr: Array.from({ length: 21 }, (_, y) => Array.from({ length: 21 }, (_, x) => ((x === 0 || (x + y) % 3 === 0) ? "1" : "0")).join("")),
+        });
       }
       if (path.startsWith("/api/hosts/") && current.peerLocked) {
         return response({ error: "pairing_required" }, 401);
@@ -3399,6 +3456,17 @@ async function submitPIN(run, pin) {
   assert(run.count("/api/pair/window", "POST") === 1, "Pair another device opened no window");
   assert(run.byId("pairingWindowBox").hidden === false && run.byId("pairingWindowPin").textContent === "123 456", "the new PIN was not shown");
   assert(run.byId("pairAnotherBtn").textContent === "New PIN", "the button did not offer a new PIN");
+  {
+    const qrBox = run.byId("pairingWindowQr");
+    const svg = qrBox.children[0];
+    assert(qrBox.hidden === false && svg?.tagName === "SVG", "the PIN's QR code was not drawn");
+    assert(svg.getAttribute("viewBox") === "0 0 29 29", `the QR code's view box was ${svg.getAttribute("viewBox")}, want a four-module quiet zone`);
+    const [ground, modules] = svg.children;
+    assert(ground.getAttribute("fill") === "#fff" && modules.getAttribute("fill") === "#000", "the QR code is not black on white");
+    // Row 0 has its dark run at x 0, then single modules every third column.
+    assert(modules.getAttribute("d").startsWith("M4 4h1v1h-1zM7 4h1v1h-1z"), `the QR path starts ${modules.getAttribute("d").slice(0, 40)}`);
+    assert(run.byId("pairingWindowNote").textContent.includes("Scan the code with that device's camera"), "the note did not mention the code");
+  }
 
   // Viewing a peer hides this agent's list, and a 401 the peer gives about
   // itself must not lock this agent's app.

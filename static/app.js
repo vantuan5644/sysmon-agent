@@ -51,6 +51,8 @@ const state = {
   pairedDevices: [],
   pairedDevicesInFlight: false,
   pairingWindow: null,
+  // The PIN a pairing link carried (#pair=123456), taken at load.
+  pairingLinkPIN: "",
   pairingArmedID: "",
   pairingArmTimer: null,
   lastProcesses: null,
@@ -146,7 +148,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v168";
+const dashboardBuild = "sysmon-static-v169";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -300,6 +302,7 @@ let procSort = { col: "cpu", dir: "desc" };
 const $ = (id) => document.getElementById(id);
 
 document.addEventListener("DOMContentLoaded", () => {
+  state.pairingLinkPIN = takePairingLinkPIN();
   $("pauseBtn").addEventListener("click", togglePause);
   $("wakeBtn").addEventListener("click", toggleWakeLock);
   $("dimBtn").addEventListener("click", () => updateSettings({ dim: !state.settings.dim }, "settings_dim"));
@@ -5687,9 +5690,37 @@ function applyPairingState(pairing) {
   }
 }
 
+// takePairingLinkPIN reads the PIN a pairing link carries, from the QR code
+// that -pair and Pair another device show, and takes it out of the address
+// bar so it stays out of the history and a Home Screen app's address.
+function takePairingLinkPIN() {
+  const match = /^#pair=(\d{6})$/.exec(String(window.location?.hash || ""));
+  if (!match) {
+    return "";
+  }
+  try {
+    window.history?.replaceState?.(null, "", `${window.location?.pathname || "/"}${window.location?.search || ""}`);
+  } catch {
+  }
+  return match[1];
+}
+
+function pairingWaitingText() {
+  if (state.pairing?.window_open) {
+    return state.pairingLinkPIN
+      ? "PIN filled in from the link. Check the device name, then press Pair."
+      : "A PIN is open on the host.";
+  }
+  return "No PIN is open yet.";
+}
+
 function showPairingScreen() {
   const screen = $("pairScreen");
   const firstShow = screen.hidden;
+  if (firstShow && state.pairingLinkPIN && !state.pairing?.window_open) {
+    // The window the link was made for has closed, and its PIN with it.
+    state.pairingLinkPIN = "";
+  }
   state.pairingLocked = true;
   stopVisibleTimers();
   setConnectionState("warn", "Not paired");
@@ -5709,9 +5740,7 @@ function showPairingScreen() {
   $("pairPin").disabled = insecure;
   $("pairName").disabled = insecure;
   $("pairSubmit").disabled = insecure;
-  $("pairWaiting").textContent = state.pairing?.window_open
-    ? "A PIN is open on the host."
-    : "No PIN is open yet.";
+  $("pairWaiting").textContent = pairingWaitingText();
   screen.hidden = false;
   // Nothing behind the screen may take focus or reach a screen reader.
   closeHostSheet();
@@ -5720,8 +5749,12 @@ function showPairingScreen() {
     if (!$("pairName").value) {
       $("pairName").value = guessDeviceName();
     }
+    const linkPIN = state.pairingLinkPIN;
+    if (linkPIN && !$("pairPin").value) {
+      $("pairPin").value = `${linkPIN.slice(0, 3)} ${linkPIN.slice(3)}`;
+    }
     if (!insecure) {
-      focusElement($("pairPin"));
+      focusElement(linkPIN ? $("pairSubmit") : $("pairPin"));
     }
   }
 }
@@ -5758,6 +5791,7 @@ async function submitPairing(event) {
       return;
     }
     showPairingError(pairingErrorText(response.status, body));
+    state.pairingLinkPIN = "";
     // The note under the button came from the state at load; the answer to a
     // try is newer news about whether a PIN is open.
     if (response.status === 409 || (response.status === 403 && body?.remaining === 0)) {
@@ -5882,13 +5916,60 @@ function renderPairingPanel() {
   if (pinWindow && Number.isFinite(expiresMS) && expiresMS > Date.now()) {
     pinBox.hidden = false;
     $("pairingWindowPin").textContent = pinWindow.pin_display || pinWindow.pin || "--";
-    $("pairingWindowNote").textContent = `For one device, until ${formatClockTime(expiresMS)}. Enter it on that device's pairing screen.`;
+    const until = formatClockTime(expiresMS);
+    $("pairingWindowNote").textContent = renderPairingQR($("pairingWindowQr"), pinWindow.qr)
+      ? `For one device, until ${until}. Scan the code with that device's camera, or enter the PIN on its pairing screen.`
+      : `For one device, until ${until}. Enter it on that device's pairing screen.`;
     $("pairAnotherBtn").textContent = "New PIN";
   } else {
     state.pairingWindow = null;
     pinBox.hidden = true;
     $("pairAnotherBtn").textContent = "Pair another device";
   }
+}
+
+// renderPairingQR draws the agent's QR code (one string per module row, "1"
+// for dark) as a single SVG path on white, with a four-module quiet zone. It
+// hides the box and returns false for anything that is not a square of rows.
+function renderPairingQR(box, rows) {
+  box.textContent = "";
+  const size = Array.isArray(rows) ? rows.length : 0;
+  if (size < 21 || !rows.every((row) => typeof row === "string" && row.length === size && /^[01]+$/.test(row))) {
+    box.hidden = true;
+    return false;
+  }
+  const quiet = 4;
+  let path = "";
+  rows.forEach((row, y) => {
+    for (let x = 0; x < size; x += 1) {
+      if (row[x] !== "1") {
+        continue;
+      }
+      let end = x;
+      while (end < size && row[end] === "1") {
+        end += 1;
+      }
+      path += `M${x + quiet} ${y + quiet}h${end - x}v1h${x - end}z`;
+      x = end;
+    }
+  });
+  const side = size + quiet * 2;
+  const svg = document.createElementNS(SVG_ICON_NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${side} ${side}`);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "QR code that opens this dashboard with the PIN filled in");
+  svg.setAttribute("shape-rendering", "crispEdges");
+  const ground = document.createElementNS(SVG_ICON_NS, "rect");
+  ground.setAttribute("width", String(side));
+  ground.setAttribute("height", String(side));
+  ground.setAttribute("fill", "#fff");
+  const modules = document.createElementNS(SVG_ICON_NS, "path");
+  modules.setAttribute("d", path);
+  modules.setAttribute("fill", "#000");
+  svg.append(ground, modules);
+  box.append(svg);
+  box.hidden = false;
+  return true;
 }
 
 function pairedDeviceRow(device) {

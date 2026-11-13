@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -19,6 +20,10 @@ type pairingCommand struct {
 	token  string
 	list   bool
 	revoke string
+	// link is the address the QR code opens (-pair-url), and qr whether to
+	// draw it: on a terminal, or when -pair-qr asks for it anyway.
+	link string
+	qr   bool
 }
 
 func (c pairingCommand) requested() bool {
@@ -30,6 +35,11 @@ const pairingSettingsHint = "pass the agent's -settings path, the same one its s
 	"Linux units use /var/lib/sysmon-agent/settings.json or ~/.local/state/sysmon-agent/settings.json)"
 
 func runPairingCommand(cmd pairingCommand, settingsPath string, listen listenConfig, out io.Writer) error {
+	if cmd.open && cmd.link != "" {
+		if _, err := pairingLink(cmd.link, "000000"); err != nil {
+			return fmt.Errorf("-pair-url: %w", err)
+		}
+	}
 	dir := pairingDirFor(settingsPath)
 	if dir == "" {
 		return errors.New("no pairing folder: " + pairingSettingsHint)
@@ -69,9 +79,10 @@ func runPairingCommand(cmd pairingCommand, settingsPath string, listen listenCon
 	if err != nil {
 		return err
 	}
+	until := expires.Local().Format("15:04")
 	fmt.Fprintf(out, "Pairing PIN:  %s\n\n", formatPIN(pin))
 	fmt.Fprintf(out, "Valid until %s (%d minutes) for one device; %d wrong tries close it.\n",
-		expires.Local().Format("15:04"), int(pairingWindowTTL/time.Minute), pairingMaxFailures)
+		until, int(pairingWindowTTL/time.Minute), pairingMaxFailures)
 	if urls := accessURLCandidates(listen); len(urls) > 0 {
 		fmt.Fprintln(out, "Open the dashboard on the device and enter the PIN:")
 		for _, url := range urls {
@@ -83,7 +94,39 @@ func runPairingCommand(cmd pairingCommand, settingsPath string, listen listenCon
 	if fingerprint := readAgentCertificateFingerprint(dir); fingerprint != "" && listen.networkTLS {
 		fmt.Fprintf(out, "\nThe browser will warn about the agent's own certificate. Its SHA-256 is\n  %s\n", fingerprint)
 	}
+	if cmd.qr {
+		printPairingQR(out, cmd.link, listen, pin, until)
+	}
 	return nil
+}
+
+// printPairingQR draws the pairing link last, so the code and the PIN under
+// it stay on screen in a console too short for the whole output.
+func printPairingQR(out io.Writer, base string, listen listenConfig, pin, until string) {
+	if base == "" {
+		base = preferredPairingBase(listen)
+	}
+	if base == "" {
+		return
+	}
+	link, err := pairingLink(base, pin)
+	if err != nil {
+		return
+	}
+	code, err := encodeQR(link)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(out, "\nOr scan this with the device's camera. It opens %s with the PIN filled in:\n\n", pairingLinkAddress(link))
+	fmt.Fprint(out, code.terminal(2, "  "))
+	fmt.Fprintf(out, "\nPIN %s, valid until %s.\n", formatPIN(pin), until)
+}
+
+// stdoutIsTerminal is true on a console or a terminal, where -pair draws its
+// QR code; redirected to a file or a pipe, the code would only be noise.
+func stdoutIsTerminal() bool {
+	info, err := os.Stdout.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
 func printPairedDevices(out io.Writer, devices []PairedDeviceInfo) {

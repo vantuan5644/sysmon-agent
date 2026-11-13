@@ -256,6 +256,11 @@ type pairingWindowResponse struct {
 	PIN        string    `json:"pin"`
 	PINDisplay string    `json:"pin_display"`
 	ExpiresAt  time.Time `json:"expires_at"`
+	// Link opens the dashboard with the PIN filled in, and QR is that link as
+	// a QR code, one string of '0' (light) and '1' (dark) per module row.
+	// Both are left out when no address another device can reach is known.
+	Link string   `json:"link,omitempty"`
+	QR   []string `json:"qr,omitempty"`
 }
 
 func writePairingOff(w http.ResponseWriter) {
@@ -422,7 +427,15 @@ func registerPairingRoutes(mux *http.ServeMux, state *RuntimeState) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, pairingWindowResponse{PIN: pin, PINDisplay: formatPIN(pin), ExpiresAt: expires})
+		response := pairingWindowResponse{PIN: pin, PINDisplay: formatPIN(pin), ExpiresAt: expires}
+		if base := pairingLinkBaseForRequest(r, state.PairingLinkFallback()); base != "" {
+			if link, err := pairingLink(base, pin); err == nil {
+				if code, err := encodeQR(link); err == nil {
+					response.Link, response.QR = link, code.rows()
+				}
+			}
+		}
+		writeJSON(w, http.StatusOK, response)
 	})
 
 	mux.HandleFunc("POST /api/pair/logout", func(w http.ResponseWriter, r *http.Request) {

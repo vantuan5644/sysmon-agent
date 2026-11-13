@@ -74,6 +74,8 @@ func main() {
 	pairingFlag := flag.String("pairing", envString("SYSMON_PAIRING", pairingModeRequired), "device pairing: required (only paired devices reach data and controls) or off (anyone who reaches the port, as before)")
 	networkTLSFlag := flag.String("network-tls", envString("SYSMON_NETWORK_TLS", networkTLSAuto), "HTTPS for network clients on the same port, plain HTTP kept for this machine: auto (on when pairing is required and the bind is not loopback), on, or off")
 	pairOpen := flag.Bool("pair", false, "open a 10-minute pairing window, print its PIN and exit (needs the agent's -settings path)")
+	pairURL := flag.String("pair-url", "", "with -pair: the dashboard address its QR code opens, such as https://host.example.ts.net:9443 (default: a private network address of this host)")
+	pairQR := flag.Bool("pair-qr", false, "with -pair: draw the QR code even when the output is not a terminal")
 	pairToken := flag.String("pair-token", "", "create a bearer token for a script under this name, print it once and exit")
 	pairList := flag.Bool("pair-list", false, "list paired devices and exit")
 	pairRevoke := flag.String("pair-revoke", "", "revoke the paired device with this id and exit")
@@ -141,7 +143,7 @@ func main() {
 		keyFile:    *keyFile,
 		networkTLS: resolveNetworkTLS(networkTLSMode, pairingMode, *tlsEnabled, *bind),
 	}
-	if cmd := (pairingCommand{open: *pairOpen, token: *pairToken, list: *pairList, revoke: *pairRevoke}); cmd.requested() {
+	if cmd := (pairingCommand{open: *pairOpen, token: *pairToken, list: *pairList, revoke: *pairRevoke, link: *pairURL, qr: *pairQR || stdoutIsTerminal()}); cmd.requested() {
 		if err := runPairingCommand(cmd, *settingsPath, listen, os.Stdout); err != nil {
 			log.Fatalf("pairing: %v", err)
 		}
@@ -202,6 +204,7 @@ func main() {
 			log.Fatalf("pairing: %v", err)
 		}
 		state.SetPairing(store)
+		state.SetPairingLinkFallback(func() string { return preferredPairingBase(listen) })
 	}
 	hostUpdate := hostSettingsUpdate(*refreshMS, *cpuWarn, *memWarn, *diskWarn, *gpuWarn, *tempWarn)
 	if !hostSettingsUpdateEmpty(hostUpdate) {

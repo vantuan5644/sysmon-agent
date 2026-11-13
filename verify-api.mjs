@@ -19,7 +19,7 @@ const timeoutMS = 5000;
 // `sysmon-agent -pair-token <name>`, is sent as a bearer token when set.
 const pairingToken = String(process.env.SYSMON_TOKEN || "").trim();
 const authHeaders = pairingToken ? { Authorization: `Bearer ${pairingToken}` } : {};
-const dashboardBuild = "sysmon-static-v168";
+const dashboardBuild = "sysmon-static-v169";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,
