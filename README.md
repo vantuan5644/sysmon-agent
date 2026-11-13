@@ -63,10 +63,12 @@ all of them.
 
 Download the latest **`SysmonAgent-Setup-<version>.exe`** from the
 [**Releases page**](https://github.com/vantuan5644/sysmon-agent/releases/latest) and
-double-click it. The wizard installs a background service, opens the firewall, and adds a
-dashboard shortcut. The build is unsigned, so Windows SmartScreen shows a one-time
-**"Windows protected your PC" → More info → Run anyway**. The wizard's log ends with a
-**pairing PIN** and the addresses to open on your phone; see [Pairing](#pairing).
+double-click it. The wizard installs a background service, opens the firewall, asks how the
+GPU overheat guard should act, and adds a dashboard shortcut. The build is unsigned, so
+Windows SmartScreen shows a one-time **"Windows protected your PC" → More info → Run
+anyway**. On its last page, **Pair a device now** opens a window with a pairing PIN and a QR
+code: scan the code with your phone's camera and the dashboard opens with the PIN filled in.
+See [Pairing](#pairing).
 
 ### Linux / build from source
 
@@ -77,12 +79,12 @@ git clone https://github.com/vantuan5644/sysmon-agent system-monitor
 cd system-monitor
 ./build.sh                                     # -> ./sysmon-agent
 ./sysmon-agent -settings ./settings.json       # serves on 0.0.0.0:9099
-./sysmon-agent -pair -settings ./settings.json # in a second terminal: a PIN for one device
+./sysmon-agent -pair -settings ./settings.json # in a second terminal: a PIN and a QR code for one device
 ```
 
-Open `https://HOST_IP:9099/` on a device on the same network, accept the certificate warning
-once, and enter the PIN. See [Pairing](#pairing) for why it is HTTPS and how to avoid the
-warning.
+Scan the QR code with the camera of a device on the same network, or open
+`https://HOST_IP:9099/` on it and type the PIN. Accept the certificate warning once. See
+[Pairing](#pairing) for why it is HTTPS and how to avoid the warning.
 
 ### Add it to your phone
 
@@ -118,21 +120,29 @@ data and control route answers `401 {"error":"pairing_required"}`. This is the d
 
 1. **Get a PIN on the host.** It is 6 digits, valid for 10 minutes and for one device; five
    wrong tries close it.
-   - **Windows:** the setup wizard ends its log with one. For another, open **Start → Sysmon
-     Agent → Pair a device**, or run `install-windows.ps1 -Action Pair` from an elevated
-     PowerShell.
+   - **Windows:** the setup wizard's last page offers **Pair a device now**. For another, open
+     **Start → Sysmon Agent → Pair a device**, or run `install-windows.ps1 -Action Pair` from
+     an elevated PowerShell.
    - **Linux:** run `-pair` as the agent's own user, with the same `-settings` path it runs
      with:
      ```bash
      sysmon-agent -pair -settings ~/.local/state/sysmon-agent/settings.json   # user unit
      sudo -u YOUR_USERNAME sysmon-agent -pair -settings /var/lib/sysmon-agent/settings.json   # system unit
      ```
-2. **Open the dashboard on the device** at one of the addresses `-pair` prints, enter the PIN
-   and a name for the device.
+2. **Scan the QR code** under the PIN with the device's camera. It opens the dashboard with
+   the PIN filled in, so you check the device's name and press **Pair**. Or open one of the
+   addresses `-pair` prints and type the PIN.
 
 After the first one, a paired dashboard can pair more: on its **More status** page (the
-second dot), **Paired devices → Pair another device** shows a new PIN. The same panel lists
-every paired device and removes any of them.
+second dot), **Paired devices → Pair another device** shows a new PIN and its QR code. The
+same panel lists every paired device and removes any of them.
+
+The QR code carries the PIN in the address's `#pair=` part, which a browser never sends to
+the agent or a proxy, and the dashboard takes it out of the address bar once read. `-pair`
+draws the code when it writes to a terminal, or with `-pair-qr`, and points it at a private
+network address of the host; `-pair-url https://HOST:PORT` picks another. The Windows
+installer passes the Tailscale Serve address when the agent has one. Pair another device
+points its code at the address the dashboard itself is open at.
 
 An iPhone Home Screen app keeps its storage apart from Safari's, so pair it from inside the
 installed app. Browsers keep the pairing in a `sysmon_device` cookie (HttpOnly,
@@ -744,7 +754,11 @@ which rebuilds the service command line on every install:
 .\install-windows.ps1 -Action Status                      # prints the guard's line
 ```
 
-A reinstall without `-GpuGuard` goes back to the default, `warn`. The hotspot comes from the
+A reinstall without `-GpuGuard` goes back to the default, `warn`. The setup wizard asks for
+the mode and the three lines on a page of its own and starts from what the installed service
+runs with, so an upgrade keeps them, `-GpuGuardSpare` included. A silent install takes them as
+switches: `SysmonAgent-Setup.exe /S /GPUGUARD=act /GPUHOTSPOTWARN=88 /GPUHOTSPOTCRIT=93
+/GPUDELTAWARN=20`. The hotspot comes from the
 LibreHardwareMonitor bridge; with `nvidia-smi` alone the guard runs on the core. The host alarm
 is a message box on the console session, which a full-screen exclusive game can hide.
 
