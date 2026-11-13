@@ -23,6 +23,10 @@ param(
     # Pair-only: wait for Enter before the window closes. The Start menu
     # shortcut uses it, so the PIN stays on screen.
     [switch]$PauseAtEnd,
+    # Install-only: open no pairing window at the end. The setup wizard passes
+    # it and offers Pair a device now on its last page instead, which shows the
+    # PIN and its QR code in a console rather than in the install log.
+    [switch]$SkipPair,
     # Warn threshold for cpu_temperature, in Celsius (50-90; 0 keeps whatever
     # is already saved). The 70 default suits a package or die reading, but on
     # AMD the canonical sensor is Tctl, a control temperature that short
@@ -1393,11 +1397,44 @@ function Invoke-AgentPair {
             Write-Warning "Pairing is off for $ServiceName, so any device that reaches it sees its data and controls without a PIN. Re-run Install without -Pairing off to require pairing."
             return
         }
-        Invoke-AgentCommand @('-pair')
+        # The advice goes first, so the PIN and its QR code are what the output
+        # ends on, even in a console too short to hold all of it.
         Show-TailscaleServeAdvice
         Write-Host ''
         Write-Host 'A paired dashboard can pair more devices: on its More status page (the second dot),'
         Write-Host 'Paired devices, Pair another device.'
+        Write-Host ''
+        $pairArguments = @('-pair')
+        # The QR code opens the Tailscale Serve address when there is one: the
+        # device trusts its certificate, and an iPhone Home Screen app installs
+        # from it. Otherwise the agent picks a private network address.
+        $tailscale = Find-TailscaleCli
+        if ($tailscale) {
+            $serveUrl = @(Get-TailscaleServeUrls $tailscale) | Select-Object -First 1
+            if ($serveUrl) {
+                $pairArguments += @('-pair-url', $serveUrl)
+            }
+        }
+        # Piped through PowerShell, the agent cannot see that its output ends
+        # up in a console, so ask for the code here, and read the output as
+        # UTF-8 for the block characters it is drawn with.
+        $previousEncoding = $null
+        if (-not [Console]::IsOutputRedirected) {
+            $pairArguments += '-pair-qr'
+            try {
+                $previousEncoding = [Console]::OutputEncoding
+                [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+            } catch {
+                $previousEncoding = $null
+            }
+        }
+        try {
+            Invoke-AgentCommand $pairArguments
+        } finally {
+            if ($previousEncoding) {
+                [Console]::OutputEncoding = $previousEncoding
+            }
+        }
     } finally {
         if ($PauseAtEnd) {
             Write-Host ''
@@ -1498,8 +1535,15 @@ function Install-Agent {
         Write-Warning "Pairing is off: any device that reaches port $Port sees this host's data and can use its controls. Re-run Install without -Pairing off to require pairing."
         return
     }
-    # The PIN goes last, where the setup wizard's log ends. -pair lists the
-    # device URLs itself.
+    if ($SkipPair) {
+        Show-DeviceHandoff
+        Write-Host ''
+        Write-Host 'Pairing is required: other devices see this host only once they are paired. For a'
+        Write-Host 'PIN, open Start, Sysmon Agent, Pair a device, or run install-windows.ps1 -Action Pair.'
+        return
+    }
+    # The PIN goes last, where the output ends. -pair lists the device URLs
+    # itself.
     Show-DeviceHandoff -SkipUrls
     Write-Host ''
     Write-Host 'Pair your first device:'

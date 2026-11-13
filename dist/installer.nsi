@@ -6,8 +6,12 @@
 ;   - elevates (RequestExecutionLevel admin) and runs install-windows.ps1,
 ;     which registers + starts the SysmonAgent service, opens the firewall,
 ;     and waits for /readyz
+;   - asks how the GPU overheat guard should act (a page of its own), keeping
+;     what an installed service runs with on an upgrade
 ;   - adds Start Menu / Desktop shortcuts to the dashboard, and a Start Menu
 ;     "Pair a device" shortcut that prints a new pairing PIN
+;   - offers "Pair a device now" on its last page: a console with a PIN and a
+;     QR code that opens the dashboard with that PIN filled in
 ;   - registers a clean uninstaller (Add/Remove Programs)
 ;
 ; The installer REUSES the existing install-windows.ps1 for all service /
@@ -16,6 +20,10 @@
 ; Build (cross-compilable — makensis runs natively on Linux/macOS/Windows):
 ;   makensis -DVERSION=0.1.0 dist/installer.nsi
 ;   # or use the wrapper: ./dist/build-installer.sh 0.1.0
+;
+; Silent install (/S) takes the guard settings as switches, each optional:
+;   SysmonAgent-Setup.exe /S /GPUGUARD=act /GPUHOTSPOTWARN=88 /GPUHOTSPOTCRIT=93 /GPUDELTAWARN=20
+; A silent install opens no pairing window; pair from the Start menu later.
 ;
 ; Output: dist/out/SysmonAgent-Setup-<VERSION>.exe
 ; ============================================================
@@ -48,6 +56,29 @@ InstallDirRegKey HKLM "${REGKEY}" "InstallDir"
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 !include "x64.nsh"
+!include "nsDialogs.nsh"
+!include "FileFunc.nsh"
+!include "WordFunc.nsh"
+
+; GPU overheat guard, as install-windows.ps1 -GpuGuard and friends take it.
+; The defaults are the agent's own; only a changed value is passed on.
+Var GpuGuardMode
+Var GpuHotspotWarn
+Var GpuHotspotCrit
+Var GpuDeltaWarn
+Var GpuGuardSpare
+; The installed service's command line, empty on a fresh install.
+Var PreviousImagePath
+; 1 when the installed service already ran with -pairing, so its devices
+; stay paired across this upgrade.
+Var PairedBefore
+Var ServiceRunning
+Var GpuRadioWarn
+Var GpuRadioAct
+Var GpuRadioOff
+Var GpuWarnField
+Var GpuCritField
+Var GpuDeltaField
 
 !define MUI_ICON "packaging\sysmon.ico"
 !define MUI_UNICON "packaging\sysmon.ico"
@@ -58,11 +89,15 @@ InstallDirRegKey HKLM "${REGKEY}" "InstallDir"
 !insertmacro MUI_PAGE_LICENSE "..\LICENSE"
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
+Page custom GpuGuardPage GpuGuardPageLeave
 !insertmacro MUI_PAGE_INSTFILES
-; Stay on the install log when it finishes: install-windows.ps1 ends it with the
-; pairing PIN for the first device, which an auto-advance would hide.
-!define MUI_FINISHPAGE_NOAUTOCLOSE
-!define MUI_FINISHPAGE_TEXT "Sysmon Agent is installed.$\r$\n$\r$\nOther devices see its data only once they are paired. The PIN for the first one was at the end of the install log. For another PIN later, open Start, Sysmon Agent, Pair a device, or use Pair another device on a dashboard that is already paired."
+; The install itself opens no pairing window (-SkipPair): "Pair a device now"
+; opens one in a console, with a QR code, after Finish.
+!define MUI_FINISHPAGE_TEXT "Sysmon Agent is installed.$\r$\n$\r$\nOther devices see this computer's data only once they are paired. Pair a device now opens a window with a PIN, and a QR code to scan with the device's camera.$\r$\n$\r$\nLater, open Start, Sysmon Agent, Pair a device, or choose Pair another device on a dashboard that is already paired."
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_TEXT "Pair a device now"
+!define MUI_FINISHPAGE_RUN_FUNCTION PairDeviceNow
+!define MUI_PAGE_CUSTOMFUNCTION_SHOW FinishPageShow
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_WELCOME
@@ -139,8 +174,27 @@ Section "!${APPNAME} (required)" SecCore
   WriteRegDWORD HKLM "${UNINSTKEY}" "NoRepair" 1
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
+  ; Only the guard settings that differ from the agent's defaults are passed,
+  ; so the service command line stays as short as the choice allows.
+  StrCpy $6 ""
+  ${If} $GpuGuardMode != "warn"
+    StrCpy $6 "$6 -GpuGuard $GpuGuardMode"
+  ${EndIf}
+  ${If} $GpuHotspotWarn != 90
+    StrCpy $6 "$6 -GpuHotspotWarn $GpuHotspotWarn"
+  ${EndIf}
+  ${If} $GpuHotspotCrit != 95
+    StrCpy $6 "$6 -GpuHotspotCrit $GpuHotspotCrit"
+  ${EndIf}
+  ${If} $GpuDeltaWarn != 20
+    StrCpy $6 "$6 -GpuDeltaWarn $GpuDeltaWarn"
+  ${EndIf}
+  ${If} $GpuGuardSpare != ""
+    StrCpy $6 '$6 -GpuGuardSpare "$GpuGuardSpare"'
+  ${EndIf}
+
   DetailPrint "Registering and starting the ${SERVICE_NAME} service..."
-  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-windows.ps1" -Action Install'
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-windows.ps1" -Action Install -SkipPair$6'
   Pop $0 ; install-windows.ps1 exit code
 
   ; The running service is the source of truth. install-windows.ps1 now
@@ -150,7 +204,9 @@ Section "!${APPNAME} (required)" SecCore
   nsExec::Exec 'cmd /c sc query "${SERVICE_NAME}" | find "RUNNING"'
   Pop $1 ; 0 when the service is RUNNING
 
+  StrCpy $ServiceRunning 0
   ${If} $1 == 0
+    StrCpy $ServiceRunning 1
     DetailPrint "Service ${SERVICE_NAME} is running."
     ${If} $0 != 0
       DetailPrint "(Setup script reported warnings, code $0 - see output above; the service is running.)"
@@ -199,8 +255,189 @@ LangString DESC_SecDesktop   ${LANG_ENGLISH} "Add a desktop shortcut that opens 
 ; ============================================================
 ; .onSelChange — keep Start Menu on by default, Desktop off (opt-in)
 ; ============================================================
+; ReadServiceFlag copies the value after FLAG in the installed service's
+; command line, up to END, into VAR. VAR keeps its value when FLAG is absent.
+; END is appended first, for a value that ends the line.
+!macro ReadServiceFlag FLAG END VAR
+  ClearErrors
+  ${WordFind} "$PreviousImagePath" `${FLAG}` "E+1}" $R0
+  ${IfNot} ${Errors}
+    ${WordFind} `$R0${END}` `${END}` "+1{" $R1
+    StrCpy ${VAR} $R1
+  ${EndIf}
+!macroend
+
+!macro ReadSwitch PARAMETERS SWITCH VAR
+  ClearErrors
+  ${GetOptions} "${PARAMETERS}" "${SWITCH}" $R1
+  ${IfNot} ${Errors}
+    StrCpy ${VAR} $R1
+  ${EndIf}
+!macroend
+
 Function .onInit
   SectionSetFlags ${SecStartMenu} ${SF_SELECTED}
+
+  StrCpy $GpuGuardMode "warn"
+  StrCpy $GpuHotspotWarn 90
+  StrCpy $GpuHotspotCrit 95
+  StrCpy $GpuDeltaWarn 20
+  StrCpy $GpuGuardSpare ""
+  StrCpy $PairedBefore 0
+  StrCpy $ServiceRunning 0
+
+  ; An upgrade starts from what the installed service runs with, since
+  ; install-windows.ps1 rebuilds its command line from the switches it gets.
+  ReadRegStr $PreviousImagePath HKLM "SYSTEM\CurrentControlSet\Services\${SERVICE_NAME}" "ImagePath"
+  ${If} $PreviousImagePath != ""
+    !insertmacro ReadServiceFlag "-gpu-guard " " " $GpuGuardMode
+    !insertmacro ReadServiceFlag "-gpu-hotspot-warn " " " $GpuHotspotWarn
+    !insertmacro ReadServiceFlag "-gpu-hotspot-crit " " " $GpuHotspotCrit
+    !insertmacro ReadServiceFlag "-gpu-delta-warn " " " $GpuDeltaWarn
+    !insertmacro ReadServiceFlag '-gpu-guard-spare "' '"' $GpuGuardSpare
+    ClearErrors
+    ${WordFind} "$PreviousImagePath" " -pairing " "E+1}" $R0
+    ${IfNot} ${Errors}
+      StrCpy $PairedBefore 1
+    ${EndIf}
+  ${EndIf}
+
+  ${GetParameters} $R0
+  !insertmacro ReadSwitch $R0 "/GPUGUARD=" $GpuGuardMode
+  !insertmacro ReadSwitch $R0 "/GPUHOTSPOTWARN=" $GpuHotspotWarn
+  !insertmacro ReadSwitch $R0 "/GPUHOTSPOTCRIT=" $GpuHotspotCrit
+  !insertmacro ReadSwitch $R0 "/GPUDELTAWARN=" $GpuDeltaWarn
+
+  ; The page checks what a person types; a silent install stops here instead
+  ; of handing install-windows.ps1 a value it refuses after the service has
+  ; already been stopped.
+  ${If} ${Silent}
+    Call CheckGpuGuard
+    Pop $R1
+    ${If} $R1 != ""
+      SetErrorLevel 2
+      Quit
+    ${EndIf}
+  ${EndIf}
+FunctionEnd
+
+; GpuLineInRange leaves an error message in $R2 when VALUE is outside the
+; range install-windows.ps1 accepts for that switch.
+!macro GpuLineInRange VALUE LOW HIGH WHAT
+  ${If} ${VALUE} < ${LOW}
+  ${OrIf} ${VALUE} > ${HIGH}
+    StrCpy $R2 "${WHAT} must be between ${LOW} and ${HIGH} C."
+  ${EndIf}
+!macroend
+
+; CheckGpuGuard pushes an error message, or "" when the settings are usable.
+Function CheckGpuGuard
+  StrCpy $R2 ""
+  ${If} $GpuGuardMode != "off"
+  ${AndIf} $GpuGuardMode != "warn"
+  ${AndIf} $GpuGuardMode != "act"
+    StrCpy $R2 "The GPU guard mode must be off, warn or act."
+  ${EndIf}
+  !insertmacro GpuLineInRange $GpuHotspotWarn 70 105 "The hotspot warning"
+  !insertmacro GpuLineInRange $GpuHotspotCrit 80 110 "The critical hotspot"
+  !insertmacro GpuLineInRange $GpuDeltaWarn 10 40 "The hotspot-to-core warning"
+  ${If} $R2 == ""
+  ${AndIf} $GpuHotspotWarn >= $GpuHotspotCrit
+    StrCpy $R2 "The hotspot warning must be below the critical hotspot."
+  ${EndIf}
+  Push $R2
+FunctionEnd
+
+; ============================================================
+; GPU overheat guard page
+; ============================================================
+Function GpuGuardPage
+  !insertmacro MUI_HEADER_TEXT "GPU overheat guard" "What Sysmon does when an NVIDIA graphics card runs hot."
+  nsDialogs::Create 1018
+  Pop $0
+  ${If} $0 == error
+    Abort
+  ${EndIf}
+
+  ${NSD_CreateLabel} 0 0 100% 20u "Sysmon reads the hottest spot on an NVIDIA graphics card every 2 seconds. On a computer without one, this page changes nothing."
+  Pop $0
+
+  ${NSD_CreateRadioButton} 0 24u 100% 12u "&Warn: alarms on this computer and on the dashboards (recommended)"
+  Pop $GpuRadioWarn
+  ${NSD_AddStyle} $GpuRadioWarn ${WS_GROUP}
+  ${NSD_CreateRadioButton} 0 37u 100% 12u "&Act: the alarms, then at the critical line lower the power limit and end GPU apps"
+  Pop $GpuRadioAct
+  ${NSD_CreateRadioButton} 0 50u 100% 12u "&Off"
+  Pop $GpuRadioOff
+  ${If} $GpuGuardMode == "act"
+    ${NSD_Check} $GpuRadioAct
+  ${ElseIf} $GpuGuardMode == "off"
+    ${NSD_Check} $GpuRadioOff
+  ${Else}
+    ${NSD_Check} $GpuRadioWarn
+  ${EndIf}
+
+  ${NSD_CreateLabel} 0 70u 75% 10u "Warn when the hotspot reaches (70 to 105 C):"
+  Pop $0
+  ${NSD_AddStyle} $0 ${WS_GROUP}
+  ${NSD_CreateNumber} 78% 68u 30u 12u "$GpuHotspotWarn"
+  Pop $GpuWarnField
+  ${NSD_SetTextLimit} $GpuWarnField 3
+  ${NSD_CreateLabel} 0 86u 75% 10u "Critical at (80 to 110 C):"
+  Pop $0
+  ${NSD_CreateNumber} 78% 84u 30u 12u "$GpuHotspotCrit"
+  Pop $GpuCritField
+  ${NSD_SetTextLimit} $GpuCritField 3
+  ${NSD_CreateLabel} 0 102u 75% 10u "Warn when the hotspot runs this far above the core (10 to 40 C):"
+  Pop $0
+  ${NSD_CreateNumber} 78% 100u 30u 12u "$GpuDeltaWarn"
+  Pop $GpuDeltaField
+  ${NSD_SetTextLimit} $GpuDeltaField 2
+
+  ${NSD_CreateLabel} 0 120u 100% 20u "Act spares the desktop, terminals, Sysmon and streaming hosts; apps it ends lose unsaved work. Run Setup again to change this."
+  Pop $0
+
+  nsDialogs::Show
+FunctionEnd
+
+Function GpuGuardPageLeave
+  StrCpy $GpuGuardMode "warn"
+  ${NSD_GetState} $GpuRadioAct $0
+  ${NSD_GetState} $GpuRadioOff $1
+  ${If} $0 == ${BST_CHECKED}
+    StrCpy $GpuGuardMode "act"
+  ${ElseIf} $1 == ${BST_CHECKED}
+    StrCpy $GpuGuardMode "off"
+  ${EndIf}
+  ${NSD_GetText} $GpuWarnField $GpuHotspotWarn
+  ${NSD_GetText} $GpuCritField $GpuHotspotCrit
+  ${NSD_GetText} $GpuDeltaField $GpuDeltaWarn
+  Call CheckGpuGuard
+  Pop $0
+  ${If} $0 != ""
+    MessageBox MB_ICONEXCLAMATION|MB_OK "$0"
+    Abort ; stays on the page
+  ${EndIf}
+FunctionEnd
+
+; ============================================================
+; Finish page
+; ============================================================
+Function FinishPageShow
+  ; An upgrade of an install that already pairs keeps its devices, and a
+  ; service that is not running cannot open a pairing window.
+  ${If} $PairedBefore == 1
+  ${OrIf} $ServiceRunning != 1
+    ${NSD_Uncheck} $mui.FinishPage.Run
+  ${EndIf}
+FunctionEnd
+
+; Runs after Finish, from this elevated installer, so the console asks for no
+; second elevation. -PauseAtEnd keeps it open on the PIN.
+Function PairDeviceNow
+  ${DisableX64FSRedirection}
+  Exec '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-windows.ps1" -Action Pair -PauseAtEnd'
+  ${EnableX64FSRedirection}
 FunctionEnd
 
 ; ============================================================

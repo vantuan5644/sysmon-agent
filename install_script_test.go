@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
@@ -222,7 +223,13 @@ func TestWindowsInstallerPairing(t *testing.T) {
 		`on its More status page (the second dot),`,
 		`function Invoke-AgentPair`,
 		`function Invoke-AgentCommand`,
-		`Invoke-AgentCommand @('-pair')`,
+		`$pairArguments = @('-pair')`,
+		`$pairArguments += @('-pair-url', $serveUrl)`,
+		`if (-not [Console]::IsOutputRedirected) {`,
+		`$pairArguments += '-pair-qr'`,
+		`[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false`,
+		`[switch]$SkipPair,`,
+		`if ($SkipPair) {`,
 		`Invoke-AgentCommand @('-pair-list')`,
 		`Start-Process -FilePath 'powershell.exe' -Verb RunAs`,
 		`function Show-PairingStatus`,
@@ -249,7 +256,7 @@ func TestWindowsInstallerPairing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, flag := range []string{"pairing", "pair", "pair-list", "network-tls", "settings", "bind", "port"} {
+	for _, flag := range []string{"pairing", "pair", "pair-list", "pair-qr", "pair-url", "network-tls", "settings", "bind", "port"} {
 		if !regexp.MustCompile(`flag\.[A-Za-z]+\("` + regexp.QuoteMeta(flag) + `"`).Match(mainGo) {
 			t.Errorf("install-windows.ps1 passes -%s, which main.go does not define", flag)
 		}
@@ -260,12 +267,49 @@ func TestWindowsInstallerPairing(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, needle := range []string{
-		`!define MUI_FINISHPAGE_NOAUTOCLOSE`,
 		`Pair a device.lnk`,
 		`-Action Pair -PauseAtEnd`,
+		// The PIN shows in a console after Finish, with its QR code, so the
+		// install itself opens no pairing window.
+		`-Action Install -SkipPair$6'`,
+		`!define MUI_FINISHPAGE_RUN_TEXT "Pair a device now"`,
+		`!define MUI_FINISHPAGE_RUN_FUNCTION PairDeviceNow`,
+		`Function PairDeviceNow`,
+		`Page custom GpuGuardPage GpuGuardPageLeave`,
+		`StrCpy $6 "$6 -GpuGuard $GpuGuardMode"`,
+		`StrCpy $6 "$6 -GpuHotspotWarn $GpuHotspotWarn"`,
+		`StrCpy $6 "$6 -GpuHotspotCrit $GpuHotspotCrit"`,
+		`StrCpy $6 "$6 -GpuDeltaWarn $GpuDeltaWarn"`,
+		`!insertmacro ReadServiceFlag "-gpu-guard " " " $GpuGuardMode`,
+		`!insertmacro ReadSwitch $R0 "/GPUGUARD=" $GpuGuardMode`,
 	} {
 		if !strings.Contains(string(nsis), needle) {
 			t.Errorf("dist/installer.nsi missing %q", needle)
+		}
+	}
+	if strings.Contains(string(nsis), "MUI_FINISHPAGE_NOAUTOCLOSE") {
+		t.Errorf("dist/installer.nsi holds the install log open, but the PIN is no longer in it")
+	}
+
+	// The wizard checks the guard's lines against the ranges the installer
+	// script accepts, and only skips a value equal to the agent's default.
+	for _, line := range []struct {
+		param             string
+		low, high, normal int
+	}{
+		{"GpuHotspotWarn", 70, 105, 90},
+		{"GpuHotspotCrit", 80, 110, 95},
+		{"GpuDeltaWarn", 10, 40, 20},
+	} {
+		ps1 := fmt.Sprintf("[ValidateScript({ $_ -eq 0 -or ($_ -ge %d -and $_ -le %d) })]\n    [int]$%s = 0,", line.low, line.high, line.param)
+		if !strings.Contains(script, ps1) {
+			t.Errorf("install-windows.ps1 no longer takes -%s as %d-%d", line.param, line.low, line.high)
+		}
+		if !strings.Contains(string(nsis), fmt.Sprintf("!insertmacro GpuLineInRange $%s %d %d ", line.param, line.low, line.high)) {
+			t.Errorf("dist/installer.nsi does not check %s against %d-%d", line.param, line.low, line.high)
+		}
+		if !strings.Contains(string(nsis), fmt.Sprintf("${If} $%s != %d\n", line.param, line.normal)) {
+			t.Errorf("dist/installer.nsi does not treat %d as the default %s", line.normal, line.param)
 		}
 	}
 }
