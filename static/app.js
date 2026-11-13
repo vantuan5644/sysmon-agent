@@ -155,7 +155,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v172";
+const dashboardBuild = "sysmon-static-v173";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -5842,13 +5842,22 @@ function showPairingScreen() {
   $("pairPin").disabled = insecure;
   $("pairName").disabled = insecure;
   $("pairSubmit").disabled = insecure;
+  // On the host itself, say first where this machine's PIN comes from; the
+  // list for other devices below would only bury it.
+  const onHost = state.pairing?.local === true;
+  $("pairHost").hidden = !onHost;
+  $("pairHowTitle").hidden = onHost;
+  $("pairHow").hidden = onHost;
+  if (onHost) {
+    $("pairHost").textContent = hostPairingHint();
+  }
   $("pairWaiting").textContent = pairingWaitingText();
   // Plain HTTP cannot pair the app either, so its notice wins over the card.
   const installFirst = !insecure && !state.pairInBrowser && isAppleMobileBrowserTab();
   $("pairInstall").hidden = !installFirst;
   $("pairForm").hidden = installFirst;
   screen.setAttribute("aria-labelledby", installFirst ? "pairInstallTitle" : "pairTitle");
-  screen.setAttribute("aria-describedby", installFirst ? "pairInstallIntro" : "pairIntro");
+  screen.setAttribute("aria-describedby", installFirst ? "pairInstallIntro" : onHost ? "pairIntro pairHost" : "pairIntro");
   if (installFirst) {
     renderPairingInstall();
   }
@@ -5869,6 +5878,17 @@ function showPairingScreen() {
       focusElement(linkPIN ? $("pairSubmit") : $("pairPin"));
     }
   }
+}
+
+// hostPairingHint tells a browser on the host how to get a PIN there. A
+// local request comes from this machine, so the browser's own platform is
+// the host's.
+function hostPairingHint() {
+  const platform = String(window.navigator?.userAgentData?.platform || window.navigator?.userAgent || "");
+  const how = /windows/i.test(platform)
+    ? "open Start, Sysmon Agent, Pair a device"
+    : "run sysmon-agent -pair as the agent's user, with its -settings path";
+  return `This is the host. For a PIN, ${how}, or choose Pair another device on a dashboard that is already paired. Then enter it here.`;
 }
 
 async function submitPairing(event) {

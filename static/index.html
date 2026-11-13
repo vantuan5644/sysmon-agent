@@ -352,6 +352,7 @@
       <svg class="icon pair-icon" aria-hidden="true"><use href="#icon-lock"></use></svg>
       <h2 id="pairTitle" class="pair-title">Pair this device</h2>
       <p id="pairIntro" class="pair-intro">This agent shows its data only to devices paired with it. Enter the PIN from the host to pair this one.</p>
+      <p id="pairHost" class="pair-host" hidden>--</p>
       <p id="pairInsecure" class="pair-insecure" hidden>This page came over plain HTTP, where the PIN could be read on the network, so the agent will not pair over it. <a id="pairSecureLink" href="/">Open the https:// address</a> instead.</p>
       <label class="pair-label" for="pairPin">PIN</label>
       <input id="pairPin" class="pair-pin" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="6 digits" spellcheck="false" aria-describedby="pairError pairWaiting">
@@ -361,11 +362,11 @@
       <p id="pairNameHelp" class="pair-help">Shown in the list of paired devices, so you can tell them apart.</p>
       <button id="pairSubmit" class="pair-submit" type="submit">Pair</button>
       <p id="pairWaiting" class="pair-help" aria-live="polite">--</p>
-      <p class="pair-help">To get a PIN:</p>
-      <ul class="pair-help pair-how">
+      <p id="pairHowTitle" class="pair-help">To get a PIN:</p>
+      <ul id="pairHow" class="pair-help pair-how">
         <li>On Windows, open Start, Sysmon Agent, Pair a device.</li>
         <li>On Linux, run <code>sysmon-agent -pair</code> as the agent's user.</li>
-        <li>On a dashboard already paired, choose Pair another device on its second page, More status.</li>
+        <li>On a dashboard already paired, choose Pair another device at the bottom of its second page.</li>
       </ul>
     </form>
   </div>

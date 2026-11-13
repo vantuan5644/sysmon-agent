@@ -2511,6 +2511,17 @@ body.host-remote .host-controls {
   color: var(--accent);
 }
 
+/* The PIN form on the host itself: where this machine's PIN comes from. */
+.pair-host {
+  margin: 0 0 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
 .pair-label {
   margin-top: 4px;
   font-size: 0.8rem;
