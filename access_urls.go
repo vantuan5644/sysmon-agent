@@ -56,7 +56,7 @@ func accessURLCandidates(config listenConfig) []string {
 	hosts := accessHostCandidates(config.bind)
 	urls := make([]string, 0, len(hosts))
 	for _, host := range hosts {
-		urls = append(urls, dashboardURL(config.scheme(), host.host, config.port))
+		urls = append(urls, dashboardURL(config.publicScheme(), host.host, config.port))
 	}
 	return urls
 }

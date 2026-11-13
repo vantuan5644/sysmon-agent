@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -10,7 +11,20 @@ import (
 	"time"
 )
 
-func runSelfCheck(handler http.Handler) error {
+// runSelfCheck exercises the handler in process. With pairing required (a
+// memory-only store, see main.go) it first checks that an unpaired client is
+// refused, then pairs one device through the real PIN route and runs every
+// other check as that device, and finally revokes it.
+func runSelfCheck(handler http.Handler, pairing *pairingStore) error {
+	var revoke func() error
+	if pairing != nil {
+		paired, deviceID, err := checkPairing(handler, pairing)
+		if err != nil {
+			return err
+		}
+		handler = paired
+		revoke = func() error { return checkPairingRevoke(paired, deviceID) }
+	}
 	if err := checkHealthz(handler); err != nil {
 		return err
 	}
@@ -41,7 +55,116 @@ func runSelfCheck(handler http.Handler) error {
 	if err := checkClientCheck(handler); err != nil {
 		return err
 	}
+	if revoke != nil {
+		return revoke()
+	}
 	return nil
+}
+
+// selfCheckCookieHandler sends every self-check request as a paired browser.
+type selfCheckCookieHandler struct {
+	next   http.Handler
+	cookie *http.Cookie
+}
+
+func (h selfCheckCookieHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	r.AddCookie(h.cookie)
+	h.next.ServeHTTP(w, r)
+}
+
+func checkPairing(handler http.Handler, store *pairingStore) (http.Handler, string, error) {
+	if rec := serveSelfCheckRequest(handler, http.MethodGet, "/healthz", ""); rec.Code != http.StatusOK {
+		return nil, "", fmt.Errorf("pairing: unpaired GET /healthz returned %d, want 200", rec.Code)
+	}
+	if rec := serveSelfCheckRequest(handler, http.MethodGet, "/", ""); rec.Code != http.StatusOK {
+		return nil, "", fmt.Errorf("pairing: unpaired GET / returned %d, want 200", rec.Code)
+	}
+	for _, path := range []string{"/readyz", "/api/metrics", "/api/status", "/api/settings", "/api/quota", "/api/hosts", "/api/pair/devices"} {
+		if rec := serveSelfCheckRequest(handler, http.MethodGet, path, ""); rec.Code != http.StatusUnauthorized {
+			return nil, "", fmt.Errorf("pairing: unpaired GET %s returned %d, want 401", path, rec.Code)
+		}
+	}
+	for path, body := range map[string]string{"/api/control": `{"action":"lock_screen"}`, "/api/settings": `{"dim":true}`, "/api/update": " "} {
+		if rec := serveSelfCheckRequest(handler, http.MethodPost, path, body); rec.Code != http.StatusUnauthorized {
+			return nil, "", fmt.Errorf("pairing: unpaired POST %s returned %d, want 401", path, rec.Code)
+		}
+	}
+
+	// Reads from this machine pass without pairing; through a proxy they do not.
+	local := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9099/api/status", nil)
+	local.RemoteAddr = "127.0.0.1:50000"
+	if rec := serveSelfCheckHTTPRequest(handler, local); rec.Code != http.StatusOK {
+		return nil, "", fmt.Errorf("pairing: loopback GET /api/status returned %d, want 200", rec.Code)
+	}
+	proxied := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9099/api/status", nil)
+	proxied.RemoteAddr = "127.0.0.1:50000"
+	proxied.Header.Set("X-Forwarded-For", "100.64.0.9")
+	if rec := serveSelfCheckHTTPRequest(handler, proxied); rec.Code != http.StatusUnauthorized {
+		return nil, "", fmt.Errorf("pairing: proxied loopback GET /api/status returned %d, want 401", rec.Code)
+	}
+
+	stateRec := serveSelfCheckRequest(handler, http.MethodGet, "/api/pair/state", "")
+	var state PairingState
+	if stateRec.Code != http.StatusOK || json.Unmarshal(stateRec.Body.Bytes(), &state) != nil {
+		return nil, "", fmt.Errorf("pairing: GET /api/pair/state returned %d %q", stateRec.Code, stateRec.Body.String())
+	}
+	if state.Pairing != pairingModeRequired || state.Paired || state.DashboardBuild != dashboardBuild {
+		return nil, "", fmt.Errorf("pairing: unexpected unpaired state %+v", state)
+	}
+
+	pin, _, err := store.OpenWindow()
+	if err != nil {
+		return nil, "", fmt.Errorf("pairing: open window: %w", err)
+	}
+	body := `{"pin":"` + formatPIN(pin) + `","name":"self-check"}`
+	if rec := serveSelfCheckRequest(handler, http.MethodPost, "/api/pair", body); rec.Code != http.StatusForbidden {
+		return nil, "", fmt.Errorf("pairing: POST /api/pair over plain network HTTP returned %d, want 403", rec.Code)
+	}
+	pairReq := httptest.NewRequest(http.MethodPost, "/api/pair", strings.NewReader(body))
+	pairReq.Header.Set("Content-Type", "application/json")
+	pairReq.Header.Set("Origin", "https://example.com")
+	pairReq.TLS = &tls.ConnectionState{}
+	pairRec := serveSelfCheckHTTPRequest(handler, pairReq)
+	if pairRec.Code != http.StatusOK {
+		return nil, "", fmt.Errorf("pairing: POST /api/pair returned %d %q", pairRec.Code, pairRec.Body.String())
+	}
+	var paired pairResponse
+	if err := json.Unmarshal(pairRec.Body.Bytes(), &paired); err != nil || paired.Device.ID == "" || paired.Token != "" {
+		return nil, "", fmt.Errorf("pairing: unexpected pair response %q", pairRec.Body.String())
+	}
+	var cookie *http.Cookie
+	for _, c := range pairRec.Result().Cookies() {
+		if c.Name == pairingCookieName {
+			cookie = c
+		}
+	}
+	if cookie == nil || !cookie.HttpOnly || !cookie.Secure || cookie.SameSite != http.SameSiteStrictMode || cookie.MaxAge <= 0 {
+		return nil, "", fmt.Errorf("pairing: cookie %+v must be HttpOnly, Secure, SameSite=Strict and persistent", cookie)
+	}
+	if store.WindowOpen() {
+		return nil, "", fmt.Errorf("pairing: the window stayed open after a successful pairing")
+	}
+	return selfCheckCookieHandler{next: handler, cookie: &http.Cookie{Name: cookie.Name, Value: cookie.Value}}, paired.Device.ID, nil
+}
+
+func checkPairingRevoke(handler http.Handler, deviceID string) error {
+	devicesRec := serveSelfCheckRequest(handler, http.MethodGet, "/api/pair/devices", "")
+	if devicesRec.Code != http.StatusOK || !strings.Contains(devicesRec.Body.String(), deviceID) {
+		return fmt.Errorf("pairing: GET /api/pair/devices returned %d %q", devicesRec.Code, devicesRec.Body.String())
+	}
+	if rec := serveSelfCheckRequest(handler, http.MethodDelete, "/api/pair/devices/"+deviceID, " "); rec.Code != http.StatusOK {
+		return fmt.Errorf("pairing: DELETE /api/pair/devices/%s returned %d %q", deviceID, rec.Code, rec.Body.String())
+	}
+	if rec := serveSelfCheckRequest(handler, http.MethodGet, "/api/metrics", ""); rec.Code != http.StatusUnauthorized {
+		return fmt.Errorf("pairing: GET /api/metrics after revoking returned %d, want 401", rec.Code)
+	}
+	return nil
+}
+
+func serveSelfCheckHTTPRequest(handler http.Handler, req *http.Request) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
 }
 
 func checkHealthz(handler http.Handler) error {
@@ -635,7 +758,7 @@ func checkClientCheck(handler http.Handler) error {
 		return fmt.Errorf("GET /api/client-checks was not empty before dashboard POST")
 	}
 
-	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v167","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
+	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v168","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
 	if post.Code != http.StatusOK {
 		return fmt.Errorf("POST /api/client-check returned %d: %s", post.Code, strings.TrimSpace(post.Body.String()))
 	}

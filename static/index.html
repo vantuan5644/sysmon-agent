@@ -214,6 +214,20 @@
           <span class="page-empty-title">All clear</span>
           <span class="page-empty-sub">No issues reported</span>
         </section>
+        <section id="pairingPanel" class="panel pairing-panel" role="region" aria-labelledby="pairingTitle" hidden>
+          <div class="section-head">
+            <h2 id="pairingTitle">Paired devices</h2>
+            <span id="pairingSummary" class="muted">--</span>
+          </div>
+          <div id="pairedList" class="paired-list"></div>
+          <div id="pairingWindowBox" class="pairing-window" aria-live="polite" hidden>
+            <span class="pairing-window-label">PIN for a new device</span>
+            <span id="pairingWindowPin" class="pairing-window-pin">--</span>
+            <span id="pairingWindowNote" class="pairing-window-note">--</span>
+          </div>
+          <p id="pairingPanelError" class="pairing-panel-error" role="alert" hidden></p>
+          <button id="pairAnotherBtn" class="pair-another" type="button">Pair another device</button>
+        </section>
       </section>
       <section class="page" aria-label="App details">
         <section id="processesPanel" class="panel processes-panel">
@@ -316,6 +330,43 @@
       <p id="gpuAlarmAction" class="gpu-alarm-action">--</p>
       <button id="gpuAlarmDismiss" class="gpu-alarm-dismiss" type="button">Hide for 1 min</button>
     </div>
+  </div>
+
+  <div id="pairScreen" class="pair-screen" role="dialog" aria-modal="true" aria-labelledby="pairTitle" aria-describedby="pairIntro" hidden>
+    <form id="pairForm" class="pair-panel" novalidate>
+      <svg class="icon pair-icon" aria-hidden="true"><use href="#icon-lock"></use></svg>
+      <h2 id="pairTitle" class="pair-title">Pair this device</h2>
+      <p id="pairIntro" class="pair-intro">This agent shows its data only to devices paired with it. Enter the PIN from the host to pair this one.</p>
+      <p id="pairInsecure" class="pair-insecure" hidden>This page came over plain HTTP, where the PIN could be read on the network, so the agent will not pair over it. <a id="pairSecureLink" href="/">Open the https:// address</a> instead.</p>
+      <label class="pair-label" for="pairPin">PIN</label>
+      <input id="pairPin" class="pair-pin" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="6 digits" spellcheck="false" aria-describedby="pairError pairWaiting">
+      <p id="pairError" class="pair-error" role="alert" hidden></p>
+      <label class="pair-label" for="pairName">Device name</label>
+      <input id="pairName" class="pair-name" type="text" maxlength="64" autocomplete="off" spellcheck="false" aria-describedby="pairNameHelp">
+      <p id="pairNameHelp" class="pair-help">Shown in the list of paired devices, so you can tell them apart.</p>
+      <button id="pairSubmit" class="pair-submit" type="submit">Pair</button>
+      <p id="pairWaiting" class="pair-help" aria-live="polite">--</p>
+      <p class="pair-help">To get a PIN, run <code>sysmon-agent -pair</code> on the host, or open Paired devices on a dashboard that is already paired and choose Pair another device.</p>
+    </form>
+  </div>
+
+  <div id="hostPairScreen" class="pair-screen" role="dialog" aria-modal="true" aria-labelledby="hostPairTitle" aria-describedby="hostPairIntro" hidden>
+    <form id="hostPairForm" class="pair-panel" novalidate>
+      <svg class="icon pair-icon" aria-hidden="true"><use href="#icon-lock"></use></svg>
+      <h2 id="hostPairTitle" class="pair-title">Pair host</h2>
+      <p id="hostPairIntro" class="pair-intro">This host shows its data only to devices paired with it. Enter its PIN, and this agent pairs with it for every device that uses this dashboard.</p>
+      <p id="hostPairNote" class="pair-insecure" hidden></p>
+      <div id="hostPairCert" class="pair-cert" hidden>
+        <p class="pair-help">It uses its own certificate. Check that it matches the one <code>sysmon-agent -pair</code> prints there:</p>
+        <p id="hostPairCertValue" class="pair-cert-value">--</p>
+      </div>
+      <label class="pair-label" for="hostPairPin">PIN</label>
+      <input id="hostPairPin" class="pair-pin" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="6 digits" spellcheck="false" aria-describedby="hostPairError hostPairHelp">
+      <p id="hostPairError" class="pair-error" role="alert" hidden></p>
+      <button id="hostPairSubmit" class="pair-submit" type="submit">Pair</button>
+      <button id="hostPairCancel" class="pair-cancel" type="button">Cancel</button>
+      <p id="hostPairHelp" class="pair-help">To get a PIN, run <code>sysmon-agent -pair</code> on <span id="hostPairHostName">the host</span>.</p>
+    </form>
   </div>
   <script src="/app.js" defer></script>
 </body>

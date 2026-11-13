@@ -70,6 +70,13 @@ func main() {
 	gpuDeltaWarn := flag.Int("gpu-delta-warn", envInt("SYSMON_GPU_DELTA_WARN", 0), "warn when the hotspot runs this many Celsius above the GPU core under load (10-40); 0 uses 20")
 	gpuGuardSpare := flag.String("gpu-guard-spare", envString("SYSMON_GPU_GUARD_SPARE", ""), "process names the guard never ends, comma-separated, besides the desktop, terminals, sysmon and streaming hosts")
 	gpuGuardTestFile := flag.String("gpu-guard-test-file", envString("SYSMON_GPU_GUARD_TEST_FILE", ""), "testing: a JSON file such as {\"hotspot\":96} whose values replace the GPU guard's readings while it exists")
+	// Device pairing (pairing.go) and HTTPS for network clients (tls_auto.go).
+	pairingFlag := flag.String("pairing", envString("SYSMON_PAIRING", pairingModeRequired), "device pairing: required (only paired devices reach data and controls) or off (anyone who reaches the port, as before)")
+	networkTLSFlag := flag.String("network-tls", envString("SYSMON_NETWORK_TLS", networkTLSAuto), "HTTPS for network clients on the same port, plain HTTP kept for this machine: auto (on when pairing is required and the bind is not loopback), on, or off")
+	pairOpen := flag.Bool("pair", false, "open a 10-minute pairing window, print its PIN and exit (needs the agent's -settings path)")
+	pairToken := flag.String("pair-token", "", "create a bearer token for a script under this name, print it once and exit")
+	pairList := flag.Bool("pair-list", false, "list paired devices and exit")
+	pairRevoke := flag.String("pair-revoke", "", "revoke the paired device with this id and exit")
 	showVersion := flag.Bool("version", false, "print the build version and exit")
 	flag.Parse()
 
@@ -118,12 +125,27 @@ func main() {
 		return
 	}
 
+	pairingMode, err := parsePairingMode(*pairingFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
+	networkTLSMode, err := parseNetworkTLSMode(*networkTLSFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
 	listen := listenConfig{
 		bind:       *bind,
 		port:       *port,
 		tlsEnabled: *tlsEnabled,
 		certFile:   *certFile,
 		keyFile:    *keyFile,
+		networkTLS: resolveNetworkTLS(networkTLSMode, pairingMode, *tlsEnabled, *bind),
+	}
+	if cmd := (pairingCommand{open: *pairOpen, token: *pairToken, list: *pairList, revoke: *pairRevoke}); cmd.requested() {
+		if err := runPairingCommand(cmd, *settingsPath, listen, os.Stdout); err != nil {
+			log.Fatalf("pairing: %v", err)
+		}
+		return
 	}
 	if *waitHealth {
 		if err := waitForConfiguredHealth(listen, *waitHealthTimeout); err != nil {
@@ -165,6 +187,21 @@ func main() {
 	peers, err := parsePeerList(*peerList)
 	if err != nil {
 		log.Fatalf("peers: %v", err)
+	}
+	if pairingMode == pairingModeRequired {
+		// -self-check pairs a device of its own in memory and must not leave
+		// one behind in the real folder.
+		dir := pairingDirFor(*settingsPath)
+		if *selfCheck {
+			dir = ""
+		} else if dir == "" {
+			log.Printf("pairing: required, but without -settings paired devices last only until the agent stops")
+		}
+		store, err := newPairingStore(dir)
+		if err != nil {
+			log.Fatalf("pairing: %v", err)
+		}
+		state.SetPairing(store)
 	}
 	hostUpdate := hostSettingsUpdate(*refreshMS, *cpuWarn, *memWarn, *diskWarn, *gpuWarn, *tempWarn)
 	if !hostSettingsUpdateEmpty(hostUpdate) {
@@ -211,20 +248,44 @@ func main() {
 		// so the in-process checks exercise the real collector without background
 		// goroutines. The update checker is likewise left unstarted so -self-check
 		// makes no outbound network calls and spawns no goroutines.
-		if err := runSelfCheck(handler); err != nil {
+		if err := runSelfCheck(handler, state.Pairing()); err != nil {
 			log.Fatalf("self-check failed: %v", err)
 		}
 		log.Println("self-check ok")
 		return
 	}
 
-	if err := listen.validate(); err != nil {
+	if listen.networkTLS {
+		dir := pairingDirFor(*settingsPath)
+		if dir == "" {
+			log.Printf("network TLS: without -settings the certificate is new on every start, so devices see a new warning each time")
+		}
+		cert, err := loadNetworkCertificate(*certFile, *keyFile, dir, time.Now())
+		if err != nil {
+			log.Fatalf("network TLS: %v", err)
+		}
+		listen.networkCert = &cert
+	} else if pairingMode == pairingModeRequired && !*tlsEnabled && !isLoopbackBind(*bind) {
+		log.Printf("pairing: network clients use plain HTTP (-network-tls off); devices can pair only through an HTTPS proxy such as Tailscale Serve")
+	}
+	if err := listen.validateServe(); err != nil {
 		log.Fatal(err)
+	}
+	if store := state.Pairing(); store != nil {
+		stopPairing := store.Start(log.Printf)
+		defer stopPairing()
 	}
 
 	// Wired after -self-check returns, so the self-check can never reach the
 	// tailnet: discovery is demand-driven, but this makes it structural.
-	state.SetPeerRegistry(newPeerRegistry(peerRegistryOptions{Configured: peers, Discover: *peerDiscovery}))
+	// Tokens from peers that require pairing live in this agent's own pairing
+	// folder whatever its own mode, since an agent that is open itself may
+	// still view peers that are not.
+	peerTokens, err := newPeerTokenStore(pairingDirFor(*settingsPath))
+	if err != nil {
+		log.Printf("peers: %v; starting with no peer tokens", err)
+	}
+	state.SetPeerRegistry(newPeerRegistry(peerRegistryOptions{Configured: peers, Discover: *peerDiscovery, Tokens: peerTokens}))
 
 	metricsSampler.Start()
 	defer metricsSampler.Stop()

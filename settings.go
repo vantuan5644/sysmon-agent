@@ -131,6 +131,7 @@ type RuntimeState struct {
 	quotaChecker  *QuotaChecker
 	codexChecker  *CodexUsageChecker
 	peers         *peerRegistry
+	pairing       *pairingStore
 }
 
 func NewRuntimeState(settingsPath string) (*RuntimeState, error) {

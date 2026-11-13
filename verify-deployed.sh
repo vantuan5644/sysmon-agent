@@ -35,6 +35,13 @@ DEVICE_URL_SOURCE=""
 INSTALLED_DEVICE_HOME_SCREEN="not_verified"
 EXPECTED_DASHBOARD_BUILD=""
 REPORT_READY=false
+# A host that requires pairing answers its API only to a paired device, or to
+# a read from its own loopback. SYSMON_TOKEN (from `sysmon-agent -pair-token
+# verify`) is sent as a bearer token; curl reads the header from a private file
+# so the token never appears on a command line.
+AUTH_HEADER_FILE=""
+AUTH_ARGS=()
+PUBLIC_PAIRED=true
 
 if [[ -z "$LOCAL_BASE_URL" ]]; then
     echo "SYSMON_DEPLOY_VERIFY_BASE_URL must not be empty" >&2
@@ -87,9 +94,19 @@ cleanup() {
         report "completed_at=$(date -Is)"
         echo "Verification report: $REPORT_FILE"
     fi
+    if [[ -n "$AUTH_HEADER_FILE" ]]; then
+        rm -f "$AUTH_HEADER_FILE"
+    fi
     return "$exit_code"
 }
 trap cleanup EXIT
+
+if [[ -n "${SYSMON_TOKEN:-}" ]]; then
+    AUTH_HEADER_FILE="$(mktemp)"
+    chmod 600 "$AUTH_HEADER_FILE"
+    printf 'Authorization: Bearer %s\n' "$SYSMON_TOKEN" > "$AUTH_HEADER_FILE"
+    AUTH_ARGS=(-H "@${AUTH_HEADER_FILE}")
+fi
 
 require_cmd() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -99,11 +116,11 @@ require_cmd() {
 }
 
 fetch() {
-    curl -fsS --max-time 5 "$1"
+    curl -fsS --max-time 5 "${AUTH_ARGS[@]}" "$1"
 }
 
 headers() {
-    curl -fsS --max-time 5 -D - -o /dev/null "$1" | tr -d '\r'
+    curl -fsS --max-time 5 "${AUTH_ARGS[@]}" -D - -o /dev/null "$1" | tr -d '\r'
 }
 
 assert_header_contains() {
@@ -679,7 +696,7 @@ const update = {
 process.stdout.write(JSON.stringify(update));
 ' "$settings")"
 
-    posted="$(curl -fsS --max-time 5 \
+    posted="$(curl -fsS --max-time 5 "${AUTH_ARGS[@]}" \
         -H "Content-Type: application/json" \
         -H "Origin: ${base_url}" \
         --data "$update" \
@@ -726,7 +743,7 @@ check_client_check_same_origin_roundtrip() {
     local status_after_client_check
 
     update="{\"dashboard_build\":\"${EXPECTED_DASHBOARD_BUILD}\",\"interaction\":\"status_strip_tap\",\"viewport_width\":390,\"viewport_height\":844,\"screen_width\":390,\"screen_height\":844,\"device_pixel_ratio\":3,\"touch_points\":5,\"display_mode\":\"browser\",\"standalone\":false,\"visibility\":\"visible\",\"orientation\":\"verify-public\"}"
-    posted="$(curl -fsS --max-time 5 \
+    posted="$(curl -fsS --max-time 5 "${AUTH_ARGS[@]}" \
         -H "Content-Type: application/json" \
         -H "Origin: ${base_url}" \
         --data "$update" \
@@ -794,6 +811,21 @@ grep -q '"metrics":true' <<< "$ready_json"
 report "readyz=pass"
 report_readyz_collection_errors "readyz" "$ready_json"
 
+pair_state_json="$(fetch "${LOCAL_BASE_URL}/api/pair/state")"
+pairing_mode="$(json_field "$pair_state_json" pairing)"
+report "pairing=${pairing_mode:-unknown}"
+if [[ "$pairing_mode" == "required" && "$(json_field "$pair_state_json" paired)" != "true" ]]; then
+    if [[ -n "${SYSMON_TOKEN:-}" ]]; then
+        echo "SYSMON_TOKEN is not a paired device on this agent (sysmon-agent -pair-list shows them)." >&2
+        report "pairing_token=fail"
+        exit 1
+    fi
+    PUBLIC_PAIRED=false
+    echo "notice: this agent requires pairing and SYSMON_TOKEN is not set, so the published URL is checked only for"
+    echo "        refusing unpaired reads; its API and round trips are skipped. For the full check, mint a token with"
+    echo "        sysmon-agent -pair-token verify -settings <path> and rerun with SYSMON_TOKEN=<token>."
+fi
+
 assert_header_contains "${LOCAL_BASE_URL}/api/status" "Cache-Control" "no-store"
 assert_header_contains "${LOCAL_BASE_URL}/api/status" "Content-Security-Policy" "default-src 'self'"
 assert_header_contains "${LOCAL_BASE_URL}/" "Cache-Control" "no-cache"
@@ -832,23 +864,38 @@ public_health_json="$(fetch "${device_url}/healthz")"
 grep -q '"status":"ok"' <<< "$public_health_json"
 report "public_healthz=pass"
 
-public_ready_json="$(fetch "${device_url}/readyz")"
-grep -q '"status":"ok"' <<< "$public_ready_json"
-grep -q '"metrics":true' <<< "$public_ready_json"
-report "public_readyz=pass"
-report_readyz_collection_errors "public_readyz" "$public_ready_json"
+if [[ "$PUBLIC_PAIRED" == "true" ]]; then
+    public_ready_json="$(fetch "${device_url}/readyz")"
+    grep -q '"status":"ok"' <<< "$public_ready_json"
+    grep -q '"metrics":true' <<< "$public_ready_json"
+    report "public_readyz=pass"
+    report_readyz_collection_errors "public_readyz" "$public_ready_json"
 
-assert_header_contains "${device_url}/api/status" "Cache-Control" "no-store"
-assert_header_contains "${device_url}/api/status" "Content-Security-Policy" "default-src 'self'"
+    assert_header_contains "${device_url}/api/status" "Cache-Control" "no-store"
+    assert_header_contains "${device_url}/api/status" "Content-Security-Policy" "default-src 'self'"
+else
+    unpaired_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${device_url}/api/status" || true)"
+    if [[ "$unpaired_code" != "401" ]]; then
+        echo "Published /api/status answered HTTP ${unpaired_code} to an unpaired client; want 401." >&2
+        report "public_pairing_required=fail"
+        exit 1
+    fi
+    report "public_pairing_required=pass"
+    report "public_readyz=skipped_pairing_required"
+fi
 assert_header_contains "${device_url}/" "Cache-Control" "no-cache"
 assert_header_contains "${device_url}/" "X-Content-Type-Options" "nosniff"
 report "public_headers=pass"
 
-echo "Checking published API schema..."
-node verify-api.mjs "$device_url"
-report "public_api_schema=pass"
-
-public_status_json="$(fetch "${device_url}/api/status")"
+if [[ "$PUBLIC_PAIRED" == "true" ]]; then
+    echo "Checking published API schema..."
+    node verify-api.mjs "$device_url"
+    report "public_api_schema=pass"
+    public_status_json="$(fetch "${device_url}/api/status")"
+else
+    report "public_api_schema=skipped_pairing_required"
+    public_status_json="$(fetch "${LOCAL_BASE_URL}/api/status")"
+fi
 EXPECTED_DASHBOARD_BUILD="$(json_field "$public_status_json" dashboard_build 2>/dev/null || true)"
 if [[ -z "$EXPECTED_DASHBOARD_BUILD" ]]; then
     echo "Published /api/status did not report dashboard_build." >&2
@@ -857,9 +904,13 @@ if [[ -z "$EXPECTED_DASHBOARD_BUILD" ]]; then
 fi
 report "dashboard_build=$EXPECTED_DASHBOARD_BUILD"
 
-echo "Checking published interactive settings controls..."
-check_settings_same_origin_roundtrip "$device_url"
-report "public_settings_roundtrip=pass"
+if [[ "$PUBLIC_PAIRED" == "true" ]]; then
+    echo "Checking published interactive settings controls..."
+    check_settings_same_origin_roundtrip "$device_url"
+    report "public_settings_roundtrip=pass"
+else
+    report "public_settings_roundtrip=skipped_pairing_required"
+fi
 
 echo "Checking published dashboard/PWA install assets..."
 check_pwa_install_assets "$device_url"
@@ -877,9 +928,13 @@ else
     report "initial_device_client_seen=false"
 fi
 
-echo "Checking published client-check controls..."
-check_client_check_same_origin_roundtrip "$device_url"
-report "public_client_check_roundtrip=pass"
+if [[ "$PUBLIC_PAIRED" == "true" ]]; then
+    echo "Checking published client-check controls..."
+    check_client_check_same_origin_roundtrip "$device_url"
+    report "public_client_check_roundtrip=pass"
+else
+    report "public_client_check_roundtrip=skipped_pairing_required"
+fi
 
 if [[ "$HOLD_SECONDS" -eq 0 ]]; then
     report "device_client_seen=not_attempted"

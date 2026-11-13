@@ -133,7 +133,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v167"`,
+		`const STATIC_CACHE = "sysmon-static-v168"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -413,7 +413,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 5000;`,
-		`const dashboardBuild = "sysmon-static-v167";`,
+		`const dashboardBuild = "sysmon-static-v168";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -435,7 +435,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 		`const requestOptions = { ...options };`,
 		`typeof window.AbortController === "function"`,
 		`requestOptions.signal = controller.signal;`,
-		`return await Promise.race([`,
+		`response = await Promise.race([`,
 		`controller.abort();`,
 		`new Promise((_, reject) => {`,
 		`reject(new Error("Request timed out"))`,

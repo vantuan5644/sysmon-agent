@@ -6,7 +6,14 @@ param(
     [ValidateRange(1, 65535)]
     [int]$Port = 19099,
     [ValidateRange(0, 86400)]
-    [int]$HoldSeconds = 0
+    [int]$HoldSeconds = 0,
+    # The main run is open, as homelab hosts are, so its POST round trips and a
+    # device on plain HTTP work as before. A second, short run on PairingPort
+    # (0 means Port + 1) checks pairing over a real socket.
+    [ValidateSet('off', 'required')]
+    [string]$Pairing = 'off',
+    [ValidateRange(0, 65535)]
+    [int]$PairingPort = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +25,7 @@ $StdoutPath = Join-Path $TempRoot 'stdout.log'
 $StderrPath = Join-Path $TempRoot 'stderr.log'
 $ReportPath = if ($env:SYSMON_VERIFY_REPORT) { $env:SYSMON_VERIFY_REPORT } else { Join-Path ([System.IO.Path]::GetTempPath()) 'sysmon-agent-verify-report.txt' }
 $Proc = $null
+$PairProc = $null
 $Succeeded = $false
 $HoldStartedMs = $null
 
@@ -32,8 +40,37 @@ function Quote-Arg([string]$Value) {
     return '"' + $Value + '"'
 }
 
-function Invoke-Text([string]$Url) {
-    return (Invoke-WebRequest -UseBasicParsing -TimeoutSec 4 -Uri $Url).Content
+function Invoke-Text([string]$Url, [int]$TimeoutSec = 4) {
+    return (Invoke-WebRequest -UseBasicParsing -TimeoutSec $TimeoutSec -Uri $Url).Content
+}
+
+# The status code of one request, including 4xx answers, which
+# Invoke-WebRequest throws on in both PowerShell 5.1 and 7.
+function Get-StatusCode {
+    param(
+        [string]$Method,
+        [string]$Url,
+        [hashtable]$Headers = @{},
+        [string]$Body = '',
+        $Session = $null
+    )
+    $request = @{ UseBasicParsing = $true; TimeoutSec = 4; Method = $Method; Uri = $Url; Headers = $Headers; MaximumRedirection = 0 }
+    if ($Body) {
+        $request.Body = $Body
+        $request.ContentType = 'application/json'
+    }
+    if ($null -ne $Session) {
+        $request.WebSession = $Session
+    }
+    try {
+        return [int](Invoke-WebRequest @request).StatusCode
+    } catch {
+        $response = $_.Exception.Response
+        if ($null -ne $response) {
+            return [int]$response.StatusCode
+        }
+        throw
+    }
 }
 
 function Invoke-Headers([string]$Url) {
@@ -316,6 +353,10 @@ function Stop-Agent {
         Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
         $Proc.WaitForExit(5000) | Out-Null
     }
+    if ($null -ne $PairProc -and -not $PairProc.HasExited) {
+        Stop-Process -Id $PairProc.Id -Force -ErrorAction SilentlyContinue
+        $PairProc.WaitForExit(5000) | Out-Null
+    }
     if (Test-Path -LiteralPath $TempRoot) {
         Remove-Item -LiteralPath $TempRoot -Recurse -Force
     }
@@ -404,7 +445,7 @@ try {
         Write-Report 'dashboard_render=skipped_node_unavailable'
     }
 
-    $argumentLine = "-bind $(Quote-Arg $Bind) -port $Port -settings $(Quote-Arg $SettingsPath)"
+    $argumentLine = "-bind $(Quote-Arg $Bind) -port $Port -settings $(Quote-Arg $SettingsPath) -pairing $Pairing"
 
     Write-Host "Starting sysmon-agent on ${Bind}:$Port; checking $BaseUrl..."
     $Proc = Start-Process `
@@ -446,7 +487,10 @@ try {
     Write-Report 'healthz=pass'
 
     Write-Host 'Checking /readyz...'
-    $ready = Invoke-Text "$BaseUrl/readyz"
+    # The first /readyz on a fresh agent waits for a direct collection, which
+    # pays a cold LHM read (3.5-4.3 s measured on BBLWIN, 2026-11-13) and is
+    # capped by the agent's 8 s metricsCollectTimeout; 4 s here raced it.
+    $ready = Invoke-Text "$BaseUrl/readyz" 12
     foreach ($needle in @('"status":"ok"', '"metrics":true')) {
         if ($ready -notmatch [regex]::Escape($needle)) {
             throw "/readyz missing $needle"
@@ -552,6 +596,101 @@ try {
         throw "settings file did not persist panel setting: $settingsFile"
     }
     Write-Report 'settings_persistence=pass'
+
+    # Pairing required, through a real listener (the self-check covers the same
+    # in process). Bound to loopback, so network TLS stays off; X-Forwarded-For
+    # stands in for tailscale serve, which is how a remote device reaches a
+    # loopback agent.
+    $pairPort = if ($PairingPort -ne 0) { $PairingPort } else { $Port + 1 }
+    $pairBase = "http://127.0.0.1:$pairPort"
+    $pairSettings = Join-Path $TempRoot 'pairing-run\settings.json'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $pairSettings) | Out-Null
+    $proxied = @{ 'X-Forwarded-For' = '100.64.0.9' }
+    $sameOrigin = @{ 'Origin' = $pairBase }
+    Write-Host "Checking pairing on 127.0.0.1:$pairPort..."
+    $PairProc = Start-Process `
+        -FilePath $AgentPath `
+        -ArgumentList "-bind 127.0.0.1 -port $pairPort -settings $(Quote-Arg $pairSettings) -pairing required" `
+        -RedirectStandardOutput (Join-Path $TempRoot 'pairing-stdout.log') `
+        -RedirectStandardError (Join-Path $TempRoot 'pairing-stderr.log') `
+        -PassThru `
+        -WindowStyle Hidden
+    $pairReady = $false
+    for ($i = 0; $i -lt 40 -and -not $pairReady; $i++) {
+        try {
+            Invoke-Text "$pairBase/healthz" | Out-Null
+            $pairReady = $true
+        } catch {
+            if ($PairProc.HasExited) { break }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    if (-not $pairReady) {
+        Write-Report 'pairing=fail'
+        Get-Content -LiteralPath (Join-Path $TempRoot 'pairing-stderr.log') -TotalCount 60 -ErrorAction SilentlyContinue
+        throw 'pairing check failed: the agent did not answer /healthz'
+    }
+    $checks = @(
+        @{ What = 'an unpaired read through the proxy'; Want = 401; Code = (Get-StatusCode -Method Get -Url "$pairBase/api/status" -Headers $proxied) },
+        @{ What = 'a read from this machine'; Want = 200; Code = (Get-StatusCode -Method Get -Url "$pairBase/api/status") },
+        @{ What = 'an unpaired settings change from this machine'; Want = 401; Code = (Get-StatusCode -Method Post -Url "$pairBase/api/settings" -Headers $sameOrigin -Body '{}') }
+    )
+    foreach ($check in $checks) {
+        if ($check.Code -ne $check.Want) {
+            Write-Report 'pairing=fail'
+            throw "pairing check failed: $($check.What) returned $($check.Code), want $($check.Want)"
+        }
+    }
+    if ((Invoke-Text "$pairBase/api/pair/state") -notmatch '"pairing":"required"') {
+        Write-Report 'pairing=fail'
+        throw 'pairing check failed: /api/pair/state does not say pairing is required'
+    }
+    $pairOutput = (& $AgentPath -pair -settings $pairSettings) -join "`n"
+    if ($pairOutput -notmatch 'Pairing PIN:\s*(\d{3}) (\d{3})') {
+        Write-Report 'pairing=fail'
+        throw "pairing check failed: -pair printed no PIN: $pairOutput"
+    }
+    $pairBody = '{"pin":"' + $Matches[1] + $Matches[2] + '","name":"verify-windows"}'
+    $proxiedPair = @{ 'X-Forwarded-For' = '100.64.0.9'; 'Origin' = $pairBase }
+    $code = Get-StatusCode -Method Post -Url "$pairBase/api/pair" -Headers $proxiedPair -Body $pairBody
+    if ($code -ne 403) {
+        Write-Report 'pairing=fail'
+        throw "pairing check failed: pairing over plain HTTP through the proxy returned $code, want 403"
+    }
+    $pairSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+    $code = Get-StatusCode -Method Post -Url "$pairBase/api/pair" -Headers $sameOrigin -Body $pairBody -Session $pairSession
+    if ($code -ne 200 -or -not ($pairSession.Cookies.GetCookies([uri]$pairBase) | Where-Object { $_.Name -eq 'sysmon_device' })) {
+        Write-Report 'pairing=fail'
+        throw "pairing check failed: the PIN from -pair returned $code or set no sysmon_device cookie"
+    }
+    $code = Get-StatusCode -Method Get -Url "$pairBase/api/metrics" -Headers $proxied -Session $pairSession
+    if ($code -ne 200) {
+        Write-Report 'pairing=fail'
+        throw "pairing check failed: a paired read through the proxy returned $code"
+    }
+    $deviceLine = (& $AgentPath -pair-list -settings $pairSettings) | Where-Object { $_ -match 'verify-windows' } | Select-Object -First 1
+    if (-not $deviceLine) {
+        Write-Report 'pairing=fail'
+        throw 'pairing check failed: -pair-list does not show the paired device'
+    }
+    & $AgentPath -pair-revoke ($deviceLine.Trim() -split '\s+')[0] -settings $pairSettings | Out-Null
+    # The agent rereads devices.json at most every 2 s (pairingReloadEvery), so
+    # a revoke from the command line lands within that; allow twice as long.
+    $revoked = $false
+    for ($i = 0; $i -lt 16 -and -not $revoked; $i++) {
+        if ((Get-StatusCode -Method Get -Url "$pairBase/api/metrics" -Headers $proxied -Session $pairSession) -eq 401) {
+            $revoked = $true
+        } else {
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    if (-not $revoked) {
+        Write-Report 'pairing=fail'
+        throw 'pairing check failed: a revoked device could still read 4 s later'
+    }
+    Stop-Process -Id $PairProc.Id -Force -ErrorAction SilentlyContinue
+    $PairProc.WaitForExit(5000) | Out-Null
+    Write-Report 'pairing=pass'
 
     Write-Host ''
     Write-Host 'ok: sysmon-agent Windows smoke test passed'

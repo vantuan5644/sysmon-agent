@@ -16,6 +16,11 @@ url_host() {
 
 PORT="${SYSMON_VERIFY_PORT:-19099}"
 BIND="${SYSMON_VERIFY_BIND:-127.0.0.1}"
+# The main run is open, as homelab hosts are, so its POST round trips and a
+# device on plain HTTP work as before. A second, short run on PAIRING_PORT
+# checks pairing over a real socket.
+PAIRING="${SYSMON_VERIFY_PAIRING:-off}"
+PAIRING_PORT="${SYSMON_VERIFY_PAIRING_PORT:-$((PORT + 1))}"
 CHECK_HOST="${SYSMON_VERIFY_HOST:-}"
 if [[ -z "$CHECK_HOST" ]]; then
     case "$BIND" in
@@ -48,6 +53,7 @@ REPORT_FILE="${SYSMON_VERIFY_REPORT:-/tmp/sysmon-agent-verify-report.txt}"
 REPORT_READY=false
 HOLD_STARTED_MS=""
 PID=""
+PAIR_PID=""
 
 report() {
     if [[ "$REPORT_READY" == "true" ]]; then
@@ -60,6 +66,10 @@ cleanup() {
     if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
         kill "$PID" 2>/dev/null || true
         wait "$PID" 2>/dev/null || true
+    fi
+    if [[ -n "$PAIR_PID" ]] && kill -0 "$PAIR_PID" 2>/dev/null; then
+        kill "$PAIR_PID" 2>/dev/null || true
+        wait "$PAIR_PID" 2>/dev/null || true
     fi
     rm -rf "$SETTINGS_DIR"
     rm -f "$LOG_FILE"
@@ -574,7 +584,7 @@ else
 fi
 
 echo "Starting sysmon-agent on ${BIND}:${PORT}; checking ${BASE_URL}..."
-"$BINARY" -bind "$BIND" -port "$PORT" -settings "$SETTINGS_FILE" >"$LOG_FILE" 2>&1 &
+"$BINARY" -bind "$BIND" -port "$PORT" -settings "$SETTINGS_FILE" -pairing "$PAIRING" >"$LOG_FILE" 2>&1 &
 PID="$!"
 report "agent_spawned=pass"
 
@@ -689,6 +699,67 @@ grep -q '"panel": "gpu"' "$SETTINGS_FILE"
 grep -q '"cpu_warn": 80' "$SETTINGS_FILE"
 grep -q '"temp_warn_c": 75' "$SETTINGS_FILE"
 report "settings_persistence=pass"
+
+# Pairing required, through a real listener (the self-check covers the same in
+# process). Bound to loopback, so network TLS stays off; X-Forwarded-For stands
+# in for tailscale serve, which is how a remote device reaches a loopback agent.
+pairing_fail() {
+    echo "pairing check failed: $1" >&2
+    sed -n '1,60p' "$pair_log" >&2
+    report "pairing=fail"
+    exit 1
+}
+http_code() {
+    curl -s -o /dev/null -w '%{http_code}' --max-time 4 "$@"
+}
+pair_base="http://127.0.0.1:${PAIRING_PORT}"
+pair_settings="${SETTINGS_DIR}/pairing-run/settings.json"
+pair_log="${SETTINGS_DIR}/pairing-agent.log"
+pair_jar="${SETTINGS_DIR}/pairing-cookies.txt"
+proxied=(-H "X-Forwarded-For: 100.64.0.9")
+origin=(-H "Origin: ${pair_base}")
+mkdir -p "$(dirname "$pair_settings")"
+echo "Checking pairing on 127.0.0.1:${PAIRING_PORT}..."
+"$BINARY" -bind 127.0.0.1 -port "$PAIRING_PORT" -settings "$pair_settings" -pairing required >"$pair_log" 2>&1 &
+PAIR_PID="$!"
+"$BINARY" -wait-health -bind 127.0.0.1 -port "$PAIRING_PORT" -wait-health-timeout 10s >/dev/null 2>&1 \
+    || pairing_fail "the agent did not answer /healthz"
+fetch "${pair_base}/api/pair/state" | grep -q '"pairing":"required"' \
+    || pairing_fail "/api/pair/state does not say pairing is required"
+[[ "$(http_code "${pair_base}/api/status")" == 200 ]] \
+    || pairing_fail "a read from this machine was refused"
+[[ "$(http_code "${proxied[@]}" "${pair_base}/api/status")" == 401 ]] \
+    || pairing_fail "an unpaired read through the proxy was not refused"
+[[ "$(http_code -X POST "${origin[@]}" -H 'Content-Type: application/json' -d '{}' "${pair_base}/api/settings")" == 401 ]] \
+    || pairing_fail "an unpaired settings change from this machine was not refused"
+pin="$("$BINARY" -pair -settings "$pair_settings" | sed -n 's/.*Pairing PIN: *\([0-9]\{3\}\) \([0-9]\{3\}\).*/\1\2/p' | head -1)"
+[[ "$pin" =~ ^[0-9]{6}$ ]] || pairing_fail "-pair printed no PIN"
+pair_body="{\"pin\":\"${pin}\",\"name\":\"verify.sh\"}"
+[[ "$(http_code -X POST "${proxied[@]}" "${origin[@]}" -H 'Content-Type: application/json' -d "$pair_body" "${pair_base}/api/pair")" == 403 ]] \
+    || pairing_fail "pairing over plain HTTP through the proxy was not refused"
+[[ "$(http_code -X POST "${origin[@]}" -H 'Content-Type: application/json' -d "$pair_body" -c "$pair_jar" "${pair_base}/api/pair")" == 200 ]] \
+    || pairing_fail "the PIN from -pair did not pair"
+grep -q 'sysmon_device' "$pair_jar" || pairing_fail "pairing set no sysmon_device cookie"
+[[ "$(http_code "${proxied[@]}" -b "$pair_jar" "${pair_base}/api/metrics")" == 200 ]] \
+    || pairing_fail "a paired read through the proxy was refused"
+device_id="$("$BINARY" -pair-list -settings "$pair_settings" | awk '/verify\.sh/ {print $1; exit}')"
+[[ -n "$device_id" ]] || pairing_fail "-pair-list does not show the paired device"
+"$BINARY" -pair-revoke "$device_id" -settings "$pair_settings" >/dev/null || pairing_fail "-pair-revoke failed"
+# The agent rereads devices.json at most every 2 s (pairingReloadEvery), so a
+# revoke from the command line lands within that; allow twice as long.
+revoked=false
+for _ in {1..16}; do
+    if [[ "$(http_code "${proxied[@]}" -b "$pair_jar" "${pair_base}/api/metrics")" == 401 ]]; then
+        revoked=true
+        break
+    fi
+    sleep 0.25
+done
+[[ "$revoked" == "true" ]] || pairing_fail "a revoked device could still read 4 s later"
+kill "$PAIR_PID" 2>/dev/null || true
+wait "$PAIR_PID" 2>/dev/null || true
+PAIR_PID=""
+report "pairing=pass"
 
 echo ""
 echo "ok: sysmon-agent smoke test passed"

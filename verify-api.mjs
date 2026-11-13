@@ -14,7 +14,12 @@ const agentBudgetArg = args.find((arg) => arg === "--agent-budget" || arg.starts
 const agentBudgetCores = agentBudgetArg ? parseAgentBudget(agentBudgetArg) : null;
 const baseURL = normalizeBaseURL(args.find((arg) => !arg.startsWith("--")) || defaultBaseURL);
 const timeoutMS = 5000;
-const dashboardBuild = "sysmon-static-v167";
+// A host that requires pairing answers its API only to a paired device, or to
+// a read from its own loopback. SYSMON_TOKEN, a token from
+// `sysmon-agent -pair-token <name>`, is sent as a bearer token when set.
+const pairingToken = String(process.env.SYSMON_TOKEN || "").trim();
+const authHeaders = pairingToken ? { Authorization: `Bearer ${pairingToken}` } : {};
+const dashboardBuild = "sysmon-static-v168";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,
@@ -47,6 +52,8 @@ const clientCheckPayload = {
 
 if (sampleMode) {
   validateHealth({ status: "ok" });
+  validatePairState(samplePairState("required"));
+  validatePairState(samplePairState("off"));
   validateReadiness(sampleReadiness());
   validateStatus(sampleStatus());
   validateMetrics(sampleMetrics());
@@ -72,6 +79,16 @@ if (sampleMode) {
 } else {
   const health = await fetchJSON("/healthz");
   validateHealth(health);
+
+  const pairState = await fetchJSON("/api/pair/state");
+  validatePairState(pairState);
+  const paired = pairState.pairing !== "required" || pairState.paired;
+  if (pairingToken && !pairState.paired) {
+    throw new Error(`${baseURL} does not accept SYSMON_TOKEN: no paired device there has that token`);
+  }
+  if (!paired && !pairState.local) {
+    throw new Error(`${baseURL} requires pairing: set SYSMON_TOKEN to a token from \`sysmon-agent -pair-token verify\`, run on that host`);
+  }
 
   const readiness = await fetchJSON("/readyz");
   validateReadiness(readiness);
@@ -104,7 +121,12 @@ if (sampleMode) {
     await assertAgentCostWithinBudget(agentBudgetCores);
   }
 
-  if (settingsRoundTrip) {
+  const writes = [settingsRoundTrip && "settings", clientCheckRoundTrip && "client-check"].filter(Boolean);
+  if (!paired && writes.length > 0) {
+    console.log(`skip: ${writes.join(" and ")} round trip: ${baseURL} requires pairing and lets this machine only read; set SYSMON_TOKEN to run it`);
+  }
+
+  if (settingsRoundTrip && paired) {
     await assertSettingsRejectsMissingOrigin();
 
     const updatedSettings = await fetchJSON("/api/settings", {
@@ -121,7 +143,7 @@ if (sampleMode) {
     validateStatus(statusAfterSettings, roundTripSettings);
   }
 
-  if (clientCheckRoundTrip) {
+  if (clientCheckRoundTrip && paired) {
     await assertClientCheckRejectsMissingOrigin();
 
     const recordedClientCheck = await fetchJSON("/api/client-check", {
@@ -160,6 +182,7 @@ async function fetchJSON(path, options = {}) {
     const response = await fetch(`${baseURL}${path}`, {
       cache: "no-store",
       ...options,
+      headers: { ...authHeaders, ...(options.headers || {}) },
       signal: controller.signal,
     });
     if (!response.ok) {
@@ -181,6 +204,7 @@ async function fetchStatus(path, options = {}) {
     const response = await fetch(`${baseURL}${path}`, {
       cache: "no-store",
       ...options,
+      headers: { ...authHeaders, ...(options.headers || {}) },
       signal: controller.signal,
     });
     return response.status;
@@ -292,6 +316,17 @@ function sampleHistory() {
 function validateHealth(health) {
   assertObject(health, "health");
   assert(health.status === "ok", "health.status must be ok");
+}
+
+function validatePairState(state) {
+  assertObject(state, "pair state");
+  assert(["off", "required"].includes(state.pairing), `pair state.pairing must be off or required, got ${state.pairing}`);
+  for (const key of ["paired", "local", "secure", "window_open"]) {
+    assert(typeof state[key] === "boolean", `pair state.${key} must be a boolean`);
+  }
+  assert(state.pairing === "required" || state.paired, "pair state.paired must be true when pairing is off");
+  assert(state.dashboard_build === dashboardBuild, `pair state.dashboard_build must be ${dashboardBuild}`);
+  assert(!("hostname" in state), "pair state must not name the host");
 }
 
 function validateReadiness(readiness) {
@@ -984,6 +1019,17 @@ function sampleStatus(settings = sampleSettings()) {
     update_check_supported: true,
     client_check: sampleClientCheck(false),
     device_client_check: sampleClientCheck(false),
+  };
+}
+
+function samplePairState(pairing) {
+  return {
+    pairing,
+    paired: pairing === "off",
+    local: false,
+    secure: true,
+    window_open: false,
+    dashboard_build: dashboardBuild,
   };
 }
 

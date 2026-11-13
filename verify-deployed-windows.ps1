@@ -12,6 +12,19 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:ExpectedDashboardBuild = ''
 
+# A host that requires pairing answers its API only to a paired device, or to
+# a read from its own loopback. SYSMON_TOKEN (from sysmon-agent -pair-token
+# verify) is sent as a bearer token on every request here; node verify-api.mjs
+# reads the same variable. The two POSTs pass their own -Headers, which
+# replaces this default, so they add $script:AuthHeaders themselves.
+$script:AuthHeaders = @{}
+if (-not [string]::IsNullOrWhiteSpace($env:SYSMON_TOKEN)) {
+    $script:AuthHeaders = @{ Authorization = "Bearer $($env:SYSMON_TOKEN.Trim())" }
+    $PSDefaultParameterValues['Invoke-RestMethod:Headers'] = $script:AuthHeaders
+    $PSDefaultParameterValues['Invoke-WebRequest:Headers'] = $script:AuthHeaders
+}
+$script:PublicPaired = $true
+
 function Normalize-BaseUrl([string]$Url) {
     while ($Url.EndsWith('/')) {
         $Url = $Url.Substring(0, $Url.Length - 1)
@@ -609,7 +622,7 @@ function Test-SettingsSameOriginRoundTrip([string]$Url) {
     $posted = Invoke-RestMethod `
         -Method Post `
         -Uri "$Url/api/settings" `
-        -Headers @{ Origin = $Url } `
+        -Headers (@{ Origin = $Url } + $script:AuthHeaders) `
         -ContentType 'application/json' `
         -Body $body `
         -TimeoutSec 5
@@ -660,7 +673,7 @@ function Test-ClientCheckSameOriginRoundTrip([string]$Url) {
     $posted = Invoke-RestMethod `
         -Method Post `
         -Uri "$Url/api/client-check" `
-        -Headers @{ Origin = $Url } `
+        -Headers (@{ Origin = $Url } + $script:AuthHeaders) `
         -ContentType 'application/json' `
         -Body $body `
         -TimeoutSec 5
@@ -764,6 +777,19 @@ try {
     Write-Report 'readyz=pass'
     Write-ReadinessCollectionErrors 'readyz' $ready
 
+    $pairState = Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/pair/state" -TimeoutSec 5
+    Write-Report "pairing=$($pairState.pairing)"
+    if ($pairState.pairing -eq 'required' -and $pairState.paired -ne $true) {
+        if ($script:AuthHeaders.Count -gt 0) {
+            Write-Report 'pairing_token=fail'
+            throw 'SYSMON_TOKEN is not a paired device on this agent (sysmon-agent -pair-list shows them).'
+        }
+        $script:PublicPaired = $false
+        Write-Host 'notice: this agent requires pairing and SYSMON_TOKEN is not set, so the published URL is checked only for'
+        Write-Host '        refusing unpaired reads; its API and round trips are skipped. For the full check, mint a token with'
+        Write-Host '        sysmon-agent -pair-token verify -settings <path> and rerun with SYSMON_TOKEN=<token>.'
+    }
+
     Assert-HeaderContains "$BaseUrl/api/status" 'Cache-Control' 'no-store'
     Assert-HeaderContains "$BaseUrl/api/status" 'Content-Security-Policy' "default-src 'self'"
     Assert-HeaderContains "$BaseUrl/" 'Cache-Control' 'no-cache'
@@ -803,27 +829,50 @@ try {
     }
     Write-Report 'public_healthz=pass'
 
-    $publicReady = Invoke-RestMethod -Method Get -Uri "$phoneUrl/readyz" -TimeoutSec 8
-    if ($publicReady.status -ne 'ok' -or -not $publicReady.metrics) {
-        throw "unexpected published readiness response: $($publicReady | ConvertTo-Json -Compress)"
-    }
-    Write-Report 'public_readyz=pass'
-    Write-ReadinessCollectionErrors 'public_readyz' $publicReady
+    if ($script:PublicPaired) {
+        $publicReady = Invoke-RestMethod -Method Get -Uri "$phoneUrl/readyz" -TimeoutSec 8
+        if ($publicReady.status -ne 'ok' -or -not $publicReady.metrics) {
+            throw "unexpected published readiness response: $($publicReady | ConvertTo-Json -Compress)"
+        }
+        Write-Report 'public_readyz=pass'
+        Write-ReadinessCollectionErrors 'public_readyz' $publicReady
 
-    Assert-HeaderContains "$phoneUrl/api/status" 'Cache-Control' 'no-store'
-    Assert-HeaderContains "$phoneUrl/api/status" 'Content-Security-Policy' "default-src 'self'"
+        Assert-HeaderContains "$phoneUrl/api/status" 'Cache-Control' 'no-store'
+        Assert-HeaderContains "$phoneUrl/api/status" 'Content-Security-Policy' "default-src 'self'"
+    } else {
+        # Invoke-WebRequest throws on a 4xx in both PowerShell 5.1 and 7.
+        $unpairedCode = 0
+        try {
+            $unpairedCode = [int](Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri "$phoneUrl/api/status").StatusCode
+        } catch {
+            if ($null -eq $_.Exception.Response) {
+                throw
+            }
+            $unpairedCode = [int]$_.Exception.Response.StatusCode
+        }
+        if ($unpairedCode -ne 401) {
+            Write-Report 'public_pairing_required=fail'
+            throw "published /api/status answered HTTP $unpairedCode to an unpaired client; want 401"
+        }
+        Write-Report 'public_pairing_required=pass'
+        Write-Report 'public_readyz=skipped_pairing_required'
+    }
     Assert-HeaderContains "$phoneUrl/" 'Cache-Control' 'no-cache'
     Assert-HeaderContains "$phoneUrl/" 'X-Content-Type-Options' 'nosniff'
     Write-Report 'public_headers=pass'
 
-    Write-Host 'Checking published API schema...'
-    & node verify-api.mjs $phoneUrl
-    if ($LASTEXITCODE -ne 0) {
-        throw 'published API schema validation failed'
+    if ($script:PublicPaired) {
+        Write-Host 'Checking published API schema...'
+        & node verify-api.mjs $phoneUrl
+        if ($LASTEXITCODE -ne 0) {
+            throw 'published API schema validation failed'
+        }
+        Write-Report 'public_api_schema=pass'
+        $publicStatus = Invoke-RestMethod -Method Get -Uri "$phoneUrl/api/status" -TimeoutSec 5
+    } else {
+        Write-Report 'public_api_schema=skipped_pairing_required'
+        $publicStatus = Invoke-RestMethod -Method Get -Uri "$BaseUrl/api/status" -TimeoutSec 5
     }
-    Write-Report 'public_api_schema=pass'
-
-    $publicStatus = Invoke-RestMethod -Method Get -Uri "$phoneUrl/api/status" -TimeoutSec 5
     $script:ExpectedDashboardBuild = [string]$publicStatus.dashboard_build
     if ([string]::IsNullOrWhiteSpace($script:ExpectedDashboardBuild)) {
         Write-Report 'dashboard_build=unavailable'
@@ -831,9 +880,13 @@ try {
     }
     Write-Report "dashboard_build=$script:ExpectedDashboardBuild"
 
-    Write-Host 'Checking published interactive settings controls...'
-    Test-SettingsSameOriginRoundTrip $phoneUrl
-    Write-Report 'public_settings_roundtrip=pass'
+    if ($script:PublicPaired) {
+        Write-Host 'Checking published interactive settings controls...'
+        Test-SettingsSameOriginRoundTrip $phoneUrl
+        Write-Report 'public_settings_roundtrip=pass'
+    } else {
+        Write-Report 'public_settings_roundtrip=skipped_pairing_required'
+    }
 
     Write-Host 'Checking published dashboard/PWA install assets...'
     Test-PwaInstallAssets $phoneUrl
@@ -850,9 +903,13 @@ try {
         Write-Report 'initial_device_client_seen=false'
     }
 
-    Write-Host 'Checking published client-check controls...'
-    Test-ClientCheckSameOriginRoundTrip $phoneUrl
-    Write-Report 'public_client_check_roundtrip=pass'
+    if ($script:PublicPaired) {
+        Write-Host 'Checking published client-check controls...'
+        Test-ClientCheckSameOriginRoundTrip $phoneUrl
+        Write-Report 'public_client_check_roundtrip=pass'
+    } else {
+        Write-Report 'public_client_check_roundtrip=skipped_pairing_required'
+    }
 
     if ($HoldSeconds -eq 0) {
         Write-Report 'device_client_seen=not_attempted'

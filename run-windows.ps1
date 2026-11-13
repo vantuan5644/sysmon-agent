@@ -41,7 +41,11 @@ param(
     [ValidateRange(1, 65535)]
     [int]$Port = 9099,
     [switch]$Background,
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    # off keeps the dev agent open, as before pairing existed; the binary
+    # itself defaults to required (docs/plans/pairing.md).
+    [ValidateSet('off', 'required')]
+    [string]$Pairing = 'off'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -93,7 +97,7 @@ if ($NoBuild) {
 # Brief pause so the OS releases the port before we rebind.
 Start-Sleep -Milliseconds 500
 
-$agentArgs = @('-bind', $Bind, '-port', $Port)
+$agentArgs = @('-bind', $Bind, '-port', $Port, '-pairing', $Pairing)
 
 if ($Background) {
     Write-Host "==> Starting agent in background: $AgentPath $($agentArgs -join ' ')"

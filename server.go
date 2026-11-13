@@ -205,6 +205,8 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 	mux.HandleFunc("GET /api/hosts/{id}/stream", withPeerRegistry(state, (*peerRegistry).serveRelayStream))
 	mux.HandleFunc("GET /api/hosts/{id}/{route}", withPeerRegistry(state, (*peerRegistry).serveRelayRead))
 	mux.HandleFunc("POST /api/hosts/{id}/control", withPeerRegistry(state, (*peerRegistry).serveRelayControl))
+	// Pairs this agent with a peer that requires pairing (peer_tokens.go).
+	mux.HandleFunc("POST /api/hosts/{id}/pair", withPeerRegistry(state, (*peerRegistry).serveRelayPair))
 	mux.HandleFunc("GET /api/settings", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, state.GetSettings())
 	})
@@ -361,8 +363,9 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 			writeJSON(w, http.StatusInternalServerError, decision)
 		}
 	})
+	registerPairingRoutes(mux, state)
 	mux.Handle("GET /", staticAssetHandler(staticSub))
-	return securityHeaders(mux), nil
+	return securityHeaders(requirePairing(state, mux)), nil
 }
 
 func withPeerRegistry(state *RuntimeState, handle func(*peerRegistry, http.ResponseWriter, *http.Request)) http.HandlerFunc {

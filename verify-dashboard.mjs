@@ -543,7 +543,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v167",
+    dashboard_build: "sysmon-static-v168",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -561,7 +561,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v167",
+    dashboard_build: "sysmon-static-v168",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1248,7 +1248,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v167, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v168, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1296,7 +1296,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v167; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v168; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1306,7 +1306,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v167",
+    dashboard_build: "sysmon-static-v168",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1316,7 +1316,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v167",
+    dashboard_build: "sysmon-static-v168",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1451,7 +1451,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v167", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v168", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -3041,7 +3041,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v167" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v168" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],
@@ -3173,6 +3173,377 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   }
   assert(document.getElementById("hostSheet").hidden === true, "Escape did not close the host sheet");
   assert(context.totalIntervalCount() === intervalsBefore, "host switching changed the interval inventory");
+}
+
+// Pairing. An agent that requires pairing answers 401 to every route but its
+// pairing ones until the device pairs. Each case runs app.js in a context of
+// its own, with its own fetch stub, timers and storage, so the main run's
+// request counts and interval inventory are untouched.
+async function runPairingCase({ pairState, onFetch }) {
+  const pairDocument = new Document(html);
+  // The fake DOM ignores the hidden attribute; start these the way the
+  // markup does, so a "shown" assertion means app.js showed it.
+  for (const id of ["pairScreen", "pairInsecure", "pairError", "pairingPanel", "pairingWindowBox", "pairingPanelError", "hostPairScreen"]) {
+    pairDocument.getElementById(id).hidden = true;
+  }
+  const intervals = new Map();
+  const timeouts = new Map();
+  let nextId = 1;
+  const storage = new Map();
+  const run = {
+    document: pairDocument,
+    requests: [],
+    reloads: 0,
+    now: 1_000_000,
+    pairState,
+    intervals,
+    byId: (id) => pairDocument.getElementById(id),
+    count: (path, method = "GET") => run.requests.filter((request) => request.path === path && request.method === method).length,
+  };
+  const pairContext = {
+    ...context,
+    document: pairDocument,
+    navigator: {
+      userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+      maxTouchPoints: 5,
+      sendBeacon: () => true,
+    },
+    localStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => {
+        storage.set(key, String(value));
+      },
+    },
+    location: {
+      host: "10.0.0.4:9099",
+      pathname: "/",
+      reload: () => {
+        run.reloads += 1;
+      },
+    },
+    addEventListener: () => {},
+    fetch: async (path, options = {}) => {
+      run.requests.push({ path, method: options.method || "GET", headers: options.headers || {}, body: options.body });
+      if (path === "/api/pair/state") {
+        // null stands for an agent older than pairing, which has no route.
+        return run.pairState ? response(run.pairState) : response({ error: "not found" }, 404);
+      }
+      const answer = onFetch?.(path, options, run);
+      if (answer) {
+        return answer;
+      }
+      if (path.startsWith("/api/")) {
+        return response({ error: "pairing_required" }, 401);
+      }
+      return response({ error: "not found" }, 404);
+    },
+    setInterval: (callback, delay) => {
+      const id = nextId;
+      nextId += 1;
+      intervals.set(id, { callback, delay });
+      return id;
+    },
+    clearInterval: (id) => {
+      intervals.delete(id);
+    },
+    setTimeout: (callback) => {
+      const id = nextId;
+      nextId += 1;
+      timeouts.set(id, callback);
+      return id;
+    },
+    clearTimeout: (id) => {
+      timeouts.delete(id);
+    },
+    __sysmonNow: () => run.now,
+  };
+  pairContext.window = pairContext;
+  run.context = pairContext;
+  vm.runInNewContext(app, pairContext, { filename: "static/app.js" });
+  pairDocument.dispatch("DOMContentLoaded");
+  await settlePairing();
+  return run;
+}
+
+async function settlePairing() {
+  for (let i = 0; i < 4; i += 1) {
+    await flushMicrotasks();
+  }
+}
+
+async function submitPIN(run, pin) {
+  run.byId("pairPin").value = pin;
+  await run.byId("pairForm").dispatch("submit");
+  await settlePairing();
+}
+
+{
+  // An unpaired device on a secure connection: the pairing screen takes over.
+  const unpaired = { pairing: "required", paired: false, local: false, secure: true, window_open: true, dashboard_build: "" };
+  const run = await runPairingCase({
+    pairState: unpaired,
+    onFetch: (path, options) => {
+      if (path === "/api/pair" && options.method === "POST") {
+        const body = JSON.parse(options.body);
+        if (body.pin === "276769") {
+          return response({ device: { id: "aaa", name: body.name, kind: "browser" } });
+        }
+        return response({ error: "wrong PIN", remaining: 4 }, 403);
+      }
+      return null;
+    },
+  });
+  assert(run.byId("pairScreen").hidden === false, "a 401 pairing_required did not show the pairing screen");
+  assert(run.byId("shell").inert === true, "the app behind the pairing screen stayed reachable");
+  assert(run.intervals.size === 0, `the locked app kept ${run.intervals.size} timers running`);
+  assert(run.requests.filter((request) => request.path !== "/api/pair/state").length > 1, "the fixture sent too few refused requests to test the recheck limit");
+  assert(run.count("/api/pair/state") === 1, `refused requests asked for the pairing state ${run.count("/api/pair/state")} times, want 1`);
+  assert(run.byId("pairName").value === "iPhone app", `the device name guess was ${JSON.stringify(run.byId("pairName").value)}`);
+  assert(run.byId("pairWaiting").textContent === "A PIN is open on the host.", "an open PIN was not mentioned");
+  assert(run.byId("pairSubmit").disabled !== true, "the Pair button was disabled on a secure connection");
+  assert(run.byId("pairInsecure").hidden === true, "the plain-HTTP notice showed on a secure connection");
+
+  await submitPIN(run, "12345");
+  assert(run.count("/api/pair", "POST") === 0, "a 5-digit PIN was sent");
+  assert(run.byId("pairError").hidden === false && run.byId("pairError").textContent.includes("6-digit"), "a short PIN gave no error");
+
+  await submitPIN(run, "123 456");
+  const attempt = run.requests.find((request) => request.path === "/api/pair" && request.method === "POST");
+  assert(attempt, "a 6-digit PIN was not sent");
+  assert(attempt.headers["Content-Type"] === "application/json", "the pairing request was not sent as JSON");
+  assert(JSON.parse(attempt.body).pin === "123456", `the PIN was sent as ${JSON.parse(attempt.body).pin}, want its digits only`);
+  assert(JSON.parse(attempt.body).name === "iPhone app", "the device name was not sent");
+  assert(run.byId("pairError").textContent.includes("4 tries left"), `a wrong PIN said ${JSON.stringify(run.byId("pairError").textContent)}`);
+  assert(run.byId("pairPin").getAttribute("aria-invalid") === "true", "a wrong PIN did not mark the field invalid");
+  assert(run.byId("pairSubmit").disabled === false && run.byId("pairSubmit").textContent === "Pair", "the Pair button did not recover after a wrong PIN");
+  assert(run.reloads === 0, "a wrong PIN reloaded the app");
+
+  // Paired from elsewhere while this screen was in the background: coming
+  // back asks again and reloads into the dashboard.
+  run.pairState = { ...unpaired, paired: true };
+  run.document.dispatch("visibilitychange");
+  await settlePairing();
+  assert(run.reloads === 1, "coming back after being paired elsewhere did not reload");
+  assert(run.intervals.size === 0, "coming back to the pairing screen started the dashboard timers");
+
+  run.pairState = unpaired;
+  await submitPIN(run, "276 769");
+  assert(run.reloads === 2, "a right PIN did not reload into the dashboard");
+}
+
+{
+  // Plain HTTP across the network: the agent will not pair over it, and the
+  // screen says so before a PIN is typed.
+  const run = await runPairingCase({
+    pairState: { pairing: "required", paired: false, local: false, secure: false, window_open: false, dashboard_build: "" },
+  });
+  assert(run.byId("pairInsecure").hidden === false, "plain HTTP showed no notice");
+  assert(run.byId("pairSecureLink").href === "https://10.0.0.4:9099/", `the https link was ${run.byId("pairSecureLink").href}`);
+  assert(run.byId("pairSubmit").disabled === true && run.byId("pairPin").disabled === true, "the form stayed usable over plain HTTP");
+  assert(run.byId("pairWaiting").textContent === "No PIN is open yet.", "a closed window was not mentioned");
+}
+
+{
+  // A paired device: the dashboard runs, and "Paired devices" lists this
+  // agent's devices with Remove, Unpair and Pair another device.
+  let devices = [
+    { id: "aaa", name: "iPhone app", kind: "browser", created: "2026-11-13T09:00:00Z", last_seen: "2026-11-13T10:00:00Z", current: true },
+    { id: "bbb", name: "ci", kind: "token", created: "2026-11-12T09:00:00Z" },
+  ];
+  const run = await runPairingCase({
+    pairState: { pairing: "required", paired: true, local: false, secure: true, window_open: false, dashboard_build: "" },
+    onFetch: (path, options, current) => {
+      const method = options.method || "GET";
+      if (path === "/api/pair/devices" && method === "GET") {
+        return response({ devices });
+      }
+      if (path.startsWith("/api/pair/devices/") && method === "DELETE") {
+        const id = decodeURIComponent(path.slice("/api/pair/devices/".length));
+        const removed = devices.find((device) => device.id === id);
+        devices = devices.filter((device) => device.id !== id);
+        return response({ removed });
+      }
+      if (path === "/api/pair/window" && method === "POST") {
+        return response({ pin: "123456", pin_display: "123 456", expires_at: new Date(Date.now() + 600000).toISOString() });
+      }
+      if (path.startsWith("/api/hosts/") && current.peerLocked) {
+        return response({ error: "pairing_required" }, 401);
+      }
+      return response({ error: "not found" }, 404);
+    },
+  });
+  const list = run.byId("pairedList");
+  assert(run.byId("pairScreen").hidden === true, "a paired device saw the pairing screen");
+  assert(run.byId("shell").inert !== true, "a paired device's app was made inert");
+  assert(run.intervals.size > 0, "a paired device's dashboard started no timers");
+  assert(run.byId("pairingPanel").hidden === false, "Paired devices stayed hidden on a paired device");
+  assert(run.byId("pairingSummary").textContent === "2 devices", `the summary read ${run.byId("pairingSummary").textContent}`);
+  assert(list.children.length === 2, `Paired devices listed ${list.children.length} rows, want 2`);
+  assert(list.children[0].textContent.includes("this device"), "the current device was not marked");
+  assert(list.children[0].children[1].textContent === "Unpair", "the current device's button was not Unpair");
+  assert(list.children[1].children[1].textContent === "Remove", "another device's button was not Remove");
+
+  // Remove takes two taps.
+  await list.children[1].children[1].click();
+  await settlePairing();
+  assert(run.count("/api/pair/devices/bbb", "DELETE") === 0, "one tap removed a device");
+  assert(list.children[1].children[1].textContent === "Confirm" && list.children[1].children[1].classList.contains("armed"), "the first tap did not ask for confirmation");
+  await list.children[1].children[1].click();
+  await settlePairing();
+  assert(run.count("/api/pair/devices/bbb", "DELETE") === 1, "the second tap did not remove the device");
+  assert(list.children.length === 1 && run.byId("pairingSummary").textContent === "1 device", "the removed device stayed listed");
+  assert(run.reloads === 0, "removing another device reloaded the app");
+
+  await run.byId("pairAnotherBtn").click();
+  await settlePairing();
+  assert(run.count("/api/pair/window", "POST") === 1, "Pair another device opened no window");
+  assert(run.byId("pairingWindowBox").hidden === false && run.byId("pairingWindowPin").textContent === "123 456", "the new PIN was not shown");
+  assert(run.byId("pairAnotherBtn").textContent === "New PIN", "the button did not offer a new PIN");
+
+  // Viewing a peer hides this agent's list, and a 401 the peer gives about
+  // itself must not lock this agent's app.
+  run.peerLocked = true;
+  run.now += 20000;
+  const checksBefore = run.count("/api/pair/state");
+  run.context.selectHost("peer");
+  await settlePairing();
+  assert(run.byId("pairingPanel").hidden === true, "Paired devices stayed up while a peer was viewed");
+  assert(run.count("/api/pair/state") === checksBefore + 1, "a peer's 401 did not recheck the local pairing state");
+  assert(run.byId("pairScreen").hidden === true && run.byId("shell").inert !== true, "a peer's 401 locked this agent's app");
+  const listsBefore = run.count("/api/pair/devices");
+  run.context.selectHost("local");
+  await settlePairing();
+  assert(run.byId("pairingPanel").hidden === false, "Paired devices did not come back on the local agent");
+  assert(run.count("/api/pair/devices") === listsBefore + 1, "switching back did not refresh Paired devices");
+}
+
+{
+  // An agent with pairing off, or one older than pairing (404), shows
+  // neither the screen nor the panel.
+  for (const pairState of [{ pairing: "off", paired: true, local: false, secure: false, window_open: false, dashboard_build: "" }, null]) {
+    const run = await runPairingCase({
+      pairState,
+      onFetch: () => response({ error: "not found" }, 404),
+    });
+    assert(run.byId("pairScreen").hidden === true && run.byId("pairingPanel").hidden === true, `pairing ${pairState ? "off" : "absent"} showed pairing UI`);
+    assert(run.count("/api/pair/devices") === 0, `pairing ${pairState ? "off" : "absent"} asked for the device list`);
+  }
+}
+
+{
+  // A peer that requires pairing and refuses this agent is listed as locked.
+  // Choosing it asks for that host's PIN, which this agent relays; a relayed
+  // 423 while the peer is in view asks again, and Cancel goes back to this
+  // agent. This agent itself has pairing off here.
+  const fingerprint = "AB".repeat(32);
+  const lockedPeer = { id: "peer", name: "gamma", source: "configured", online: true, locked: true, cert_sha256: fingerprint };
+  const hosts = {
+    hosts: [{ id: "local", name: "home", self: true, source: "local", online: true }, lockedPeer],
+    discovery: { enabled: false, available: false, scanning: false },
+  };
+  const pairBodies = [];
+  const run = await runPairingCase({
+    pairState: { pairing: "off", paired: true, local: false, secure: true, window_open: false, dashboard_build: "" },
+    onFetch: (path, options, current) => {
+      const method = options.method || "GET";
+      if (path === "/api/hosts" || path === "/api/hosts?refresh=1") {
+        return response(hosts);
+      }
+      if (path === "/api/hosts/peer/pair" && method === "POST") {
+        const body = JSON.parse(options.body);
+        pairBodies.push(body);
+        if (body.pin !== "123456") {
+          return response({ error: "wrong PIN", remaining: 4 }, 403);
+        }
+        current.peerLocked = false;
+        hosts.hosts[1] = { id: "peer", name: "gamma", source: "configured", online: true, os: "linux" };
+        return response({ paired: true, id: "peer" });
+      }
+      if (path.startsWith("/api/hosts/peer/")) {
+        if (current.peerLocked) {
+          return response({ error: "gamma requires pairing", host_locked: true, cert_sha256: fingerprint }, 423);
+        }
+        if (path === "/api/hosts/peer/metrics") {
+          return response({ ...sampleMetrics(), hostname: "gamma" });
+        }
+        if (path === "/api/hosts/peer/status") {
+          return response(sampleStatus());
+        }
+        return response({ error: "not found" }, 404);
+      }
+      if (path === "/api/metrics") {
+        return response(sampleMetrics());
+      }
+      if (path === "/api/status") {
+        return response(sampleStatus());
+      }
+      if (path === "/api/settings") {
+        return response(settings);
+      }
+      return response({ error: "not found" }, 404);
+    },
+  });
+  run.peerLocked = true;
+  const dialog = run.byId("hostPairScreen");
+  const hostRows = () => run.byId("hostList").children.filter((child) => child.className?.startsWith("host-row"));
+
+  await run.byId("hostSwitch").click();
+  await settlePairing();
+  const peerRow = hostRows()[1];
+  assert(peerRow.textContent.includes("Locked"), "a locked peer was not badged Locked");
+  assert(peerRow.textContent.includes("Needs a PIN"), "a locked peer's row did not say it needs a PIN");
+
+  await peerRow.click();
+  await settlePairing();
+  assert(dialog.hidden === false, "choosing a locked peer did not ask for its PIN");
+  assert(run.byId("shell").inert === true, "the app behind the host PIN dialog stayed reachable");
+  assert(run.byId("hostPairTitle").textContent === "Pair gamma", `the dialog title read ${run.byId("hostPairTitle").textContent}`);
+  assert(run.byId("hostPairCert").hidden === false, "the peer's certificate was not shown");
+  assert(run.byId("hostPairCertValue").textContent === Array(32).fill("AB").join(":"), "the certificate was not printed the way -pair prints it");
+  assert(run.byId("hostPairNote").hidden === true, "a peer with no note showed one");
+  assert(run.count("/api/hosts/peer/metrics") === 0, "choosing a locked peer still asked it for metrics");
+
+  run.byId("hostPairPin").value = "12345";
+  await run.byId("hostPairForm").dispatch("submit");
+  await settlePairing();
+  assert(pairBodies.length === 0, "a 5-digit PIN was sent");
+  assert(run.byId("hostPairError").textContent === "Enter the 6-digit PIN shown on gamma.", `a short PIN read ${run.byId("hostPairError").textContent}`);
+
+  run.byId("hostPairPin").value = "111111";
+  await run.byId("hostPairForm").dispatch("submit");
+  await settlePairing();
+  assert(pairBodies.length === 1 && pairBodies[0].cert_sha256 === fingerprint, "the PIN did not go out with the certificate the dialog showed");
+  assert(run.byId("hostPairError").textContent === "Wrong PIN. 4 tries left before this PIN closes.", `a wrong PIN read ${run.byId("hostPairError").textContent}`);
+  assert(dialog.hidden === false, "a wrong PIN closed the dialog");
+
+  const before = run.requests.length;
+  run.byId("hostPairPin").value = "123 456";
+  await run.byId("hostPairForm").dispatch("submit");
+  await settlePairing();
+  assert(pairBodies.length === 2 && pairBodies[1].pin === "123456", "the PIN was not sent as six digits");
+  assert(dialog.hidden === true, "pairing the peer left the dialog open");
+  assert(run.byId("shell").inert !== true, "pairing the peer left the app inert");
+  const after = run.requests.slice(before).map((request) => request.path);
+  assert(after.includes("/api/hosts/peer/metrics") && after.includes("/api/hosts/peer/status"), "the paired peer was not viewed");
+  assert(run.byId("pairScreen").hidden === true, "a peer's pairing showed this agent's own pairing screen");
+
+  // The peer revokes this agent: the next relayed read answers 423, and the
+  // dialog comes back with the relay's note about the certificate.
+  run.peerLocked = true;
+  hosts.hosts[1] = { ...lockedPeer, error: "certificate changed since it was paired" };
+  run.now += 20000;
+  await run.context.fetchMetrics();
+  await settlePairing();
+  assert(dialog.hidden === false, "a relayed 423 did not ask for the peer's PIN");
+  assert(run.byId("hostPairNote").hidden === false && run.byId("hostPairNote").textContent.startsWith("Certificate changed since it was paired."), `the note read ${run.byId("hostPairNote").textContent}`);
+  assert(run.byId("pairScreen").hidden === true && run.count("/api/pair/state") === 1, "a peer's 423 was taken for this agent's own pairing");
+
+  const beforeCancel = run.requests.length;
+  run.context.handleHostPairKeydown({ key: "Escape" });
+  await settlePairing();
+  assert(dialog.hidden === true && run.byId("shell").inert !== true, "Escape did not close the host PIN dialog");
+  const afterCancel = run.requests.slice(beforeCancel).map((request) => request.path);
+  assert(afterCancel.includes("/api/metrics") && !afterCancel.some((path) => path.startsWith("/api/hosts/peer/")), "leaving a locked peer did not go back to this agent");
 }
 
 console.log("ok: dashboard runtime smoke test passed");

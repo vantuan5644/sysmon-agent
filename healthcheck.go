@@ -48,7 +48,7 @@ func waitForConfiguredReady(config listenConfig, timeout time.Duration) error {
 
 func healthCheckClient(config listenConfig) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if config.tlsEnabled {
+	if healthCheckScheme(config) == "https" {
 		// This is a local readiness probe for the running agent. Direct TLS may
 		// use a self-signed certificate or a certificate for the public tailnet
 		// name, so hostname verification would make the startup check brittle.
@@ -68,9 +68,22 @@ func readinessCheckURL(config listenConfig) string {
 	return probeURL(config, "/readyz")
 }
 
+// healthCheckScheme is plain HTTP unless the agent would refuse it: under -tls, or
+// with network TLS when the check has to use a network address (a -bind to
+// one specific interface), where plain HTTP is answered with a redirect.
+func healthCheckScheme(config listenConfig) string {
+	if config.tlsEnabled {
+		return "https"
+	}
+	if config.networkTLS && !isLoopbackBind(healthCheckHost(config.bind)) {
+		return "https"
+	}
+	return "http"
+}
+
 func probeURL(config listenConfig, path string) string {
 	return (&url.URL{
-		Scheme: config.scheme(),
+		Scheme: healthCheckScheme(config),
 		Host:   net.JoinHostPort(healthCheckHost(config.bind), strconv.Itoa(config.port)),
 		Path:   path,
 	}).String()

@@ -36,6 +36,23 @@ const state = {
   alertsExpanded: false,
   alertMessages: [],
   staleDashboardBuild: "",
+  // Pairing (see "Pairing" near the end): the last /api/pair/state answer,
+  // whether the pairing screen holds the app, and the "Paired devices" panel.
+  pairing: null,
+  pairingLocked: false,
+  // hostLocked: the host in view is a peer refusing this agent (423); its
+  // metrics stop until it is paired or left. hostPair is its PIN dialog.
+  hostLocked: false,
+  hostPair: null,
+  hostPairSubmitting: false,
+  pairingCheckInFlight: false,
+  pairingCheckedAtMS: 0,
+  pairingSubmitting: false,
+  pairedDevices: [],
+  pairedDevicesInFlight: false,
+  pairingWindow: null,
+  pairingArmedID: "",
+  pairingArmTimer: null,
   lastProcesses: null,
   staticRefreshInFlight: false,
   lastMetricsAtMS: 0,
@@ -129,7 +146,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v167";
+const dashboardBuild = "sysmon-static-v168";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -313,6 +330,11 @@ document.addEventListener("DOMContentLoaded", () => {
   // bubbles here); the button is what keyboard and VoiceOver users reach.
   $("gpuAlarm").addEventListener("click", snoozeGPUAlarm);
   document.addEventListener("keydown", handleGPUAlarmKeydown);
+  $("pairForm").addEventListener("submit", submitPairing);
+  $("pairAnotherBtn").addEventListener("click", openPairingWindow);
+  $("hostPairForm").addEventListener("submit", submitHostPair);
+  $("hostPairCancel").addEventListener("click", cancelHostPair);
+  document.addEventListener("keydown", handleHostPairKeydown);
   setupPager();
   reflectProcSort();
 
@@ -337,6 +359,9 @@ document.addEventListener("DOMContentLoaded", () => {
   restoreWakePreference();
   // Before the first fetch: every host-scoped request below reads hostID.
   restoreHostPreference();
+  // Ask first whether this device must pair; the 401s from the fetches below
+  // then find that check already under way instead of starting their own.
+  fetchPairingState();
   fetchSettings();
   fetchStatus();
   // One quota fetch at load reveals (or hides) the fourth page; afterwards the
@@ -546,7 +571,7 @@ function syncStandaloneViewportGap() {
 
 function schedulePolling() {
   clearDashboardInterval("timer");
-  if (state.paused || document.visibilityState !== "visible") {
+  if (state.paused || state.pairingLocked || state.hostLocked || document.visibilityState !== "visible") {
     closeStream();
     return;
   }
@@ -696,6 +721,10 @@ function scheduleStalePolling() {
 }
 
 function syncVisibleTimers() {
+  if (state.pairingLocked) {
+    // Every route but the pairing ones answers 401 until this device pairs.
+    return;
+  }
   schedulePolling();
   scheduleStatusPolling();
   scheduleStalePolling();
@@ -775,6 +804,14 @@ function shouldSendClientCheck() {
 function refreshVisibleDashboard() {
   if (document.visibilityState !== "visible") {
     return;
+  }
+  if (state.pairingLocked || pairingRequired()) {
+    // Locked: find out whether this device was paired meanwhile (it reloads
+    // if so). Paired: the device list may have changed while away.
+    fetchPairingState();
+    if (state.pairingLocked) {
+      return;
+    }
   }
   if (state.wakeWanted && !state.wakeLock) {
     requestWakeLock();
@@ -938,8 +975,9 @@ async function fetchWithTimeout(path, options, timeoutMS) {
   }
 
   let timeout;
+  let response;
   try {
-    return await Promise.race([
+    response = await Promise.race([
       fetch(path, requestOptions),
       new Promise((_, reject) => {
         timeout = setTimeout(() => {
@@ -953,6 +991,16 @@ async function fetchWithTimeout(path, options, timeoutMS) {
   } finally {
     clearTimeout(timeout);
   }
+  if (response?.status === 401) {
+    // An agent that requires pairing refuses an unpaired device with 401;
+    // the caller still handles the response as a failure.
+    notePairingRequired();
+  } else if (response?.status === 423 && state.hostID && String(path).startsWith(`/api/hosts/${encodeURIComponent(state.hostID)}/`)) {
+    // The relay's answer for a peer that requires pairing and refuses this
+    // agent: ask for that host's PIN.
+    noteHostLocked();
+  }
+  return response;
 }
 
 function sendClientCheck(options = {}) {
@@ -1323,6 +1371,9 @@ function applyHosts(payload) {
     : [];
   state.hosts = hosts;
   state.hostsDiscovery = payload?.discovery && typeof payload.discovery === "object" ? payload.discovery : null;
+  if (state.hostPair) {
+    updateHostPair(hosts.find((host) => host.id === state.hostPair.id));
+  }
   const scanning = state.hostsDiscovery?.scanning === true;
   // A remembered host the agent no longer lists (dropped from -peers, or a
   // tailnet machine it forgot across a restart) falls back to this agent,
@@ -1448,17 +1499,24 @@ function handleHostSheetKeydown(event) {
   }
 }
 
-function selectHost(id) {
+function selectHost(id, options = {}) {
   const next = !id || id === localHostID ? "" : String(id);
   closeHostSheet();
-  if (next === state.hostID) {
+  if (next === state.hostID && !options.force) {
     return;
   }
   state.hostID = next;
   state.hostGeneration += 1;
+  state.hostLocked = false;
   writeStoredHostID(next);
   resetHostView();
   renderHostSwitch();
+  // "Paired devices" lists this agent's devices, so it shows only while this
+  // agent is the one viewed.
+  renderPairingPanel();
+  if (!next && pairingRequired()) {
+    fetchPairedDevices();
+  }
   schedulePolling();
   fetchStatus();
   fetchQuota();
@@ -1570,10 +1628,10 @@ function hostRow(host) {
   detail.textContent = hostRowDetail(host);
   text.append(name, detail);
   row.append(dot, text);
-  if (host.self) {
+  if (host.self || host.locked) {
     const badge = document.createElement("span");
-    badge.className = "host-row-badge";
-    badge.textContent = "this agent";
+    badge.className = host.self ? "host-row-badge" : "host-row-badge locked";
+    badge.textContent = host.self ? "this agent" : "Locked";
     row.append(badge);
   }
   if (current) {
@@ -1582,7 +1640,8 @@ function hostRow(host) {
     row.append(check);
   }
   row.title = host.address ? `${host.name} (${host.address})` : (host.name || id);
-  row.addEventListener("click", () => selectHost(id));
+  // A locked host has nothing to show until this agent is paired with it.
+  row.addEventListener("click", () => (host.locked && !host.self ? openHostPair(host) : selectHost(id)));
   return row;
 }
 
@@ -1597,6 +1656,8 @@ function hostRowDetail(host) {
     } else {
       parts.push(host.error ? `Offline: ${String(host.error).slice(0, 48)}` : "Offline");
     }
+  } else if (host.locked) {
+    parts.push(host.error ? sentenceStart(String(host.error).slice(0, 48)) : "Needs a PIN");
   }
   const os = osLabels[String(host.os || "").toLowerCase()] || String(host.os || "");
   if (os) {
@@ -1622,6 +1683,174 @@ function hostDiscoveryNote(discovery) {
   }
   const scannedMS = Date.parse(discovery.scanned_at);
   return Number.isFinite(scannedMS) ? `Tailnet scanned ${formatSampleAge(scannedMS)} ago` : "Tailnet scan on";
+}
+
+// --- Pairing a peer through this agent --------------------------------------
+// A peer that requires pairing is listed as locked. Choosing it, or a relayed
+// 423 while it is the host in view, asks for that host's PIN. This agent pairs
+// with the peer and keeps the token (POST /api/hosts/<id>/pair), so the
+// browser never holds it and every device using this dashboard can view the
+// peer afterwards. A peer behind its own self-signed certificate shows its
+// SHA-256, to compare with what `sysmon-agent -pair` printed on that host.
+
+function noteHostLocked() {
+  if (!state.hostID) {
+    return;
+  }
+  if (!state.hostLocked) {
+    // Every poll of a locked host costs the peer a refused request.
+    state.hostLocked = true;
+    schedulePolling();
+  }
+  if (state.hostPair) {
+    return;
+  }
+  openHostPair(currentHostEntry() || { id: state.hostID, name: currentHostLabel() });
+  // The relay has just marked the host locked; the list says over which
+  // certificate.
+  fetchHosts();
+}
+
+function openHostPair(host) {
+  if (!host?.id || host.self) {
+    return;
+  }
+  closeHostSheet();
+  disarmControl();
+  state.hostPair = { id: host.id, name: host.name || host.id, cert: "" };
+  updateHostPair(host);
+  $("hostPairPin").value = "";
+  showHostPairError("");
+  setHostPairBusy(false);
+  $("hostPairScreen").hidden = false;
+  // Nothing behind the dialog may take focus or reach a screen reader.
+  setShellInert(true);
+  focusElement($("hostPairPin"));
+}
+
+// updateHostPair fills the dialog from a host entry; a newer host list
+// replaces it while the dialog is open.
+function updateHostPair(host) {
+  const pair = state.hostPair;
+  if (!pair || !host || host.id !== pair.id) {
+    return;
+  }
+  pair.name = host.name || pair.name;
+  pair.cert = normalizeCertFingerprint(host.cert_sha256);
+  $("hostPairTitle").textContent = `Pair ${pair.name}`;
+  $("hostPairHostName").textContent = pair.name;
+  $("hostPairCert").hidden = !pair.cert;
+  $("hostPairCertValue").textContent = formatCertFingerprint(pair.cert);
+  const note = String(host.error || "").trim();
+  $("hostPairNote").hidden = !note;
+  $("hostPairNote").textContent = note ? `${sentenceStart(note)}. Compare the certificate before pairing again.` : "";
+}
+
+function closeHostPair() {
+  if (!state.hostPair) {
+    return;
+  }
+  state.hostPair = null;
+  $("hostPairScreen").hidden = true;
+  setShellInert(false);
+}
+
+function cancelHostPair() {
+  const pair = state.hostPair;
+  if (!pair) {
+    return;
+  }
+  closeHostPair();
+  // A locked host has nothing to show: go back to this agent.
+  if (state.hostID === pair.id) {
+    selectHost(localHostID);
+  }
+  focusElement($("hostSwitch"));
+}
+
+function handleHostPairKeydown(event) {
+  if (state.hostPair && event?.key === "Escape") {
+    event.preventDefault?.();
+    cancelHostPair();
+  }
+}
+
+async function submitHostPair(event) {
+  event?.preventDefault?.();
+  const pair = state.hostPair;
+  if (!pair || state.hostPairSubmitting) {
+    return;
+  }
+  const pin = String($("hostPairPin").value || "").replace(/\D/g, "");
+  if (pin.length !== 6) {
+    showHostPairError(`Enter the 6-digit PIN shown on ${pair.name}.`);
+    return;
+  }
+  state.hostPairSubmitting = true;
+  setHostPairBusy(true);
+  showHostPairError("");
+  try {
+    const response = await fetchWithTimeout(`/api/hosts/${encodeURIComponent(pair.id)}/pair`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pin, cert_sha256: pair.cert }),
+    }, auxiliaryTimeoutMS);
+    let body = null;
+    try {
+      body = await response.json();
+    } catch {
+    }
+    if (state.hostPair !== pair) {
+      // Cancelled while the PIN was on its way.
+      return;
+    }
+    if (response.ok) {
+      closeHostPair();
+      // View it from scratch, even when its locked view is already up.
+      selectHost(pair.id, { force: true });
+      fetchHosts();
+      return;
+    }
+    showHostPairError(pairingErrorText(response.status, body, pair.name));
+    if (body?.cert_changed) {
+      fetchHosts({ refresh: true });
+    }
+    if (response.status === 409 || (response.status === 403 && body?.remaining === 0)) {
+      $("hostPairPin").value = "";
+    }
+  } catch (error) {
+    showHostPairError(`Could not reach this agent (${error?.message || "request failed"}). Check the connection and try again.`);
+  } finally {
+    state.hostPairSubmitting = false;
+    setHostPairBusy(false);
+  }
+}
+
+function showHostPairError(message) {
+  const error = $("hostPairError");
+  error.textContent = message;
+  error.hidden = !message;
+  $("hostPairPin").setAttribute("aria-invalid", message ? "true" : "false");
+}
+
+function setHostPairBusy(busy) {
+  $("hostPairSubmit").disabled = busy;
+  $("hostPairSubmit").textContent = busy ? "Pairing…" : "Pair";
+  $("hostPairForm").setAttribute("aria-busy", busy ? "true" : "false");
+}
+
+function normalizeCertFingerprint(value) {
+  const hex = String(value || "").replace(/[\s:-]/g, "").toUpperCase();
+  return /^[0-9A-F]{64}$/.test(hex) ? hex : "";
+}
+
+// formatCertFingerprint prints it the way `sysmon-agent -pair` does.
+function formatCertFingerprint(hex) {
+  return hex ? hex.match(/.{2}/g).join(":") : "";
+}
+
+function sentenceStart(text) {
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : text;
 }
 
 // releaseVersionPattern matches a real release tag ("v1.2.3" / "1.2.3", with an
@@ -5383,4 +5612,413 @@ function nowMS() {
     return window.__sysmonNow();
   }
   return Date.now();
+}
+
+// --- Pairing ---------------------------------------------------------------
+// An agent started with pairing required answers 401 pairing_required to every
+// data and control route until this device is paired (docs/plans/pairing.md).
+// Every request goes through fetchWithTimeout, so that is where a 401 is
+// noticed; a refused EventSource cannot show a status code, but it closes and
+// falls back to fetchMetrics, which lands there too. The open /api/pair/state
+// route then decides, because a peer behind the relay can answer 401 about
+// itself and that must not lock this agent's screen.
+//
+// The pairing cookie is HttpOnly and set by the agent, so nothing here reads
+// or stores a token: fetch, EventSource and the service worker send it.
+
+const pairingRecheckMS = 10000;
+const pairingArmMS = 4000;
+const pairedKindLabels = { browser: "Browser", token: "Token" };
+
+function notePairingRequired() {
+  if (state.pairingLocked) {
+    return;
+  }
+  // A locked peer behind the relay answers 401 on every poll; the local
+  // answer does not change that often.
+  if (state.pairingCheckedAtMS && nowMS() - state.pairingCheckedAtMS < pairingRecheckMS) {
+    return;
+  }
+  fetchPairingState();
+}
+
+async function fetchPairingState() {
+  if (state.pairingCheckInFlight) {
+    return;
+  }
+  state.pairingCheckInFlight = true;
+  state.pairingCheckedAtMS = nowMS();
+  try {
+    const response = await fetchWithTimeout("/api/pair/state", { cache: "no-store" }, auxiliaryTimeoutMS);
+    if (!response.ok) {
+      // 404 is an agent older than pairing: nothing to show.
+      return;
+    }
+    applyPairingState(await response.json());
+  } catch {
+    // Offline: the connection state already says so.
+  } finally {
+    state.pairingCheckInFlight = false;
+  }
+}
+
+function pairingRequired() {
+  return state.pairing?.pairing === "required";
+}
+
+function applyPairingState(pairing) {
+  state.pairing = pairing && typeof pairing === "object" ? pairing : null;
+  if (pairingRequired() && state.pairing.paired === false) {
+    showPairingScreen();
+    return;
+  }
+  if (state.pairingLocked) {
+    // Paired meanwhile (another tab, or the same app after a resume): start
+    // over, so every route is fetched again with the cookie.
+    window.location.reload();
+    return;
+  }
+  if (!state.pairing?.window_open) {
+    state.pairingWindow = null;
+  }
+  renderPairingPanel();
+  if (pairingRequired() && !state.hostID) {
+    fetchPairedDevices();
+  }
+}
+
+function showPairingScreen() {
+  const screen = $("pairScreen");
+  const firstShow = screen.hidden;
+  state.pairingLocked = true;
+  stopVisibleTimers();
+  setConnectionState("warn", "Not paired");
+  const serverBuild = String(state.pairing?.dashboard_build || "").trim();
+  if (serverBuild && serverBuild !== dashboardBuild) {
+    // The usual stale-shell check rides /api/status, which is closed to an
+    // unpaired device, so the pairing state carries the build instead.
+    maybeAutoRefreshStaleShell(serverBuild);
+  }
+  // Plain HTTP across the network: the agent refuses to pair over it, so say
+  // why up front rather than after a PIN has been typed.
+  const insecure = state.pairing?.secure === false && state.pairing?.local === false;
+  $("pairInsecure").hidden = !insecure;
+  if (insecure) {
+    $("pairSecureLink").href = `https://${window.location?.host || ""}${window.location?.pathname || "/"}`;
+  }
+  $("pairPin").disabled = insecure;
+  $("pairName").disabled = insecure;
+  $("pairSubmit").disabled = insecure;
+  $("pairWaiting").textContent = state.pairing?.window_open
+    ? "A PIN is open on the host."
+    : "No PIN is open yet.";
+  screen.hidden = false;
+  // Nothing behind the screen may take focus or reach a screen reader.
+  closeHostSheet();
+  setShellInert(true);
+  if (firstShow) {
+    if (!$("pairName").value) {
+      $("pairName").value = guessDeviceName();
+    }
+    if (!insecure) {
+      focusElement($("pairPin"));
+    }
+  }
+}
+
+async function submitPairing(event) {
+  event?.preventDefault?.();
+  if (state.pairingSubmitting) {
+    return;
+  }
+  const pin = String($("pairPin").value || "").replace(/\D/g, "");
+  if (pin.length !== 6) {
+    showPairingError("Enter the 6-digit PIN shown on the host.");
+    return;
+  }
+  state.pairingSubmitting = true;
+  setPairingBusy(true);
+  showPairingError("");
+  let paired = false;
+  try {
+    const response = await fetchWithTimeout("/api/pair", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pin, name: String($("pairName").value || "").trim() }),
+    }, auxiliaryTimeoutMS);
+    let body = null;
+    try {
+      body = await response.json();
+    } catch {
+    }
+    if (response.ok) {
+      paired = true;
+      $("pairSubmit").textContent = "Paired";
+      window.location.reload();
+      return;
+    }
+    showPairingError(pairingErrorText(response.status, body));
+    // The note under the button came from the state at load; the answer to a
+    // try is newer news about whether a PIN is open.
+    if (response.status === 409 || (response.status === 403 && body?.remaining === 0)) {
+      $("pairPin").value = "";
+      $("pairWaiting").textContent = "No PIN is open yet.";
+    } else if (response.status === 403 && Number(body?.remaining) > 0) {
+      $("pairWaiting").textContent = "A PIN is open on the host.";
+    }
+  } catch (error) {
+    showPairingError(`Could not reach the agent (${error?.message || "request failed"}). Check the connection and try again.`);
+  } finally {
+    state.pairingSubmitting = false;
+    if (!paired) {
+      setPairingBusy(false);
+    }
+  }
+}
+
+// pairingErrorText words the pairing route's answer. host names a peer being
+// paired through this agent, whose own answers the relay passes through.
+function pairingErrorText(status, body, host = "") {
+  const remaining = Number(body?.remaining);
+  if (status === 403 && body && "remaining" in body && Number.isFinite(remaining)) {
+    if (remaining > 0) {
+      return `Wrong PIN. ${remaining} ${remaining === 1 ? "try" : "tries"} left before this PIN closes.`;
+    }
+    return `Wrong PIN. This PIN is now closed; get a new one on ${host || "the host"}.`;
+  }
+  if (status === 409 && /too many paired/i.test(String(body?.error || ""))) {
+    return host
+      ? `${host} has as many paired devices as it allows. Remove one there first.`
+      : "This agent has as many paired devices as it allows. Remove one from a paired dashboard first.";
+  }
+  if (status === 409) {
+    return `No PIN is open on ${host || "the host"}, or it expired. Get a new one and try again.`;
+  }
+  if (status === 429) {
+    return "Too many tries at once. Wait a second and try again.";
+  }
+  return String(body?.error || "").trim() || `Pairing failed (HTTP ${status}).`;
+}
+
+function showPairingError(message) {
+  const error = $("pairError");
+  error.textContent = message;
+  error.hidden = !message;
+  $("pairPin").setAttribute("aria-invalid", message ? "true" : "false");
+}
+
+function setPairingBusy(busy) {
+  $("pairSubmit").disabled = busy;
+  $("pairSubmit").textContent = busy ? "Pairing…" : "Pair";
+  $("pairForm").setAttribute("aria-busy", busy ? "true" : "false");
+}
+
+// guessDeviceName prefills the name field so the paired-devices list says
+// which device is which; the owner can change it before pairing.
+function guessDeviceName() {
+  const ua = String(window.navigator?.userAgent || "");
+  const touch = Number(window.navigator?.maxTouchPoints || 0) > 1;
+  let device = "";
+  if (/iPhone/.test(ua)) device = "iPhone";
+  else if (/iPad/.test(ua) || (/Macintosh/.test(ua) && touch)) device = "iPad";
+  else if (/Android/.test(ua)) device = "Android";
+  else if (/Macintosh/.test(ua)) device = "Mac";
+  else if (/Windows/.test(ua)) device = "Windows";
+  else if (/CrOS/.test(ua)) device = "Chromebook";
+  else if (/Linux|X11/.test(ua)) device = "Linux";
+  let app = "";
+  if (isStandaloneDisplay()) app = "app";
+  else if (/Edg\//.test(ua)) app = "Edge";
+  else if (/Firefox\//.test(ua)) app = "Firefox";
+  else if (/Chrome\//.test(ua)) app = "Chrome";
+  else if (/Safari\//.test(ua)) app = "Safari";
+  return [device, app].filter(Boolean).join(" ");
+}
+
+function isStandaloneDisplay() {
+  if (window.navigator?.standalone === true) {
+    return true;
+  }
+  return typeof window.matchMedia === "function" && Boolean(window.matchMedia("(display-mode: standalone)")?.matches);
+}
+
+async function fetchPairedDevices() {
+  if (state.pairedDevicesInFlight) {
+    return;
+  }
+  state.pairedDevicesInFlight = true;
+  try {
+    const response = await fetchWithTimeout("/api/pair/devices", { cache: "no-store" }, auxiliaryTimeoutMS);
+    if (!response.ok) {
+      return;
+    }
+    const body = await response.json();
+    state.pairedDevices = Array.isArray(body?.devices) ? body.devices : [];
+    renderPairingPanel();
+  } catch {
+  } finally {
+    state.pairedDevicesInFlight = false;
+  }
+}
+
+// renderPairingPanel draws "Paired devices" on the More status page. It lists
+// the devices paired with the agent that served this app, so it hides while a
+// peer is being viewed: that peer keeps its own list.
+function renderPairingPanel() {
+  const panel = $("pairingPanel");
+  const show = pairingRequired() && state.pairing?.paired === true && !state.hostID;
+  panel.hidden = !show;
+  if (!show) {
+    return;
+  }
+  const devices = state.pairedDevices;
+  $("pairingSummary").textContent = devices.length === 1 ? "1 device" : `${devices.length} devices`;
+  const list = $("pairedList");
+  list.textContent = "";
+  list.append(...devices.map(pairedDeviceRow));
+  const pinBox = $("pairingWindowBox");
+  const pinWindow = state.pairingWindow;
+  const expiresMS = pinWindow ? Date.parse(pinWindow.expires_at) : NaN;
+  if (pinWindow && Number.isFinite(expiresMS) && expiresMS > Date.now()) {
+    pinBox.hidden = false;
+    $("pairingWindowPin").textContent = pinWindow.pin_display || pinWindow.pin || "--";
+    $("pairingWindowNote").textContent = `For one device, until ${formatClockTime(expiresMS)}. Enter it on that device's pairing screen.`;
+    $("pairAnotherBtn").textContent = "New PIN";
+  } else {
+    state.pairingWindow = null;
+    pinBox.hidden = true;
+    $("pairAnotherBtn").textContent = "Pair another device";
+  }
+}
+
+function pairedDeviceRow(device) {
+  const row = document.createElement("div");
+  row.className = "paired-row";
+  const text = document.createElement("div");
+  text.className = "paired-text";
+  const title = document.createElement("div");
+  title.className = "paired-title";
+  const name = document.createElement("span");
+  name.className = "paired-name";
+  name.textContent = String(device?.name || "").trim() || "Unnamed device";
+  title.append(name);
+  if (device?.current) {
+    const tag = document.createElement("span");
+    tag.className = "paired-current";
+    tag.textContent = "this device";
+    title.append(tag);
+  }
+  const meta = document.createElement("span");
+  meta.className = "paired-meta";
+  const parts = [pairedKindLabels[device?.kind] || String(device?.kind || "")];
+  const created = Date.parse(device?.created);
+  if (Number.isFinite(created)) {
+    parts.push(`paired ${formatCalendarDate(created)}`);
+  }
+  const seen = Date.parse(device?.last_seen);
+  if (Number.isFinite(seen)) {
+    parts.push(`seen ${formatSampleAge(seen)} ago`);
+  }
+  meta.textContent = parts.filter(Boolean).join(" · ");
+  text.append(title, meta);
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "paired-remove";
+  const armed = state.pairingArmedID === device?.id;
+  button.classList.toggle("armed", armed);
+  const verb = device?.current ? "Unpair" : "Remove";
+  button.textContent = armed ? "Confirm" : verb;
+  button.setAttribute("aria-label", armed ? `Confirm: ${verb.toLowerCase()} ${name.textContent}` : `${verb} ${name.textContent}`);
+  button.addEventListener("click", () => removePairedDevice(device));
+  row.append(text, button);
+  return row;
+}
+
+// removePairedDevice takes two taps: the first arms the button for a few
+// seconds, the second removes. A kiosk has no good place for a blocking
+// confirm dialog, and a stray tap must not unpair a device.
+async function removePairedDevice(device) {
+  const id = String(device?.id || "");
+  if (!id) {
+    return;
+  }
+  if (state.pairingArmedID !== id) {
+    state.pairingArmedID = id;
+    clearDashboardTimeout("pairingArmTimer");
+    state.pairingArmTimer = setTimeout(() => {
+      state.pairingArmTimer = null;
+      state.pairingArmedID = "";
+      renderPairingPanel();
+    }, pairingArmMS);
+    renderPairingPanel();
+    return;
+  }
+  clearDashboardTimeout("pairingArmTimer");
+  state.pairingArmedID = "";
+  showPairingPanelError("");
+  try {
+    const response = await fetchWithTimeout(`/api/pair/devices/${encodeURIComponent(id)}`, { method: "DELETE" }, auxiliaryTimeoutMS);
+    if (!response.ok) {
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+      }
+      throw new Error(String(body?.error || "").trim() || `HTTP ${response.status}`);
+    }
+    if (device.current) {
+      // This device is no longer paired; the reload lands on the pairing screen.
+      window.location.reload();
+      return;
+    }
+    state.pairedDevices = state.pairedDevices.filter((entry) => entry?.id !== id);
+    renderPairingPanel();
+    fetchPairedDevices();
+  } catch (error) {
+    showPairingPanelError(`Could not remove ${String(device?.name || "the device")}: ${error?.message || "request failed"}`);
+    renderPairingPanel();
+  }
+}
+
+async function openPairingWindow() {
+  const button = $("pairAnotherBtn");
+  if (button.disabled) {
+    return;
+  }
+  button.disabled = true;
+  showPairingPanelError("");
+  try {
+    const response = await fetchWithTimeout("/api/pair/window", { method: "POST", headers: { "Content-Type": "application/json" }, body: "" }, auxiliaryTimeoutMS);
+    let body = null;
+    try {
+      body = await response.json();
+    } catch {
+    }
+    if (!response.ok) {
+      throw new Error(String(body?.error || "").trim() || `HTTP ${response.status}`);
+    }
+    state.pairingWindow = body;
+    renderPairingPanel();
+  } catch (error) {
+    showPairingPanelError(`Could not open a pairing PIN: ${error?.message || "request failed"}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function showPairingPanelError(message) {
+  const error = $("pairingPanelError");
+  error.textContent = message;
+  error.hidden = !message;
+}
+
+function formatClockTime(timestampMS) {
+  const date = new Date(timestampMS);
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function formatCalendarDate(timestampMS) {
+  const date = new Date(timestampMS);
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
 }

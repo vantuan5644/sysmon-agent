@@ -62,6 +62,12 @@ const (
 
 	defaultPeerHTTPPort  = 9099
 	defaultPeerHTTPSPort = 9443
+
+	// peerLockedStatus answers a relayed request to a peer that requires
+	// pairing and holds no token from this agent. A plain 401 would read to
+	// the dashboard as "this agent requires pairing" and send it to its own
+	// PIN screen.
+	peerLockedStatus = http.StatusLocked
 )
 
 // peerRelayRoutes are the read routes a dashboard may fetch from a peer. The
@@ -110,6 +116,14 @@ type HostEntry struct {
 	CheckedAt *time.Time `json:"checked_at,omitempty"`
 	LastSeen  *time.Time `json:"last_seen,omitempty"`
 	Error     string     `json:"error,omitempty"`
+	// Locked is an agent that requires pairing and holds no device for this
+	// one. It answers only /api/pair/state, so it is listed without its OS or
+	// hostname, and choosing it asks for its PIN (POST /api/hosts/{id}/pair).
+	Locked bool `json:"locked,omitempty"`
+	// CertSHA256 is the self-signed certificate a locked peer presented. The
+	// PIN form shows it, to compare with what `sysmon-agent -pair` prints on
+	// that host, and pairing pins it.
+	CertSHA256 string `json:"cert_sha256,omitempty"`
 }
 
 type PeerDiscoveryStatus struct {
@@ -173,6 +187,9 @@ func parsePeerList(raw string) ([]peerConfig, error) {
 type peerRegistryOptions struct {
 	Configured []peerConfig
 	Discover   bool
+	// Tokens holds what this agent was given by peers that require pairing.
+	// Nil keeps them in memory.
+	Tokens *peerTokenStore
 }
 
 // peerRegistry owns the host list and the relay.
@@ -180,6 +197,18 @@ type peerRegistry struct {
 	configured []peerConfig
 	discover   bool
 	client     *http.Client
+	tokens     *peerTokenStore
+	// pinned holds one client per pinned certificate, each on a transport of
+	// its own, so a connection opened under one pin is never reused for a
+	// peer pinned to another, or for a verified one.
+	pinnedMu sync.Mutex
+	pinned   map[string]*http.Client
+	// newUnverifiedClient reads a locked peer's open /api/pair/state over a
+	// certificate nobody vouches for yet, recording what it presented. Only
+	// that route goes over it, and never with a token.
+	newUnverifiedClient func(record func(fingerprint string)) *http.Client
+	// relayName is the device name this agent pairs under on a peer.
+	relayName string
 	// Injectable for tests; the defaults run `tailscale status --json` and
 	// try the canonical ports.
 	listTailnet  func(context.Context) (string, []tailscalePeer, error)
@@ -205,33 +234,141 @@ type peerRecord struct {
 	base  *url.URL
 	// key is stable across scans: "cfg:<index>" or "ts:<machine name>".
 	key string
+	// tokenKey names the peer in peers.json: "ts:<machine name>", or
+	// "url:<origin>" for a -peers entry, which survives a reordered list.
+	tokenKey string
+	// pin is the certificate base was reached with, when it is the
+	// self-signed one this agent paired the peer over.
+	pin string
+	// pairedAt keeps a scan that started before a pairing from marking the
+	// peer locked again with what it saw before the token existed.
+	pairedAt time.Time
 }
 
-func newPeerRegistry(options peerRegistryOptions) *peerRegistry {
-	transport := &http.Transport{
+func (record *peerRecord) target() peerTarget {
+	return peerTarget{
+		id:         record.entry.ID,
+		name:       record.entry.Name,
+		base:       *record.base,
+		tokenKey:   record.tokenKey,
+		pin:        record.pin,
+		locked:     record.entry.Locked,
+		certSHA256: record.entry.CertSHA256,
+	}
+}
+
+func newPeerTransport(tlsConfig *tls.Config) *http.Transport {
+	return &http.Transport{
 		// Tailnet and LAN peers only: an HTTP(S)_PROXY meant for the internet
 		// would break them.
 		Proxy:               nil,
 		DialContext:         (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSClientConfig:     tlsConfig,
 		TLSHandshakeTimeout: 4 * time.Second,
 		MaxIdleConns:        32,
 		MaxIdleConnsPerHost: 4,
 		IdleConnTimeout:     90 * time.Second,
 	}
-	return &peerRegistry{
-		configured: options.Configured,
-		discover:   options.Discover,
-		client: &http.Client{
-			Transport: transport,
-			// A redirect could point the relay anywhere; peers never send one.
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		},
-		listTailnet:  readTailscalePeers,
-		tailnetBases: defaultTailnetBases,
-		now:          time.Now,
-		byID:         map[string]*peerRecord{},
-		known:        map[string]*peerRecord{},
+}
+
+func newPeerClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Transport: transport,
+		// A redirect could point the relay anywhere. The one a peer sends (an
+		// agent serving its network over HTTPS) is followed by identify, by
+		// hand, and only to https on the same host.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
+}
+
+func newPeerRegistry(options peerRegistryOptions) *peerRegistry {
+	tokens := options.Tokens
+	if tokens == nil {
+		tokens, _ = newPeerTokenStore("")
+	}
+	return &peerRegistry{
+		configured:          options.Configured,
+		discover:            options.Discover,
+		client:              newPeerClient(newPeerTransport(nil)),
+		tokens:              tokens,
+		pinned:              map[string]*http.Client{},
+		newUnverifiedClient: newUnverifiedPeerClient,
+		relayName:           defaultRelayName(),
+		listTailnet:         readTailscalePeers,
+		tailnetBases:        defaultTailnetBases,
+		now:                 time.Now,
+		byID:                map[string]*peerRecord{},
+		known:               map[string]*peerRecord{},
+	}
+}
+
+// newUnverifiedPeerClient makes a one-request client that accepts any
+// certificate and reports the one it saw. Keep-alives are off, so no
+// connection it opened can carry a later request.
+func newUnverifiedPeerClient(record func(fingerprint string)) *http.Client {
+	transport := newPeerTransport(&tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true, //nolint:gosec // reads the open pairing state only; see the field comment
+		VerifyConnection: func(state tls.ConnectionState) error {
+			record(leafFingerprint(state))
+			return nil
+		},
+	})
+	transport.DisableKeepAlives = true
+	return newPeerClient(transport)
+}
+
+// pinnedClient is the client for a peer pinned to one certificate.
+func (r *peerRegistry) pinnedClient(fingerprint string) *http.Client {
+	key := normalizeFingerprint(fingerprint)
+	r.pinnedMu.Lock()
+	defer r.pinnedMu.Unlock()
+	if client := r.pinned[key]; client != nil {
+		return client
+	}
+	client := newPeerClient(newPeerTransport(pinnedTLSConfig(key)))
+	r.pinned[key] = client
+	return client
+}
+
+// clientForPin is the client for one base of a peer: pinned when that base
+// serves the self-signed certificate this agent paired it over, verified
+// otherwise. The pin belongs to the base, since the same peer behind
+// Tailscale Serve presents a certificate the system trusts.
+func (r *peerRegistry) clientForPin(pin string) *http.Client {
+	if pin == "" {
+		return r.client
+	}
+	return r.pinnedClient(pin)
+}
+
+// peerTokenTransportOK is where a token may be sent: over TLS, or to this
+// machine. Never across the network in plain HTTP, where it could be copied.
+func peerTokenTransportOK(base *url.URL) bool {
+	return base.Scheme == "https" || isLoopbackBind(base.Hostname())
+}
+
+// authorize adds this agent's token for the peer to an outgoing request and
+// returns the token it sent, or "" when it sent none.
+func (r *peerRegistry) authorize(request *http.Request, base *url.URL, tokenKey string) string {
+	token, ok := r.tokens.Get(tokenKey)
+	if !ok || !peerTokenTransportOK(base) {
+		return ""
+	}
+	request.Header.Set("Authorization", "Bearer "+token.Token)
+	return token.Token
+}
+
+func defaultRelayName() string {
+	name, err := os.Hostname()
+	if err != nil || strings.TrimSpace(name) == "" {
+		return "sysmon relay"
+	}
+	name, _, _ = strings.Cut(strings.ToLower(strings.TrimSpace(name)), ".")
+	if runes := []rune(name); len(runes) > 40 {
+		name = string(runes[:40])
+	}
+	return name + " relay"
 }
 
 // defaultTailnetBases lists where a tailnet peer's agent may answer, in order
@@ -356,6 +493,7 @@ func localHostEntry(tailnetName string) HostEntry {
 
 type peerCandidate struct {
 	key      string
+	tokenKey string
 	name     string
 	explicit bool
 	source   string
@@ -363,10 +501,26 @@ type peerCandidate struct {
 }
 
 type peerCheckResult struct {
+	// base is where the peer answered, which is the https:// form of the
+	// address tried when the peer redirected there.
 	base   *url.URL
 	status peerIdentity
 	err    error
+	// locked: the peer requires pairing and holds no device for this agent.
+	locked bool
+	// certSHA256 is a locked peer's self-signed certificate; pin is the
+	// certificate an unlocked base was reached with, when it is self-signed.
+	certSHA256 string
+	pin        string
+	// note goes in the host's error line while it is still listed as online.
+	note string
 }
+
+// redirectedToHTTPS is set when a plain-HTTP address answered with a
+// redirect to the same address over https://.
+type redirectedToHTTPS struct{ next *url.URL }
+
+func (e redirectedToHTTPS) Error() string { return "redirected to " + e.next.String() }
 
 // peerIdentity is the slice of a peer's /api/status that identifies it.
 type peerIdentity struct {
@@ -387,6 +541,7 @@ func (r *peerRegistry) runScan() {
 	for i, peer := range r.configured {
 		candidates = append(candidates, peerCandidate{
 			key:      fmt.Sprintf("cfg:%d", i),
+			tokenKey: "url:" + peerOrigin(*peer.Base),
 			name:     peer.Name,
 			explicit: peer.Name != "",
 			source:   "configured",
@@ -409,17 +564,19 @@ func (r *peerRegistry) runScan() {
 					continue
 				}
 				candidates = append(candidates, peerCandidate{
-					key:    "ts:" + peer.Name,
-					name:   peer.Name,
-					source: "tailscale",
-					bases:  r.tailnetBases(peer),
+					key:      "ts:" + peer.Name,
+					tokenKey: "ts:" + peer.Name,
+					name:     peer.Name,
+					source:   "tailscale",
+					bases:    r.tailnetBases(peer),
 				})
 			}
 		}
 	}
 
+	started := r.now()
 	results := r.checkCandidates(ctx, candidates)
-	r.applyScan(candidates, results, selfName, tailnetAvailable, tailnetErr)
+	r.applyScan(candidates, results, selfName, tailnetAvailable, tailnetErr, started)
 }
 
 func (r *peerRegistry) configuredNames(peer tailscalePeer) bool {
@@ -447,8 +604,7 @@ func (r *peerRegistry) checkCandidates(ctx context.Context, candidates []peerCan
 				defer candidateWG.Done()
 				semaphore <- struct{}{}
 				defer func() { <-semaphore }()
-				status, err := r.identify(ctx, base)
-				perBase[j] = peerCheckResult{base: base, status: status, err: err}
+				perBase[j] = r.identify(ctx, base, candidate.tokenKey)
 			}()
 		}
 		wg.Add(1)
@@ -463,8 +619,14 @@ func (r *peerRegistry) checkCandidates(ctx context.Context, candidates []peerCan
 }
 
 // pickCheckResult takes the first base, in preference order, that answered as
-// an agent; failing that, the first error, which describes the preferred base.
+// an agent, preferring one this agent can read over one that is locked;
+// failing that, the first error, which describes the preferred base.
 func pickCheckResult(perBase []peerCheckResult) peerCheckResult {
+	for _, result := range perBase {
+		if result.err == nil && !result.locked {
+			return result
+		}
+	}
 	for _, result := range perBase {
 		if result.err == nil {
 			return result
@@ -476,33 +638,170 @@ func pickCheckResult(perBase []peerCheckResult) peerCheckResult {
 	return perBase[0]
 }
 
-func (r *peerRegistry) identify(ctx context.Context, base *url.URL) (peerIdentity, error) {
+// identify asks one address whether a sysmon agent answers there. An agent
+// that serves its network over HTTPS redirects a plain-HTTP address to itself
+// over https://; that redirect is followed once, and to that address only.
+func (r *peerRegistry) identify(ctx context.Context, base *url.URL, tokenKey string) peerCheckResult {
+	result := r.identifyAt(ctx, base, tokenKey)
+	var redirect redirectedToHTTPS
+	if errors.As(result.err, &redirect) {
+		result = r.identifyAt(ctx, redirect.next, tokenKey)
+		if errors.As(result.err, &redirect) {
+			result.err = errors.New("redirect loop")
+		}
+	}
+	return result
+}
+
+func (r *peerRegistry) identifyAt(ctx context.Context, base *url.URL, tokenKey string) peerCheckResult {
 	ctx, cancel := context.WithTimeout(ctx, peerCheckTimeout)
 	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, peerURL(base, "/api/status"), nil)
+	result := peerCheckResult{base: base}
+	client := r.client
+	response, sent, err := r.getPeer(ctx, client, base, "/api/status", tokenKey)
+	if err != nil && isCertificateError(err) {
+		// A certificate the system does not trust: the self-signed one of an
+		// agent serving its network over HTTPS. It is reached with the pin
+		// when this agent paired it over that certificate; otherwise it is
+		// only asked whether it requires pairing.
+		token, paired := r.tokens.Get(tokenKey)
+		if paired && token.CertSHA256 != "" {
+			result.pin = token.CertSHA256
+			client = r.pinnedClient(token.CertSHA256)
+			response, sent, err = r.getPeer(ctx, client, base, "/api/status", tokenKey)
+		}
+		if err != nil && isCertificateError(err) {
+			return r.identifyUnverified(ctx, base, paired && token.CertSHA256 != "")
+		}
+	}
 	if err != nil {
-		return peerIdentity{}, err
+		result.err = errors.New(relayErrorReason(err))
+		return result
+	}
+	defer response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusOK:
+	case http.StatusUnauthorized:
+		return r.identifyLocked(ctx, client, result, tokenKey, sent)
+	case http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		if next := httpsRedirectTarget(base, response.Header.Get("Location")); next != nil {
+			result.err = redirectedToHTTPS{next: next}
+			return result
+		}
+		result.err = fmt.Errorf("HTTP %d", response.StatusCode)
+		return result
+	default:
+		result.err = fmt.Errorf("HTTP %d", response.StatusCode)
+		return result
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&result.status); err != nil {
+		result.err = errNotSysmonAgent
+		return result
+	}
+	if !strings.HasPrefix(result.status.DashboardBuild, "sysmon-static-") {
+		result.status = peerIdentity{}
+		result.err = errNotSysmonAgent
+	}
+	return result
+}
+
+// getPeer sends one GET, with this agent's token for the peer when it holds
+// one and the address may carry it. It returns the token it sent.
+func (r *peerRegistry) getPeer(ctx context.Context, client *http.Client, base *url.URL, path, tokenKey string) (*http.Response, string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, peerURL(base, path), nil)
+	if err != nil {
+		return nil, "", err
 	}
 	request.Header.Set("Accept", "application/json")
-	response, err := r.client.Do(request)
+	sent := r.authorize(request, base, tokenKey)
+	response, err := client.Do(request)
+	return response, sent, err
+}
+
+// identifyLocked reads the open /api/pair/state of a peer that refused
+// /api/status. A sysmon agent that requires pairing is listed as locked, and
+// a token it refused is dropped: the peer revoked it.
+func (r *peerRegistry) identifyLocked(ctx context.Context, client *http.Client, result peerCheckResult, tokenKey, sent string) peerCheckResult {
+	pairing, err := r.readPairingState(ctx, client, result.base)
+	if err != nil || pairing.Pairing != pairingModeRequired || pairing.Paired {
+		result.err = fmt.Errorf("HTTP %d", http.StatusUnauthorized)
+		return result
+	}
+	if sent != "" {
+		_ = r.tokens.Forget(tokenKey, sent)
+	}
+	result.locked = true
+	result.status = peerIdentity{DashboardBuild: pairing.DashboardBuild}
+	// Reached over the pinned certificate: that is the one to pair again.
+	result.certSHA256, result.pin = result.pin, ""
+	return result
+}
+
+// identifyUnverified reads /api/pair/state over a certificate nobody vouches
+// for yet, sending nothing secret, and records the certificate the peer
+// presented. Only an agent that requires pairing is listed (locked); the PIN
+// form shows the certificate's SHA-256 to compare with `sysmon-agent -pair`
+// on that host, and pairing pins it.
+func (r *peerRegistry) identifyUnverified(ctx context.Context, base *url.URL, pinChanged bool) peerCheckResult {
+	result := peerCheckResult{base: base}
+	var mu sync.Mutex
+	var seen string
+	client := r.newUnverifiedClient(func(fingerprint string) {
+		mu.Lock()
+		seen = fingerprint
+		mu.Unlock()
+	})
+	pairing, err := r.readPairingState(ctx, client, base)
+	mu.Lock()
+	fingerprint := seen
+	mu.Unlock()
+	if err != nil || pairing.Pairing != pairingModeRequired || pairing.Paired || fingerprint == "" {
+		result.err = errors.New("TLS certificate rejected")
+		return result
+	}
+	result.locked = true
+	result.certSHA256 = fingerprint
+	result.status = peerIdentity{DashboardBuild: pairing.DashboardBuild}
+	if pinChanged {
+		result.note = "certificate changed since it was paired"
+	}
+	return result
+}
+
+func (r *peerRegistry) readPairingState(ctx context.Context, client *http.Client, base *url.URL) (PairingState, error) {
+	var pairing PairingState
+	response, _, err := r.getPeer(ctx, client, base, "/api/pair/state", "")
 	if err != nil {
-		return peerIdentity{}, errors.New(relayErrorReason(err))
+		return pairing, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return peerIdentity{}, fmt.Errorf("HTTP %d", response.StatusCode)
+		return pairing, fmt.Errorf("HTTP %d", response.StatusCode)
 	}
-	var status peerIdentity
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&status); err != nil {
-		return peerIdentity{}, errNotSysmonAgent
+	if err := json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&pairing); err != nil {
+		return pairing, errNotSysmonAgent
 	}
-	if !strings.HasPrefix(status.DashboardBuild, "sysmon-static-") {
-		return peerIdentity{}, errNotSysmonAgent
+	if !strings.HasPrefix(pairing.DashboardBuild, "sysmon-static-") {
+		return pairing, errNotSysmonAgent
 	}
-	return status, nil
+	return pairing, nil
 }
 
-func (r *peerRegistry) applyScan(candidates []peerCandidate, results []peerCheckResult, selfName string, tailnetAvailable bool, tailnetErr string) {
+// httpsRedirectTarget accepts only a redirect from a plain-HTTP address to
+// the same host and port over https://, which is what an agent serving its
+// network over HTTPS sends. Anything else could point the scan anywhere.
+func httpsRedirectTarget(base *url.URL, location string) *url.URL {
+	if base.Scheme != "http" || location == "" {
+		return nil
+	}
+	target, err := base.Parse(location)
+	if err != nil || target.Scheme != "https" || !strings.EqualFold(target.Host, base.Host) {
+		return nil
+	}
+	return &url.URL{Scheme: "https", Host: base.Host}
+}
+
+func (r *peerRegistry) applyScan(candidates []peerCandidate, results []peerCheckResult, selfName string, tailnetAvailable bool, tailnetErr string, started time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
@@ -529,19 +828,31 @@ func (r *peerRegistry) applyScan(candidates []peerCandidate, results []peerCheck
 			record = &peerRecord{key: candidate.key, base: candidate.bases[0]}
 			r.known[candidate.key] = record
 		}
+		record.tokenKey = candidate.tokenKey
 		entry := &record.entry
 		entry.Source = candidate.source
 		entry.CheckedAt = &now
-		if result.err == nil {
+		switch {
+		case result.err == nil && result.locked && record.pairedAt.After(started):
+			// Paired while this scan ran: it saw the peer before the token
+			// existed. The next scan reads it with the token.
+		case result.err == nil:
 			record.base = result.base
+			record.pin = result.pin
 			entry.Online = true
-			entry.Error = ""
+			entry.Error = result.note
 			entry.LastSeen = &now
-			entry.OS = result.status.OS
-			entry.Version = result.status.Version
 			entry.DashboardBuild = result.status.DashboardBuild
-			entry.Hostname = result.status.Hostname
-		} else {
+			entry.Locked = result.locked
+			entry.CertSHA256 = result.certSHA256
+			// A locked peer names nothing about itself, so the last
+			// description it gave while readable stays.
+			if !result.locked {
+				entry.OS = result.status.OS
+				entry.Version = result.status.Version
+				entry.Hostname = result.status.Hostname
+			}
+		default:
 			entry.Online = false
 			entry.Error = result.err.Error()
 		}
@@ -645,8 +956,15 @@ func peerIDSlug(name string) string {
 
 // peerTarget is a resolved relay destination.
 type peerTarget struct {
-	name string
-	base url.URL
+	id       string
+	name     string
+	base     url.URL
+	tokenKey string
+	// pin: base serves the self-signed certificate this agent paired over.
+	pin string
+	// locked and certSHA256 are what the last scan saw.
+	locked     bool
+	certSHA256 string
 }
 
 // resolve maps a client-supplied id to a known peer. An id the registry has
@@ -658,7 +976,7 @@ func (r *peerRegistry) resolve(ctx context.Context, id string) (peerTarget, bool
 	}
 	r.mu.Lock()
 	if record := r.byID[id]; record != nil {
-		target := peerTarget{name: record.entry.Name, base: *record.base}
+		target := record.target()
 		r.mu.Unlock()
 		return target, true
 	}
@@ -676,7 +994,7 @@ func (r *peerRegistry) resolve(ctx context.Context, id string) (peerTarget, bool
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if record := r.byID[id]; record != nil {
-		return peerTarget{name: record.entry.Name, base: *record.base}, true
+		return record.target(), true
 	}
 	return peerTarget{}, false
 }
@@ -737,6 +1055,51 @@ func writeRelayError(w http.ResponseWriter, target peerTarget, err error) {
 
 func writeUnknownHost(w http.ResponseWriter) {
 	writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown host"})
+}
+
+// send forwards one relayed request with this agent's token for the peer,
+// and returns the token it sent, so a refusal drops exactly that one.
+func (r *peerRegistry) send(upstream *http.Request, target peerTarget) (*http.Response, string, error) {
+	sent := r.authorize(upstream, &target.base, target.tokenKey)
+	response, err := r.clientForPin(target.pin).Do(upstream)
+	return response, sent, err
+}
+
+// writeSendError answers a relayed request that got no response. A locked
+// peer behind its own self-signed certificate fails the TLS check before it
+// can answer 401, so for a peer the last scan saw locked that is the same
+// answer: it wants a PIN.
+func (r *peerRegistry) writeSendError(w http.ResponseWriter, target peerTarget, err error) {
+	if target.locked && isCertificateError(err) {
+		r.writePeerLocked(w, target, "")
+		return
+	}
+	writeRelayError(w, target, err)
+}
+
+// writePeerLocked answers for a peer that refused this agent with 423, so
+// the dashboard asks for that host's PIN and never shows this agent's own
+// pairing screen. A token the peer refused was revoked there and is dropped.
+func (r *peerRegistry) writePeerLocked(w http.ResponseWriter, target peerTarget, sent string) {
+	if sent != "" {
+		_ = r.tokens.Forget(target.tokenKey, sent)
+	}
+	certSHA256 := target.certSHA256
+	r.mu.Lock()
+	if record := r.byID[target.id]; record != nil && record.tokenKey == target.tokenKey {
+		record.entry.Locked = true
+		// A peer reached over a pinned certificate is paired again over it.
+		if record.entry.CertSHA256 == "" {
+			record.entry.CertSHA256 = record.pin
+		}
+		certSHA256 = record.entry.CertSHA256
+	}
+	r.mu.Unlock()
+	body := map[string]any{"error": target.name + " requires pairing", "host_locked": true}
+	if certSHA256 != "" {
+		body["cert_sha256"] = certSHA256
+	}
+	writeJSON(w, peerLockedStatus, body)
 }
 
 // serveRelayRead forwards one allow-listed GET route and passes the peer's
@@ -816,12 +1179,16 @@ func (r *peerRegistry) serveRelayControl(w http.ResponseWriter, req *http.Reques
 }
 
 func (r *peerRegistry) forwardJSON(w http.ResponseWriter, upstream *http.Request, target peerTarget) {
-	response, err := r.client.Do(upstream)
+	response, sent, err := r.send(upstream, target)
 	if err != nil {
-		writeRelayError(w, target, err)
+		r.writeSendError(w, target, err)
 		return
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized {
+		r.writePeerLocked(w, target, sent)
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, peerRelayMaxBody+1))
 	if err != nil {
 		writeRelayError(w, target, err)
@@ -868,16 +1235,20 @@ func (r *peerRegistry) serveRelayStream(w http.ResponseWriter, req *http.Request
 	upstream.Header.Set("Accept", "text/event-stream")
 	// Bound the wait for response headers only; the body is unbounded.
 	headerTimer := time.AfterFunc(peerRelayReadTimeout, cancel)
-	response, err := r.client.Do(upstream)
+	response, sent, err := r.send(upstream, target)
 	headerTimer.Stop()
 	if err != nil {
 		if ctx.Err() != nil && req.Context().Err() == nil {
 			err = context.DeadlineExceeded
 		}
-		writeRelayError(w, target, err)
+		r.writeSendError(w, target, err)
 		return
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized {
+		r.writePeerLocked(w, target, sent)
+		return
+	}
 	if response.StatusCode != http.StatusOK || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") {
 		status := response.StatusCode
 		if status == http.StatusOK {
