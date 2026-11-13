@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -236,6 +237,98 @@ func TestWindowsInstallerTailscaleServe(t *testing.T) {
 	}
 	if t.Failed() {
 		t.FailNow()
+	}
+}
+
+// The GPU guard parameters are hand-ported into this release-owned installer,
+// so nothing else notices when the agent renames a flag, moves a range or
+// changes a default. Each check below reads the agent source the sync brings in.
+func TestWindowsInstallerGPUGuard(t *testing.T) {
+	read := func(name string) string {
+		t.Helper()
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The working tree is CRLF for .ps1 files; compare line-ending blind.
+		return strings.ReplaceAll(string(data), "\r\n", "\n")
+	}
+	script := read("install-windows.ps1")
+	agentMain := read("main.go")
+	guard := read("internal/gpuguard/guard.go")
+	metrics := read("metrics.go")
+
+	for _, needle := range []string{
+		"[ValidateSet('', 'off', 'warn', 'act')]\n    [string]$GpuGuard = '',",
+		`[string]$GpuGuardSpare = ''`,
+		`$binPath += " -gpu-guard $GpuGuard"`,
+		`$binPath += " -gpu-hotspot-warn $GpuHotspotWarn"`,
+		`$binPath += " -gpu-hotspot-crit $GpuHotspotCrit"`,
+		`$binPath += " -gpu-delta-warn $GpuDeltaWarn"`,
+		`$binPath += " -gpu-guard-spare $(Quote-Arg $GpuGuardSpare)"`,
+		`must be below -GpuHotspotCrit ($effectiveCrit).`,
+		`function Show-GpuGuardStatus`,
+		"Show-DashboardSettings\n        Show-GpuGuardStatus\n",
+	} {
+		if !strings.Contains(script, needle) {
+			t.Errorf("install-windows.ps1 missing %q", needle)
+		}
+	}
+
+	// Every -gpu-* flag the installer passes is one the agent defines.
+	passed := regexp.MustCompile(`\$binPath \+= " -(gpu-[a-z-]+) `).FindAllStringSubmatch(script, -1)
+	if len(passed) != 5 {
+		t.Errorf("found %d -gpu-* flags in Get-BinaryPath, want 5", len(passed))
+	}
+	for _, m := range passed {
+		if !regexp.MustCompile(`flag\.\w+\("` + regexp.QuoteMeta(m[1]) + `"`).MatchString(agentMain) {
+			t.Errorf("install-windows.ps1 passes -%s, which main.go does not define", m[1])
+		}
+	}
+
+	// Ranges and defaults match internal/gpuguard.
+	constants := func(pattern string) []string {
+		t.Helper()
+		m := regexp.MustCompile(pattern).FindStringSubmatch(guard)
+		if m == nil {
+			t.Fatalf("internal/gpuguard/guard.go has no match for %s", pattern)
+		}
+		return m[1:]
+	}
+	for _, c := range []struct{ param, pair, def string }{
+		{"GpuHotspotWarn", "HotspotWarnC", "DefaultHotspotWarnC"},
+		{"GpuHotspotCrit", "HotspotCritC", "DefaultHotspotCritC"},
+		{"GpuDeltaWarn", "DeltaWarnC", "DefaultDeltaWarnC"},
+	} {
+		r := constants(`Min` + c.pair + `, Max` + c.pair + `\s*=\s*(\d+), (\d+)`)
+		want := "($_ -ge " + r[0] + " -and $_ -le " + r[1] + ") })]\n    [int]$" + c.param + " = 0,"
+		if !strings.Contains(script, want) {
+			t.Errorf("install-windows.ps1 range for -%s should be %s-%s (missing %q)", c.param, r[0], r[1], want)
+		}
+		def := constants(`\b` + c.def + `\s*=\s*(\d+)`)[0]
+		if c.param != "GpuDeltaWarn" {
+			effective := map[string]string{"GpuHotspotWarn": "$effectiveWarn", "GpuHotspotCrit": "$effectiveCrit"}[c.param]
+			want := effective + " = if ($" + c.param + " -ne 0) { $" + c.param + " } else { " + def + " }"
+			if !strings.Contains(script, want) {
+				t.Errorf("install-windows.ps1 should assume the agent's default %s for -%s (missing %q)", def, c.param, want)
+			}
+		}
+	}
+	defaults := constants(`DefaultHotspotWarnC\s*=\s*(\d+)`)[0] + ", " +
+		constants(`DefaultHotspotCritC\s*=\s*(\d+)`)[0] + " and " +
+		constants(`DefaultDeltaWarnC\s*=\s*(\d+)`)[0]
+	if !strings.Contains(script, "(0 keeps the agent's default: "+defaults+")") {
+		t.Errorf("install-windows.ps1 parameter comment should list the agent's defaults %s", defaults)
+	}
+
+	// The Status readout reads these JSON fields from /api/metrics.
+	if !strings.Contains(metrics, `json:"gpu_guard,`) {
+		t.Error("metrics.go no longer publishes gpu_guard; recheck Show-GpuGuardStatus")
+	}
+	for _, field := range []string{"mode", "level", "source", "hotspot_celsius", "core_celsius", "thresholds", "warn_c", "critical_c", "delta_warn_c", "action", "action_error", "error"} {
+		if !regexp.MustCompile(`json:"` + field + `[,"]`).MatchString(guard) {
+			t.Errorf("internal/gpuguard/guard.go has no %q field; recheck Show-GpuGuardStatus", field)
+		}
 	}
 }
 

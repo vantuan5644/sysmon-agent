@@ -62,7 +62,26 @@ param(
     # the CLI is resolved to an absolute path at install time; pass
     # -CodexBinary when codex is not on the installing user PATH.
     [switch]$CodexQuotaPoll,
-    [string]$CodexBinary = ''
+    [string]$CodexBinary = '',
+    # GPU overheat guard (see "GPU overheat guard" in README.md). warn raises
+    # the alarms on the desktop and the dashboard and logs what act would do;
+    # act also lowers the NVIDIA power limit at the critical hotspot and then
+    # ends GPU apps; off stops it. Empty passes no flag, so the agent's default
+    # (warn) holds. Like every flag here, a reinstall without it drops it from
+    # the service command line.
+    [ValidateSet('', 'off', 'warn', 'act')]
+    [string]$GpuGuard = '',
+    # Hotspot warn and critical lines and the hotspot-core delta warning, in C
+    # (0 keeps the agent's default: 90, 95 and 20).
+    [ValidateScript({ $_ -eq 0 -or ($_ -ge 70 -and $_ -le 105) })]
+    [int]$GpuHotspotWarn = 0,
+    [ValidateScript({ $_ -eq 0 -or ($_ -ge 80 -and $_ -le 110) })]
+    [int]$GpuHotspotCrit = 0,
+    [ValidateScript({ $_ -eq 0 -or ($_ -ge 10 -and $_ -le 40) })]
+    [int]$GpuDeltaWarn = 0,
+    # Extra process names act mode never ends, comma-separated, beside the
+    # built-in list (shell, compositor, terminals, sysmon, the streaming host).
+    [string]$GpuGuardSpare = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -118,6 +137,28 @@ function Get-BinaryPath {
     }
     if ($TempWarn -ne 0) {
         $binPath += " -temp-warn $TempWarn"
+    }
+    # The agent refuses to start when warn is not below critical, so check the
+    # pair here (0 means the agent's default) rather than after the service fails.
+    $effectiveWarn = if ($GpuHotspotWarn -ne 0) { $GpuHotspotWarn } else { 90 }
+    $effectiveCrit = if ($GpuHotspotCrit -ne 0) { $GpuHotspotCrit } else { 95 }
+    if ($effectiveWarn -ge $effectiveCrit) {
+        throw "-GpuHotspotWarn ($effectiveWarn) must be below -GpuHotspotCrit ($effectiveCrit)."
+    }
+    if ($GpuGuard) {
+        $binPath += " -gpu-guard $GpuGuard"
+    }
+    if ($GpuHotspotWarn -ne 0) {
+        $binPath += " -gpu-hotspot-warn $GpuHotspotWarn"
+    }
+    if ($GpuHotspotCrit -ne 0) {
+        $binPath += " -gpu-hotspot-crit $GpuHotspotCrit"
+    }
+    if ($GpuDeltaWarn -ne 0) {
+        $binPath += " -gpu-delta-warn $GpuDeltaWarn"
+    }
+    if ($GpuGuardSpare) {
+        $binPath += " -gpu-guard-spare $(Quote-Arg $GpuGuardSpare)"
     }
     return $binPath
 }
@@ -410,6 +451,34 @@ function Show-DashboardSettings {
         Write-Host "  thresholds: CPU $($settings.thresholds.cpu_warn)% / RAM $($settings.thresholds.memory_warn)% / Disk $($settings.thresholds.disk_warn)% / GPU $($settings.thresholds.gpu_warn)% / Temp $($settings.thresholds.temp_warn_c)C"
     } catch {
         Write-Warning "Dashboard settings failed at ${statusUrl}: $($_.Exception.Message)"
+    }
+}
+
+function Show-GpuGuardStatus {
+    $metricsUrl = "$(Get-AgentBaseUrl)/api/metrics"
+    try {
+        $metrics = Invoke-RestMethod -Method Get -Uri $metricsUrl -TimeoutSec 8
+    } catch {
+        Write-Warning "GPU guard check failed at ${metricsUrl}: $($_.Exception.Message)"
+        return
+    }
+    $guard = $metrics.gpu_guard
+    if (-not $guard) {
+        Write-Host 'GPU guard: off (or this agent predates it).'
+        return
+    }
+    $hotspot = if ($guard.hotspot_celsius.available) { "$([math]::Round([double]$guard.hotspot_celsius.value))C" } else { 'n/a' }
+    $core = if ($guard.core_celsius.available) { "$([math]::Round([double]$guard.core_celsius.value))C" } else { 'n/a' }
+    $lines = "warn $($guard.thresholds.warn_c)C / critical $($guard.thresholds.critical_c)C / delta $($guard.thresholds.delta_warn_c)C"
+    Write-Host "GPU guard: mode=$($guard.mode), level=$($guard.level), source=$($guard.source), hotspot=$hotspot, core=$core, action=$($guard.action) ($lines)"
+    if ($guard.mode -eq 'warn') {
+        Write-Host '  Warn mode raises the alarms only. Reinstall with -GpuGuard act to lower the power limit and end GPU apps.'
+    }
+    if ($guard.error) {
+        Write-Warning "GPU guard: $($guard.error)"
+    }
+    if ($guard.action_error) {
+        Write-Warning "GPU guard action failed: $($guard.action_error)"
     }
 }
 
@@ -1197,6 +1266,7 @@ function Show-Status {
         Show-LhmLibraryStatus
         Show-PwshStatus
         Show-DashboardSettings
+        Show-GpuGuardStatus
         Show-QuotaStatus
         Show-CodexUsageStatus
         Show-ClientCheckStatus
