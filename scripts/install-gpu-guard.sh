@@ -120,7 +120,7 @@ if ! $apply; then echo "Dry-run complete; use --apply to make these changes"; ex
 install -o root -g root -m 0755 "$helper_binary" "$install_path"
 install -o root -g root -m 0644 "$unit_source" "$unit_path"
 if [[ -n "$mode" || ! -f "$env_file" ]]; then
-    printf '# sysmon-gpu-guard: warn or act; thresholds SYSMON_GPU_HOTSPOT_WARN, SYSMON_GPU_HOTSPOT_CRIT,\n# SYSMON_GPU_DELTA_WARN and SYSMON_GPU_GUARD_SPARE (see sysmon-gpu-guard -h)\nSYSMON_GPU_GUARD=%s\n' "${mode:-warn}" > "$env_file.tmp"
+    printf '# sysmon-gpu-guard: warn or act; thresholds SYSMON_GPU_HOTSPOT_WARN, SYSMON_GPU_HOTSPOT_CRIT,\n# SYSMON_GPU_DELTA_WARN, SYSMON_GPU_VRAM_WARN, SYSMON_GPU_VRAM_CRIT and SYSMON_GPU_GUARD_SPARE (see sysmon-gpu-guard -h)\nSYSMON_GPU_GUARD=%s\n' "${mode:-warn}" > "$env_file.tmp"
     chmod 0644 "$env_file.tmp"
     mv -f "$env_file.tmp" "$env_file"
 fi

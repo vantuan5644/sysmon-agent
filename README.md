@@ -195,7 +195,8 @@ auto`):
   refused over plain HTTP from the network.
 - On the host itself, `http://127.0.0.1:9099` and `http://localhost:9099` keep working
   unchanged. A local request that came through no proxy can read the dashboard without
-  pairing; changing settings and running controls still needs a paired device.
+  pairing; changing settings and running controls still needs a paired device. So a browser
+  there shows the dashboard view only, without a PIN, and using a control asks for one.
 
 **Tailscale Serve is the better path where Tailscale is installed.** The device then gets a
 certificate it already trusts, with no warning, and an iPhone Home Screen app installs from
@@ -417,6 +418,7 @@ value keeps the saved default.
 | `-settings` / `SYSMON_SETTINGS` | path | optional JSON file for persisted settings; pairings live in a `pairing` folder beside it |
 | `-pairing` / `SYSMON_PAIRING` | `required` (default), `off` | only paired devices reach data and controls, or every device does |
 | `-network-tls` / `SYSMON_NETWORK_TLS` | `auto` (default), `on`, `off` | HTTPS for other devices on the same port; `auto` is on when pairing is required and the bind is not loopback |
+| `-mdns-name` / `SYSMON_MDNS_NAME` | label | a `.local` name other than the hostname's, which the agent then answers for itself and adds to its certificate; for a machine that boots two systems, give both the same name |
 | `-pair` / `-pair-list` / `-pair-revoke ID` / `-pair-token NAME` | | show a PIN, list or remove paired devices, or make a script token, for the agent using the same `-settings`, then exit |
 | `-claude-config-dir` / `SYSMON_CLAUDE_CONFIG_DIR` | path | Claude Code config dir for the AI usage page (default `$CLAUDE_CONFIG_DIR`, then `$HOME/.claude`; missing = Claude section hidden) |
 | `-claude-quota-poll` / `SYSMON_CLAUDE_QUOTA_POLL` | bool, off | also poll `api.anthropic.com` for quota instead of only reading local files |
@@ -717,7 +719,9 @@ and opens no socket; it publishes `/run/sysmon-gpu-hotspot/readings.json` every 
 and the agent stays unprivileged and ignores readings older than six seconds. NVIDIA does not
 document the register (the offset and decoding follow
 [gddr6-core-junction-vram-temps](https://github.com/ThomasBaruzier/gddr6-core-junction-vram-temps/blob/6d8c5ecf633a8658d205fb2c24531bf87164912f/src/sensor.c)),
-so compare the number against another tool before relying on it.
+so compare the number against another tool before relying on it. The same helper reads the
+GDDR6X memory junction too (`vram_celsius`), which `nvidia-smi` reports as N/A on GeForce
+cards; the GPU card shows it as VRAM after the hotspot, and the GPU guard judges it.
 
 ```bash
 go build -trimpath -o sysmon-gpu-hotspot ./cmd/gpu-hotspot
@@ -749,6 +753,8 @@ publishes the result as `gpu_guard` in `/api/metrics`.
 | warn | hotspot at 90 °C or more for 3 samples | alerts chip on every dashboard page, hotspot coloured, desktop notification |
 | warn | hotspot 20 °C or more above the core for 60 s at 150 W or more | the same, as "poor thermal contact?" |
 | critical | hotspot at 95 °C or more for 3 samples | full-screen alarm on the dashboard, alarm on the host, the action below |
+| warn | memory junction (VRAM) at 100 °C or more (Linux, with the hotspot helper) | as for the hotspot |
+| critical | memory junction at 106 °C or more | as for the hotspot, before the card's own memory throttling at about 110 °C |
 
 A large hotspot-to-core gap under load usually means the thermal paste has pumped out or the
 cooler has lost contact; a healthy RTX 4090 runs about 10 °C apart. Without a hotspot reading the
