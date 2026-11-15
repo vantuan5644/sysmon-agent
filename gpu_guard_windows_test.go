@@ -85,3 +85,19 @@ func TestPickGuardGPU(t *testing.T) {
 		t.Fatalf("sample %+v", sample)
 	}
 }
+
+// The memory junction reaches the guard beside the core and hotspot, and a card
+// without one leaves it out rather than failing the sample.
+func TestGuardSampleCarriesTheMemoryJunction(t *testing.T) {
+	device := GPUMetric{Name: "NVIDIA GeForce RTX 4090", Temperature: availableNumber(54, "C"),
+		HotspotTemperature: availableNumber(66.25, "C"), VRAMTemperature: availableNumber(96, "C"), Power: availableNumber(312.4, "W")}
+	sample := guardSampleFromGPU(gpuguard.Sample{}, device)
+	if sample.VRAM == nil || *sample.VRAM != 96 || sample.Hotspot == nil || *sample.Hotspot != 66.25 || sample.Error != "" {
+		t.Fatalf("sample %+v", sample)
+	}
+	device.VRAMTemperature = unavailableNumber("C", vramNotReported)
+	sample = guardSampleFromGPU(gpuguard.Sample{}, device)
+	if sample.VRAM != nil || sample.Core == nil || sample.Error != "" {
+		t.Fatalf("sample without a junction %+v", sample)
+	}
+}

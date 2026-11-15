@@ -343,7 +343,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.Network = network
 	metrics.Tailscale = tailscale
 	metrics.Temperatures = temperatures
-	metrics.GPU = mergeWindowsGPUHotspots(gpu, bridgeResult.GPUHotspots, bridgeResult.Available && bridgeErr == nil)
+	metrics.GPU = mergeWindowsGPUSensors(gpu, bridgeResult.GPUHotspots, bridgeResult.GPUVRAM, bridgeResult.Available && bridgeErr == nil)
 	metrics.Processes = processes
 	return finishMetrics(metrics, started), nil
 }
@@ -601,12 +601,13 @@ type lhmBridgeResult struct {
 	// boost?" -- and only the peak is a sane thing to ratchet the ceiling with.
 	// Absent (nil) when the bridge is older than the agent, which degrades
 	// cpu_clock_peak_core rather than the whole clock set.
-	CPUClock         *lhmBridgeValue     `json:"cpu_clock,omitempty"`
-	CPUClockPeakCore *lhmBridgeValue     `json:"cpu_clock_peak_core,omitempty"`
-	PSUOutputPower   *lhmBridgeValue     `json:"psu_output_power,omitempty"`
-	Temperatures     []lhmBridgeTemp     `json:"temperatures,omitempty"`
-	GPU              []GPUMetric         `json:"gpu,omitempty"`
-	GPUHotspots      []gpuHotspotReading `json:"gpu_hotspots,omitempty"`
+	CPUClock         *lhmBridgeValue    `json:"cpu_clock,omitempty"`
+	CPUClockPeakCore *lhmBridgeValue    `json:"cpu_clock_peak_core,omitempty"`
+	PSUOutputPower   *lhmBridgeValue    `json:"psu_output_power,omitempty"`
+	Temperatures     []lhmBridgeTemp    `json:"temperatures,omitempty"`
+	GPU              []GPUMetric        `json:"gpu,omitempty"`
+	GPUHotspots      []gpuSensorReading `json:"gpu_hotspots,omitempty"`
+	GPUVRAM          []gpuSensorReading `json:"gpu_vram,omitempty"`
 }
 
 type lhmBridgeValue struct {

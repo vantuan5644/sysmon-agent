@@ -328,7 +328,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		return unavailableProcessSet(fmt.Sprintf("Windows process collector panicked: %v", recovered))
 	})
 	wg.Wait()
-	gpu = mergeWindowsGPUHotspots(gpu, bridgeResult.GPUHotspots, bridgeResult.Available && bridgeErr == nil)
+	gpu = mergeWindowsGPUSensors(gpu, bridgeResult.GPUHotspots, bridgeResult.GPUVRAM, bridgeResult.Available && bridgeErr == nil)
 	// DXGI enumeration (~18 ms, then cached) only when there is something to
 	// attach.
 	if engines.Available {

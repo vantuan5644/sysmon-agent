@@ -240,7 +240,7 @@ func TestWindowsCollectorRunsMetricQueriesConcurrently(t *testing.T) {
 		`metrics.Disks = disks`,
 		`metrics.Network = network`,
 		`metrics.Temperatures = temperatures`,
-		`metrics.GPU = mergeWindowsGPUHotspots(gpu, bridgeResult.GPUHotspots, bridgeResult.Available && bridgeErr == nil)`,
+		`metrics.GPU = mergeWindowsGPUSensors(gpu, bridgeResult.GPUHotspots, bridgeResult.GPUVRAM, bridgeResult.Available && bridgeErr == nil)`,
 	} {
 		if !strings.Contains(source, needle) {
 			t.Fatalf("collector_windows.go missing concurrent Windows collection behavior %q", needle)

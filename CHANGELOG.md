@@ -4,6 +4,19 @@ Versions are plain numbers. What each one changes is written here, not in its na
 The full notes of a published release are on its
 [GitHub release page](https://github.com/vantuan5644/sysmon-agent/releases).
 
+## 0.2.5 (not released yet)
+
+The memory junction on Windows. Dashboard build v176, unchanged.
+
+### New
+
+- **VRAM temperature on Windows.** The GPU card shows the memory junction (VRAM) after
+  the hotspot, and the GPU overheat guard judges it at the same lines as on Linux (warn
+  100 °C, critical 106 °C), on NVIDIA cards with GDDR6X or GDDR7 memory. It comes from
+  LibreHardwareMonitor's `GPU Memory Junction` sensor, in the same reading as the
+  hotspot, so the guard's 2-second check costs nothing more. Cards with older memory
+  have no such sensor and show none.
+
 ## 0.2.4 (2026-11-15)
 
 The Windows network total counts each adapter once. Dashboard build v176, unchanged.

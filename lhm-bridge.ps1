@@ -111,6 +111,19 @@ function Get-NvidiaHotspot($hardware) {
     }
 }
 
+# The memory junction (GDDR6X, GDDR7), on the cards that report one. LHM
+# names it 'GPU Memory Junction'; a card with older memory has no such sensor.
+function Get-NvidiaMemoryJunction($hardware) {
+    if (-not $hardware.HardwareType -or $hardware.HardwareType.ToString() -ne 'GpuNvidia') { return }
+    $sensor = $hardware.Sensors | Where-Object {
+        $_.SensorType -eq 'Temperature' -and $_.Name -match '^GPU Memory Junction$' -and
+        $_.Value -ne $null -and (Test-PlausibleTemperature ([double]$_.Value))
+    } | Select-Object -First 1
+    if ($sensor) {
+        @{ name = $hardware.Name; identifier = $hardware.Identifier.ToString(); value = [math]::Round([double]$sensor.Value, 2) }
+    }
+}
+
 
 # Selects the aggregate output power (watts) from a PSU hardware node's Power
 # sensors, or $null if none is reported. Vendor naming for the total rail
@@ -234,6 +247,7 @@ try {
     $psuOutputPower = $null
     $temperatures = New-Object System.Collections.Generic.List[object]
     $gpuHotspots = New-Object System.Collections.Generic.List[object]
+    $gpuVram = New-Object System.Collections.Generic.List[object]
 
     # Read with retry. LibreHardwareMonitor's kernel driver can hand back a
     # partial or stale reading (0 W package power, only a handful of sensors)
@@ -251,10 +265,12 @@ try {
         $psuOutputPower = $null
         $temperatures.Clear()
         $gpuHotspots.Clear()
+        $gpuVram.Clear()
         foreach ($hw in $computer.Hardware) {
             try { $hw.Update() } catch {}
             $sensors = @($hw.Sensors)
             foreach ($reading in @(Get-NvidiaHotspot $hw)) { $gpuHotspots.Add($reading) }
+            foreach ($reading in @(Get-NvidiaMemoryJunction $hw)) { $gpuVram.Add($reading) }
             # First CPU node that reports package power wins. The per-rail
             # breakdown is read from that same node so the parts always sum
             # against the total they were measured with.
@@ -371,6 +387,7 @@ try {
         cpu_clock_peak_core = if ($null -ne $cpuClockPeakCore -and $cpuClockPeakCore -gt 0) { @{ available = $true; value = [math]::Round($cpuClockPeakCore, 0) } } else { $null }
         psu_output_power = if ($null -ne $psuOutputPower) { @{ available = $true; value = [math]::Round($psuOutputPower, 2) } } else { $null }
         gpu_hotspots     = $gpuHotspots
+        gpu_vram         = $gpuVram
         temperatures     = $temperatures
         library_path     = $dll
     }
