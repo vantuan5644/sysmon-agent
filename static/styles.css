@@ -135,11 +135,15 @@ html.standalone-gap .shell {
   height: calc(100svh + var(--standalone-gap, 0px));
 }
 
+/* The host name and its two platform lines take what they need, up to 55%
+   of the header, once the status strip has its minimum; the strip takes the
+   rest. A fixed 1 : 1.6 share left them under 100px on a phone, which cut a
+   kernel or Windows build short. */
 .topbar {
   position: relative;
   isolation: isolate;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr) auto;
+  grid-template-columns: fit-content(55%) minmax(130px, 1fr) auto;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
@@ -187,6 +191,16 @@ html.standalone-gap .shell {
 
 .host-identity {
   min-width: 0;
+}
+
+/* The platform under the host name is two lines (renderPlatform): the system
+   and architecture, then the kernel or OS build, each cut short on its own. */
+.platform-line {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.25;
 }
 
 .eyebrow {
@@ -2055,7 +2069,7 @@ body.host-remote .host-controls {
   }
 
   .topbar {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+    grid-template-columns: fit-content(55%) minmax(140px, 1fr);
     gap: 6px 10px;
   }
 
@@ -2264,9 +2278,9 @@ body.host-remote .host-controls {
 /* GPU hotspot: neutral until the GPU guard's lines (gpu_guard.thresholds, else
    its defaults 90/95 C), and coloured on its own, apart from the core warning. */
 #gpuDetail { white-space: normal; overflow-wrap: anywhere; }
-.gpu-hotspot-detail { color: var(--muted); }
-.gpu-hotspot-detail.warn { color: var(--warn); }
-.gpu-hotspot-detail.crit { color: var(--bad); font-weight: 700; }
+.gpu-hotspot-detail, .gpu-vram-detail { color: var(--muted); }
+.gpu-hotspot-detail.warn, .gpu-vram-detail.warn { color: var(--warn); }
+.gpu-hotspot-detail.crit, .gpu-vram-detail.crit { color: var(--bad); font-weight: 700; }
 
 /* GPU guard alarm (gpu_guard.level "critical"): one fixed layer over the whole
    shell, so it covers every pager page. A sibling of .shell, never a child:

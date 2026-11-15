@@ -229,14 +229,32 @@ window.addEventListener("load", function () {
   document.getElementById("cameraCtlState").textContent = "Mix";
   document.getElementById("cameraCtlUsage").textContent = "Busy";
   document.getElementById("hostname").textContent = "workstation-with-a-long-name";
-  document.getElementById("platform").textContent = "windows / amd64 / 10.0.26100";
+  // A release on this app's own build: one version badge, no build badge.
   document.getElementById("statusText").textContent = "Live";
   document.getElementById("agentVersion").hidden = false;
-  document.getElementById("agentVersion").textContent = "v0.1.44";
-  document.getElementById("buildToken").hidden = false;
-  document.getElementById("buildToken").textContent = "v999";
+  document.getElementById("agentVersion").textContent = "0.2.3";
+  document.getElementById("buildToken").hidden = true;
   document.getElementById("agentMeta").textContent = "up 7h 12m / saved / app / checked 2m ago";
   document.getElementById("updatedAt").textContent = "03:16:00 / 4s / 142ms";
+  // The platform's two lines (renderPlatform), measured for a Linux and a
+  // Windows host: each must fit beside the status strip without being cut.
+  var platformEl = document.getElementById("platform");
+  var setPlatform = function (lines) {
+    platformEl.textContent = "";
+    lines.forEach(function (text) {
+      var line = document.createElement("span");
+      line.className = "platform-line";
+      line.textContent = text;
+      platformEl.appendChild(line);
+    });
+  };
+  var platformFits = [["linux / amd64", "7.2.15-1-omarchy"], ["windows / amd64", "Windows 11 Pro 10.0.26200"]].map(function (lines) {
+    setPlatform(lines);
+    return Array.prototype.map.call(platformEl.querySelectorAll(".platform-line"), function (line) {
+      return { text: line.textContent, scrollWidth: line.scrollWidth, clientWidth: line.clientWidth };
+    });
+  });
+  setPlatform(["windows / amd64", "Windows 11 Pro 10.0.26200"]);
   var identityRect = document.querySelector(".topbar-id").getBoundingClientRect();
   var statusRect = document.querySelector(".status-row").getBoundingClientRect();
   var pager = document.getElementById("pager");
@@ -258,6 +276,7 @@ window.addEventListener("load", function () {
       var rect = document.getElementById(id).getBoundingClientRect();
       return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2).closest("button").id;
     }),
+    platformFits: platformFits,
     controlsInPager: !!controls.closest("#pager"),
     controlsBottom: controls.getBoundingClientRect().bottom,
     pagerTop: pager.getBoundingClientRect().top,
@@ -339,7 +358,8 @@ window.addEventListener("load", function () {
   // everything above: a git-describe version, a four-digit build token and a
   // 12-hour clock. When the strip had fixed grid columns, these drew over one
   // another on a desktop and ran off a phone screen.
-  document.getElementById("agentVersion").textContent = "release v0.2.0-14-g52a0645-dirty";
+  document.getElementById("agentVersion").textContent = "0.2.0-14-g52a0645-dirty";
+  document.getElementById("buildToken").hidden = false;
   document.getElementById("buildToken").textContent = "v1700";
   document.getElementById("updatedAt").textContent = "12:59:59 PM / 59m / 1.3s";
   var stripRect = document.querySelector(".status-strip").getBoundingClientRect();
@@ -438,6 +458,17 @@ function assertPagerInvariants(m) {
       header.statusRight > m.viewportWidth || header.identityBottom <= header.statusTop ||
       header.statusBottom <= header.identityTop) {
     throw new Error("Machine identity and status must share a row without overlap: " + JSON.stringify(header));
+  }
+  // Each platform line shows whole: on one line a phone cut the kernel off.
+  // Headless Chrome measures the 481-559px band (it will not size a window
+  // below 500px), where the actions share the row and the fixture's long
+  // hostname takes every pixel the strip leaves: there a Windows build may
+  // end in an ellipsis. Phone width is render-checked in verify-render.mjs.
+  const [linuxLines, windowsLines] = m.platformFits;
+  for (const line of [...linuxLines, windowsLines[0]]) {
+    if (line.clientWidth <= 0 || line.scrollWidth > line.clientWidth + 1) {
+      throw new Error("Platform line is cut short: " + JSON.stringify({ lines: m.platformFits, header: m.header }));
+    }
   }
   const strip = m.statusStrip;
   strip.items.forEach((item, index) => {

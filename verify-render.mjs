@@ -127,8 +127,9 @@ function writeFixture(root) {
   <main class="shell">
     ${readFileSync(join(scriptDir, "static", "index.html"), "utf8").match(/<header class="topbar">[\s\S]*?<\/header>/)[0]
       .replace('id="hostname">Sysmon', 'id="hostname">labbox-mini')
-      .replace('id="platform">Loading', 'id="platform">linux / amd64 / 6.8.0-homelab')
+      .replace('id="platform">Loading', 'id="platform"><span class="platform-line">windows / amd64</span><span class="platform-line">Windows 11 Pro 10.0.26200</span>')
       .replace('id="statusText">Connecting', 'id="statusText">Live')
+      .replace('id="agentVersion" class="agent-version" hidden>--', 'id="agentVersion" class="agent-version is-release">0.2.3')
       .replace('id="agentMeta" class="muted">--', 'id="agentMeta" class="muted">up 7h 12m / saved / app')
       .replace('id="updatedAt" class="muted">--', 'id="updatedAt" class="muted">03:16:00 / 4s / 142ms')}
     <section class="panel issues-panel" role="button" tabindex="0" aria-label="Expand issue details" aria-expanded="false" aria-live="polite">

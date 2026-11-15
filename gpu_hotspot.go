@@ -24,6 +24,7 @@ func mergeWindowsGPUHotspots(gpu GPUSet, readings []gpuHotspotReading, bridgeAva
 	for i := range gpu.Devices {
 		device := &gpu.Devices[i]
 		device.HotspotTemperature = unavailableNumber("C", "NVIDIA hotspot sensor not reported")
+		device.VRAMTemperature = unavailableNumber("C", vramNotReported)
 		if !bridgeAvailable {
 			continue
 		}
@@ -44,3 +45,9 @@ func normalizeGPUName(name string) string {
 }
 
 func validGPUHotspot(value float64) bool { return isFinite(value) && value > 0 && value < 150 }
+
+// The memory junction is read only by the Linux helper so far. LHM has a
+// "GPU Memory Junction" sensor that the Windows bridges could add.
+const vramNotReported = "GPU memory junction not reported"
+
+func validGPUVRAM(value float64) bool { return isFinite(value) && value > 0 && value < 127 }

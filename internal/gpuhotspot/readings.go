@@ -17,10 +17,15 @@ const MaxDevices = 64
 const MaxBytes = 64 * 1024
 const FreshFor = 6 * time.Second
 
+// Celsius is the die hotspot. VRAMCelsius is the GDDR6X memory junction,
+// which on a 3090 (half its memory on the back of the board) is often the
+// hottest part of the card, and which nvidia-smi does not report on GeForce.
 type Device struct {
-	PCIBusID string   `json:"pci_bus_id"`
-	Celsius  *float64 `json:"celsius"`
-	Error    string   `json:"error,omitempty"`
+	PCIBusID    string   `json:"pci_bus_id"`
+	Celsius     *float64 `json:"celsius"`
+	Error       string   `json:"error,omitempty"`
+	VRAMCelsius *float64 `json:"vram_celsius,omitempty"`
+	VRAMError   string   `json:"vram_error,omitempty"`
 }
 
 type Snapshot struct {
@@ -87,11 +92,24 @@ func NormalizePCIBusID(raw string) (string, error) {
 
 // Ampere/Ada register decoding follows ThomasBaruzier/gddr6-core-junction-vram-temps,
 // src/sensor.c at 6d8c5ecf633a8658d205fb2c24531bf87164912f (Apache-2.0).
-// The selected register is die hotspot; VRAM junction uses a different register.
+// Decode reads the die hotspot register.
 func Decode(raw uint32) (float64, error) {
 	value := float64((raw >> 8) & 0xff)
 	if raw == math.MaxUint32 || value <= 0 || value >= 150 {
 		return 0, fmt.Errorf("invalid GPU hotspot register reading")
+	}
+	return value, nil
+}
+
+// DecodeVRAM reads the GDDR6/GDDR6X temperature ADC: the low 12 bits in
+// 1/32 C steps, rejected at 127 C or above, as upstream does (same source and
+// commit as Decode, its GDDR6 profile).
+func DecodeVRAM(raw uint32) (float64, error) {
+	// Rounded first, so a value that passes is never published as 127.0,
+	// which every reader rejects.
+	value := math.Round(float64(raw&0xfff)/32*10) / 10
+	if raw == math.MaxUint32 || value <= 0 || value >= 127 {
+		return 0, fmt.Errorf("invalid GPU VRAM register reading")
 	}
 	return value, nil
 }

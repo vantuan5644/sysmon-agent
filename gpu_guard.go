@@ -82,6 +82,11 @@ func attachGPUGuard(m *Metrics, guard gpuGuardService) {
 	if st.ActionError != "" {
 		issues = append(issues, "gpu guard action failed: "+st.ActionError)
 	}
+	// Only a helper that reads the junction reports this, so on such a card
+	// the guard has lost the memory, often the hottest part of a 3090.
+	if st.VRAMError != "" {
+		issues = append(issues, "gpu guard cannot read the memory junction: "+st.VRAMError)
+	}
 	// Copied rather than appended in place: the slices can share a backing
 	// array with the sampler's working snapshot.
 	if len(issues) > 0 {

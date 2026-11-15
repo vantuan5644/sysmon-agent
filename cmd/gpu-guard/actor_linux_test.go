@@ -43,6 +43,22 @@ func TestPickHotspotMatchesThePCIAddress(t *testing.T) {
 	}
 }
 
+func TestPickVRAMTellsAnOldHelperFromAFailedRead(t *testing.T) {
+	ok := gpuhotspot.Snapshot{Devices: []gpuhotspot.Device{{PCIBusID: "0000:01:00.0", Celsius: hot(70), VRAMCelsius: hot(92.5)}}}
+	if got, why := pickVRAM(ok, "00000000:01:00.0"); got == nil || *got != 92.5 || why != "" {
+		t.Fatalf("got %v (%s)", got, why)
+	}
+	// A helper from before the VRAM register sends neither field: no fault.
+	old := gpuhotspot.Snapshot{Devices: []gpuhotspot.Device{{PCIBusID: "0000:01:00.0", Celsius: hot(70)}}}
+	if got, why := pickVRAM(old, "00000000:01:00.0"); got != nil || why != "" {
+		t.Fatalf("old helper: %v (%s)", got, why)
+	}
+	failed := gpuhotspot.Snapshot{Devices: []gpuhotspot.Device{{PCIBusID: "0000:01:00.0", Celsius: hot(70), VRAMError: "GPU VRAM register unavailable"}}}
+	if got, why := pickVRAM(failed, "00000000:01:00.0"); got != nil || why != "GPU VRAM register unavailable" {
+		t.Fatalf("failed read: %v (%s)", got, why)
+	}
+}
+
 func TestSourceCombinesTheStreamAndTheHotspotFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "readings.json")

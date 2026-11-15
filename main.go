@@ -73,6 +73,7 @@ func main() {
 	// Device pairing (pairing.go) and HTTPS for network clients (tls_auto.go).
 	pairingFlag := flag.String("pairing", envString("SYSMON_PAIRING", pairingModeRequired), "device pairing: required (only paired devices reach data and controls) or off (anyone who reaches the port, as before)")
 	networkTLSFlag := flag.String("network-tls", envString("SYSMON_NETWORK_TLS", networkTLSAuto), "HTTPS for network clients on the same port, plain HTTP kept for this machine: auto (on when pairing is required and the bind is not loopback), on, or off")
+	mdnsNameFlag := flag.String("mdns-name", envString("SYSMON_MDNS_NAME", ""), "a .local name for this agent other than its hostname's, such as bblwin for bblwin.local: the agent answers mDNS for it, its certificate names it and pairing QR codes open it, so a dual-boot machine can go by one name under both systems")
 	pairOpen := flag.Bool("pair", false, "open a 10-minute pairing window, print its PIN and exit (needs the agent's -settings path)")
 	pairURL := flag.String("pair-url", "", "with -pair: the dashboard address its QR code opens, such as https://host.example.ts.net:9443 (default: a private network address of this host)")
 	pairQR := flag.Bool("pair-qr", false, "with -pair: draw the QR code even when the output is not a terminal")
@@ -135,6 +136,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	mdnsName, err := parseMDNSNameFlag(*mdnsNameFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
 	listen := listenConfig{
 		bind:       *bind,
 		port:       *port,
@@ -142,6 +147,7 @@ func main() {
 		certFile:   *certFile,
 		keyFile:    *keyFile,
 		networkTLS: resolveNetworkTLS(networkTLSMode, pairingMode, *tlsEnabled, *bind),
+		mdnsName:   mdnsName,
 	}
 	if cmd := (pairingCommand{open: *pairOpen, token: *pairToken, list: *pairList, revoke: *pairRevoke, link: *pairURL, qr: *pairQR || stdoutIsTerminal()}); cmd.requested() {
 		if err := runPairingCommand(cmd, *settingsPath, listen, os.Stdout); err != nil {
@@ -263,7 +269,7 @@ func main() {
 		if dir == "" {
 			log.Printf("network TLS: without -settings the certificate is new on every start, so devices see a new warning each time")
 		}
-		cert, err := loadNetworkCertificate(*certFile, *keyFile, dir, time.Now())
+		cert, err := loadNetworkCertificate(*certFile, *keyFile, dir, time.Now(), mdnsCertificateNames(listen)...)
 		if err != nil {
 			log.Fatalf("network TLS: %v", err)
 		}
@@ -319,6 +325,13 @@ func main() {
 	// goroutines).
 	updateChecker.Start()
 	defer updateChecker.Stop()
+
+	// The -mdns-name responder joins the LAN's mDNS group, so it too starts
+	// only on the serve path.
+	if name, ok := mdnsResponderNeeded(listen); ok {
+		stopMDNS := startMDNSResponder(name, listen, log.Printf)
+		defer stopMDNS()
+	}
 
 	quotaChecker.Start()
 	defer quotaChecker.Stop()

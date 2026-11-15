@@ -1092,6 +1092,7 @@ func windowsVideoControllerGPU(ctx context.Context, nvidiaError string) GPUSet {
 	for index, row := range validRows {
 		devices = append(devices, GPUMetric{
 			HotspotTemperature: unavailableNumber("C", "NVIDIA hotspot sensor not reported"),
+			VRAMTemperature:    unavailableNumber("C", vramNotReported),
 			Name:               row.Name,
 			Usage:              windowsGPUEngineUsageMetricForAdapter(index, len(validRows), usageByAdapter, aggregateUsage, engineErr),
 			Memory:             windowsAdapterRAMCapacity(row.AdapterRAM),

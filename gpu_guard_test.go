@@ -74,6 +74,7 @@ func TestGuardFaultsReachTheIssueLists(t *testing.T) {
 		{gpuguard.State{Source: gpuguard.SourceNone}, []string{"gpu guard: no GPU temperature"}, nil},
 		{gpuguard.State{Source: gpuguard.SourceCore, Error: "hotspot file missing"}, nil, []string{"gpu guard judges the core temperature: hotspot file missing"}},
 		{gpuguard.State{Source: gpuguard.SourceHotspot, ActionError: "nvidia-smi -pl: Insufficient Permissions"}, []string{"gpu guard action failed: nvidia-smi -pl: Insufficient Permissions"}, nil},
+		{gpuguard.State{Source: gpuguard.SourceHotspot, VRAMError: "GPU VRAM register unavailable"}, []string{"gpu guard cannot read the memory junction: GPU VRAM register unavailable"}, nil},
 	} {
 		m := Metrics{CollectionErrors: shared}
 		state := tc.state

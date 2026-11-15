@@ -104,6 +104,7 @@ func parseNVIDIAGPUCSV(out string) GPUSet {
 		devices = append(devices, GPUMetric{
 			PCIBusID:           pciBusID,
 			HotspotTemperature: unavailableNumber("C", "NVIDIA hotspot sensor not reported"),
+			VRAMTemperature:    unavailableNumber("C", vramNotReported),
 			Name:               name,
 			Usage:              usage,
 			Power:              power,

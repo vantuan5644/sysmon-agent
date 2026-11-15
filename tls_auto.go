@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -80,8 +81,14 @@ func resolveNetworkTLS(mode, pairingMode string, tlsEnabled bool, bind string) b
 
 // loadNetworkCertificate returns -cert/-key when both are set, else the
 // agent's own certificate from dir (made on first use, and again when it
-// nears expiry), or a fresh in-memory one when dir is empty.
-func loadNetworkCertificate(certFile, keyFile, dir string, now time.Time) (tls.Certificate, error) {
+// nears expiry or does not name every one of names), or a fresh in-memory one
+// when dir is empty. names are host names the certificate must cover besides
+// the ones it always carries, such as an -mdns-name.
+//
+// A certificate made by the other operating system of a dual-boot machine
+// and copied here is kept as long as it covers names, since keeping it is
+// the point: a device that trusted it there trusts it here.
+func loadNetworkCertificate(certFile, keyFile, dir string, now time.Time, names ...string) (tls.Certificate, error) {
 	if certFile != "" || keyFile != "" {
 		if certFile == "" || keyFile == "" {
 			return tls.Certificate{}, errors.New("-cert and -key must be given together")
@@ -93,7 +100,7 @@ func loadNetworkCertificate(certFile, keyFile, dir string, now time.Time) (tls.C
 		return cert, nil
 	}
 	if dir == "" {
-		certPEM, keyPEM, err := newAgentCertificate(now)
+		certPEM, keyPEM, err := newAgentCertificate(now, names...)
 		if err != nil {
 			return tls.Certificate{}, err
 		}
@@ -103,11 +110,11 @@ func loadNetworkCertificate(certFile, keyFile, dir string, now time.Time) (tls.C
 		return tls.Certificate{}, fmt.Errorf("certificate folder %s: %w", dir, err)
 	}
 	if cert, err := tls.LoadX509KeyPair(filepath.Join(dir, agentCertFile), filepath.Join(dir, agentKeyFile)); err == nil {
-		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil && leaf.NotAfter.Sub(now) > agentCertRenewAt {
+		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil && leaf.NotAfter.Sub(now) > agentCertRenewAt && certificateNames(leaf, names) {
 			return cert, nil
 		}
 	}
-	certPEM, keyPEM, err := newAgentCertificate(now)
+	certPEM, keyPEM, err := newAgentCertificate(now, names...)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
@@ -154,9 +161,19 @@ func formatFingerprint(der []byte) string {
 	return strings.Join(parts, ":")
 }
 
+// certificateNames reports whether leaf is valid for every one of names.
+func certificateNames(leaf *x509.Certificate, names []string) bool {
+	for _, name := range names {
+		if leaf.VerifyHostname(name) != nil {
+			return false
+		}
+	}
+	return true
+}
+
 // newAgentCertificate makes a self-signed ECDSA P-256 server certificate
-// naming this host, localhost and the machine's current addresses.
-func newAgentCertificate(now time.Time) (certPEM, keyPEM []byte, err error) {
+// naming this host, localhost, the machine's current addresses and extra.
+func newAgentCertificate(now time.Time, extra ...string) (certPEM, keyPEM []byte, err error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, err
@@ -170,6 +187,11 @@ func newAgentCertificate(now time.Time) (certPEM, keyPEM []byte, err error) {
 	dnsNames := []string{"localhost"}
 	if hostname != "" && !strings.EqualFold(hostname, "localhost") {
 		dnsNames = append(dnsNames, hostname, hostname+".local")
+	}
+	for _, name := range extra {
+		if name = strings.TrimSpace(name); name != "" && !slices.ContainsFunc(dnsNames, func(have string) bool { return strings.EqualFold(have, name) }) {
+			dnsNames = append(dnsNames, name)
+		}
 	}
 	ips := []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback}
 	if addrs, err := net.InterfaceAddrs(); err == nil {

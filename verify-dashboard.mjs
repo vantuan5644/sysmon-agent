@@ -543,7 +543,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v173",
+    dashboard_build: "sysmon-static-v176",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -561,7 +561,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v173",
+    dashboard_build: "sysmon-static-v176",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1012,6 +1012,24 @@ delete hotspotMetrics.gpu_guard;
 hotspotMetrics.gpu.devices[0].hotspot_temperature_celsius = { available: false, unit: "C" };
 context.render(hotspotMetrics);
 assert(document.getElementById("gpuDetail").textContent === "49\u00b0C \u00b7 112 W", "missing hotspot stayed visible");
+// VRAM (memory junction) sits after the hotspot, coloured by its own lines
+// (defaults 100/106 without gpu_guard).
+hotspotMetrics.gpu.devices[0].hotspot_temperature_celsius = { available: true, value: 82, unit: "C" };
+hotspotMetrics.gpu.devices[0].vram_temperature_celsius = { available: true, value: 94, unit: "C" };
+context.render(hotspotMetrics);
+assert(document.getElementById("gpuDetail").textContent === "49\u00b0C \u00b7 112 W \u00b7 Hotspot 82\u00b0C \u00b7 VRAM 94\u00b0C", "GPU VRAM was not labeled after the hotspot");
+assert(document.getElementById("gpuDetail").children[1].className === "gpu-vram-detail", "VRAM below its warn line did not use neutral styling");
+hotspotMetrics.gpu.devices[0].vram_temperature_celsius = { available: true, value: 101, unit: "C" };
+context.render(hotspotMetrics);
+assert(document.getElementById("gpuDetail").children[1].className === "gpu-vram-detail warn", "VRAM over the default warn line was not coloured warn");
+assert(document.getElementById("gpuDetail").children[0].className === "gpu-hotspot-detail", "a hot VRAM coloured the hotspot");
+hotspotMetrics.gpu_guard = { mode: "warn", level: "ok", source: "hotspot", thresholds: { warn_c: 90, critical_c: 95, delta_warn_c: 20, vram_warn_c: 96, vram_critical_c: 100 } };
+context.render(hotspotMetrics);
+assert(document.getElementById("gpuDetail").children[1].className === "gpu-vram-detail crit", "VRAM colour did not follow the guard's own lines");
+delete hotspotMetrics.gpu_guard;
+hotspotMetrics.gpu.devices[0].hotspot_temperature_celsius = { available: false, unit: "C" };
+context.render(hotspotMetrics);
+assert(document.getElementById("gpuDetail").textContent === "49\u00b0C \u00b7 112 W \u00b7 VRAM 101\u00b0C", "VRAM without a hotspot did not render alone");
 context.render(sampleMetrics());
 
 {
@@ -1073,6 +1091,24 @@ context.render(sampleMetrics());
   context.render(guardFrame({ ...critical, source: "core", core_celsius: { available: true, value: 89, unit: "C" }, hotspot_celsius: { available: false, unit: "C" }, delta_celsius: { available: false, unit: "C" } }));
   assert(document.getElementById("gpuAlarmTitle").textContent === "GPU core 89\u00b0C", "a core-only alarm named the hotspot");
   assert(document.getElementById("gpuAlarmReadings").textContent === "431 W", "a core-only alarm repeated the core as a reading");
+  // A memory-junction episode leads with the memory and lists the die.
+  const vramCritical = {
+    ...critical,
+    reasons: ["vram_critical"],
+    message: "GPU memory (VRAM) 108°C, critical at 106°C",
+    hotspot_celsius: { available: true, value: 84, unit: "C" },
+    vram_celsius: { available: true, value: 108, unit: "C" },
+  };
+  context.render(guardFrame(vramCritical));
+  assert(document.getElementById("gpuAlarmTitle").textContent === "GPU memory 108°C", `memory alarm title = ${document.getElementById("gpuAlarmTitle").textContent}`);
+  assert(document.getElementById("gpuAlarmReadings").textContent === "hotspot 84°C · core 70°C · 431 W", `memory alarm readings = ${document.getElementById("gpuAlarmReadings").textContent}`);
+  assert(alertTexts().length === 1 && alertTexts()[0] === "GPU memory (VRAM) 108°C, critical at 106°C", `memory-only alerts = ${alertTexts()}`);
+  // With the hotspot leading, a hot memory gets its own alert line and a
+  // reading on the alarm.
+  context.render(guardFrame({ ...critical, reasons: ["hotspot_critical", "vram_warn"], vram_celsius: { available: true, value: 101, unit: "C" } }));
+  assert(document.getElementById("gpuAlarmTitle").textContent === "GPU hotspot 96°C", "a hotspot episode lost its title to a warm memory");
+  assert(document.getElementById("gpuAlarmReadings").textContent === "core 70°C · delta 26°C · VRAM 101°C · 431 W", `hotspot alarm with VRAM = ${document.getElementById("gpuAlarmReadings").textContent}`);
+  assert(alertTexts()[1] === "GPU memory (VRAM) 101°C, warning at 100°C", `memory beside a hot die = ${alertTexts()[1]}`);
 
   // The button's click bubbles to the overlay in a browser; the fixture has no
   // bubbling, so the tap lands on the overlay itself.
@@ -1167,11 +1203,16 @@ assert(document.getElementById("agentVersion").hidden === true, "missing version
 
 context.renderStatus({ ...sampleStatus(), version: "v0.1.4", update_check_supported: true });
 assert(document.getElementById("agentVersion").hidden === false, "release version did not show the build badge");
-assert(document.getElementById("agentVersion").textContent === "release v0.1.4", "release build badge text did not render");
+assert(document.getElementById("agentVersion").textContent === "0.1.4", "release build badge did not show just the number");
+assert(document.getElementById("agentVersion").title === "Running release v0.1.4", "release build badge title did not name the version");
 assert(document.getElementById("agentVersion").classList.contains("is-release"), "release build badge missing is-release class");
 assert(!document.getElementById("agentVersion").classList.contains("is-dev"), "release build badge kept the is-dev class");
-// The build badge names the host's dashboard build beside the channel badge.
+// A release on this app's own dashboard build needs no second badge.
 const ownBuild = sampleStatus().dashboard_build;
+assert(document.getElementById("buildToken").hidden === true, "a release on this app's own build still showed a build badge");
+// A versionless agent (and a dev build, below) is told apart by its build.
+context.renderAgentVersion(null);
+context.renderBuildToken(sampleStatus());
 assert(document.getElementById("buildToken").hidden === false, "the host's dashboard build was not shown");
 assert(document.getElementById("buildToken").textContent === ownBuild.replace("sysmon-static-", ""), "build badge did not shorten the token to vNNN");
 assert(document.getElementById("buildToken").title === `Dashboard build ${ownBuild}`, "build badge title did not name the full token");
@@ -1248,7 +1289,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v173, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v176, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1296,7 +1337,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v173; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v176; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1306,7 +1347,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v173",
+    dashboard_build: "sysmon-static-v176",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1316,7 +1357,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v173",
+    dashboard_build: "sysmon-static-v176",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1451,7 +1492,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v173", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v176", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -3041,7 +3082,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v173" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v176" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],
@@ -3188,7 +3229,7 @@ async function runPairingCase({ pairState, onFetch, hash = "", standalone = true
   const pairDocument = new Document(html);
   // The fake DOM ignores the hidden attribute; start these the way the
   // markup does, so a "shown" assertion means app.js showed it.
-  for (const id of ["pairScreen", "pairHost", "pairInsecure", "pairError", "pairingPanel", "pairingWindowBox", "pairingWindowQr", "pairingPanelError", "hostPairScreen", "pairInstall", "pairInstallPin", "pairingAppHint"]) {
+  for (const id of ["pairScreen", "pairBack", "pairHost", "pairInsecure", "pairError", "pairingPanel", "pairingWindowBox", "pairingWindowQr", "pairingPanelError", "hostPairScreen", "pairInstall", "pairInstallPin", "pairingAppHint"]) {
     pairDocument.getElementById(id).hidden = true;
   }
   const jar = new Map(cookies);
@@ -3534,19 +3575,41 @@ for (const [userAgent, how] of [
   ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36", "open Start, Sysmon Agent, Pair a device"],
   ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36", "run sysmon-agent -pair as the agent's user"],
 ]) {
-  // A browser on the host itself (localhost): the form says first where this
-  // machine's PIN comes from, in place of the list for other devices.
+  // A browser on the host itself (localhost) gets the dashboard without a
+  // PIN, since the agent answers its reads, and sends none of its writes.
   const run = await runPairingCase({
     pairState: { pairing: "required", paired: false, local: true, secure: true, window_open: false, dashboard_build: "" },
     standalone: false,
     userAgent,
     maxTouchPoints: 0,
+    onFetch: (path, options) => ((options.method || "GET") === "GET" && path === "/api/status" ? response(sampleStatus()) : null),
   });
-  assert(run.byId("pairScreen").hidden === false && run.byId("pairForm").hidden === false, "the host's own tab showed no PIN form");
+  assert(run.byId("pairScreen").hidden === true, "the host's own tab got the PIN form in place of the dashboard");
+  assert(run.byId("agentMeta").textContent.startsWith("view only / "), `the host's own tab did not say it is view only: ${run.byId("agentMeta").textContent}`);
+  assert(run.count("/api/client-check", "POST") === 0, "a view-only tab sent a client check, a write the agent refuses");
+  // A control opens the PIN form instead of a request that would 401. The
+  // form says first where this machine's PIN comes from, in place of the
+  // list for other devices, and leads back to the dashboard.
+  await run.context.sendControl("media_toggle", run.byId("mediaCtl"));
+  await run.context.updateSettings({ dim_enabled: true });
+  await settlePairing();
+  assert(run.count("/api/control", "POST") === 0 && run.count("/api/settings", "POST") === 0, "a view-only tab sent a control or a setting");
+  assert(run.byId("pairScreen").hidden === false && run.byId("pairForm").hidden === false, "a control in a view-only tab opened no PIN form");
+  assert(run.byId("pairBack").hidden === false, "the view-only PIN form had no way back to the dashboard");
+  assert(run.byId("pairIntro").textContent.startsWith("This browser runs on the host"), `the view-only PIN form did not say why it asks: ${run.byId("pairIntro").textContent}`);
   assert(run.byId("pairHost").hidden === false, "the host's own tab got no note on where its PIN comes from");
   assert(run.byId("pairHost").textContent.startsWith("This is the host.") && run.byId("pairHost").textContent.includes(how), `the host's note did not say ${how}: ${run.byId("pairHost").textContent}`);
   assert(run.byId("pairHow").hidden === true && run.byId("pairHowTitle").hidden === true, "the host's own tab kept the list for other devices");
   assert(run.byId("pairInsecure").hidden === true, "a local tab got the plain-HTTP notice");
+  await run.byId("pairBack").click();
+  await settlePairing();
+  assert(run.byId("pairScreen").hidden === true, "Back did not return to the dashboard");
+  assert(run.intervals.size > 0, "Back did not start the dashboard's timers again");
+  // Pairing elsewhere (the form, another tab) reloads into full control.
+  run.pairState = { ...run.pairState, paired: true };
+  await run.context.fetchPairingState();
+  await settlePairing();
+  assert(run.reloads === 1, "a view-only tab did not reload once paired");
 }
 
 {
