@@ -123,6 +123,40 @@ func TestWindowsNetCountersUseNativeInterfaceTable(t *testing.T) {
 	}
 }
 
+// TestWindowsNetCountersSkipFilterModules guards the 4x NET total: every
+// NDIS filter bound to an adapter is a GetIfTable2 row carrying the adapter's
+// own byte counts, so counting one adds the adapter's traffic again.
+func TestWindowsNetCountersSkipFilterModules(t *testing.T) {
+	var filters, adapters []string
+	err := walkWindowsIfTable(context.Background(), func(row *mibIfRow2) {
+		if row.InterfaceAndOperStatusFlags&ifFlagFilterInterface != 0 {
+			filters = append(filters, windowsIfRowName(row))
+		} else {
+			adapters = append(adapters, windowsIfRowName(row))
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filters) == 0 {
+		t.Skip("no NDIS filter modules on this host")
+	}
+	counters, err := windowsNetCounters(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range filters {
+		if _, ok := counters[name]; ok {
+			t.Errorf("filter module %q counted as an interface", name)
+		}
+	}
+	for _, name := range adapters {
+		if _, ok := counters[name]; !ok {
+			t.Errorf("adapter %q missing from the counters", name)
+		}
+	}
+}
+
 // TestRunPowerShellNamesADeadlineKill pins the message a cut-short query
 // produces. Go kills a timed-out child with TerminateProcess(handle, 1), so the
 // raw failure is a bare "exit status 1" with both streams empty - the dashboard

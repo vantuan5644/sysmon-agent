@@ -4,6 +4,18 @@ Versions are plain numbers. What each one changes is written here, not in its na
 The full notes of a published release are on its
 [GitHub release page](https://github.com/vantuan5644/sysmon-agent/releases).
 
+## 0.2.4 (2026-11-15)
+
+The Windows network total counts each adapter once. Dashboard build v176, unchanged.
+
+### Fixes
+
+- **The network total counts each adapter once (Windows).** Windows lists every
+  network filter driver bound to an adapter (QoS Packet Scheduler, the WFP filters, a
+  virtual switch extension) as an interface of its own with the adapter's own byte
+  counts, and the agent added them all up. A download at 133 MB/s on one Ethernet port
+  showed as about 520 MB/s, four times over. Filter interfaces are now skipped.
+
 ## 0.2.3 (2026-11-15)
 
 Dashboard build v173 to v176.
