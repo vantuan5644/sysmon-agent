@@ -708,9 +708,11 @@ The GPU card adds `Hotspot NN°C` to its detail line when the hotspot sensor can
 (`gpu.devices[].hotspot_temperature_celsius` in `/api/metrics`). The span is coloured at the
 GPU overheat guard's warn and critical lines (below), which are what raise the alarms.
 
-**Windows** needs nothing extra: the LibreHardwareMonitor bridge already reads `GPU Hot Spot`.
-When two GPUs share a model name the reading stays unavailable, rather than risk showing it
-on the wrong card.
+**Windows** needs nothing extra: the LibreHardwareMonitor bridge already reads `GPU Hot Spot`,
+and on cards with GDDR6X or GDDR7 memory `GPU Memory Junction`, which the GPU card shows as
+VRAM after the hotspot (`vram_temperature_celsius`) and the GPU guard judges. When two GPUs
+share a model name the readings stay unavailable, rather than risk showing them on the wrong
+card.
 
 **Linux** has no supported interface for it (`nvidia-smi` does not report it), so an optional
 root helper reads it from a GPU register through a read-only `/dev/mem` mapping. Supported:
@@ -753,7 +755,7 @@ publishes the result as `gpu_guard` in `/api/metrics`.
 | warn | hotspot at 90 °C or more for 3 samples | alerts chip on every dashboard page, hotspot coloured, desktop notification |
 | warn | hotspot 20 °C or more above the core for 60 s at 150 W or more | the same, as "poor thermal contact?" |
 | critical | hotspot at 95 °C or more for 3 samples | full-screen alarm on the dashboard, alarm on the host, the action below |
-| warn | memory junction (VRAM) at 100 °C or more (Linux, with the hotspot helper) | as for the hotspot |
+| warn | memory junction (VRAM) at 100 °C or more (Windows; Linux with the hotspot helper) | as for the hotspot |
 | critical | memory junction at 106 °C or more | as for the hotspot, before the card's own memory throttling at about 110 °C |
 
 A large hotspot-to-core gap under load usually means the thermal paste has pumped out or the

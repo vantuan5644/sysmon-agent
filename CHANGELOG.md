@@ -4,7 +4,7 @@ Versions are plain numbers. What each one changes is written here, not in its na
 The full notes of a published release are on its
 [GitHub release page](https://github.com/vantuan5644/sysmon-agent/releases).
 
-## 0.2.5 (not released yet)
+## 0.2.5 (2026-11-15)
 
 The memory junction on Windows. Dashboard build v176, unchanged.
 
