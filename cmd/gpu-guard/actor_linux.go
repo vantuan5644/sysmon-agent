@@ -41,19 +41,42 @@ func (s *source) ReadSample(_ context.Context) gpuguard.Sample {
 	snapshot, err := gpuhotspot.ReadFile(s.hotspotPath, now)
 	if err != nil {
 		problems = append(problems, err.Error())
-	} else if hot, why := pickHotspot(snapshot, reading.PCIBusID); hot != nil {
-		sample.Hotspot = hot
 	} else {
-		problems = append(problems, why)
+		if hot, why := pickHotspot(snapshot, reading.PCIBusID); hot != nil {
+			sample.Hotspot = hot
+		} else {
+			problems = append(problems, why)
+		}
+		// A helper from before the VRAM register reports neither field; the
+		// guard then judges the die alone, as it did before, with no issue.
+		// One that tried and failed says why, and the agent lists it.
+		sample.VRAM, sample.VRAMError = pickVRAM(snapshot, reading.PCIBusID)
 	}
 	sample.Error = strings.Join(problems, "; ")
 	return sample
 }
 
-// pickHotspot takes the device with the nvidia-smi PCI address; without one
-// (nvidia-smi down), a lone device is taken, since the hotspot alone is the
-// reading that matters most.
-func pickHotspot(snapshot gpuhotspot.Snapshot, busID string) (*float64, string) {
+// pickVRAM is the memory junction of the device pickHotspot would take, or
+// the helper's reason for having none.
+func pickVRAM(snapshot gpuhotspot.Snapshot, busID string) (*float64, string) {
+	device := pickDevice(snapshot, busID)
+	if device == nil {
+		return nil, ""
+	}
+	if device.VRAMError != "" {
+		return nil, device.VRAMError
+	}
+	if device.VRAMCelsius == nil {
+		return nil, ""
+	}
+	value := *device.VRAMCelsius
+	if value <= 0 || value >= 127 {
+		return nil, "GPU VRAM reading out of range"
+	}
+	return &value, ""
+}
+
+func pickDevice(snapshot gpuhotspot.Snapshot, busID string) *gpuhotspot.Device {
 	want, wantErr := gpuhotspot.NormalizePCIBusID(busID)
 	var match []gpuhotspot.Device
 	for _, device := range snapshot.Devices {
@@ -66,15 +89,26 @@ func pickHotspot(snapshot gpuhotspot.Snapshot, busID string) (*float64, string) 
 		match = snapshot.Devices
 	}
 	if len(match) != 1 {
+		return nil
+	}
+	return &match[0]
+}
+
+// pickHotspot takes the device with the nvidia-smi PCI address; without one
+// (nvidia-smi down), a lone device is taken, since the hotspot alone is the
+// reading that matters most.
+func pickHotspot(snapshot gpuhotspot.Snapshot, busID string) (*float64, string) {
+	device := pickDevice(snapshot, busID)
+	if device == nil {
 		return nil, fmt.Sprintf("no hotspot reading for GPU %s", busID)
 	}
-	if match[0].Error != "" {
-		return nil, match[0].Error
+	if device.Error != "" {
+		return nil, device.Error
 	}
-	if match[0].Celsius == nil {
+	if device.Celsius == nil {
 		return nil, "hotspot helper reported no value"
 	}
-	value := *match[0].Celsius
+	value := *device.Celsius
 	return &value, ""
 }
 

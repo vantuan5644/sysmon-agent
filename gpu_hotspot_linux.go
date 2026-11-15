@@ -21,8 +21,10 @@ func mergeLinuxGPUHotspots(gpu GPUSet, path string, now time.Time) GPUSet {
 	for i := range gpu.Devices {
 		device := &gpu.Devices[i]
 		device.HotspotTemperature = unavailableNumber("C", "NVIDIA hotspot sensor not reported")
+		device.VRAMTemperature = unavailableNumber("C", vramNotReported)
 		if err != nil {
 			device.HotspotTemperature.Error = err.Error()
+			device.VRAMTemperature.Error = err.Error()
 			continue
 		}
 		id, idErr := gpuhotspot.NormalizePCIBusID(device.PCIBusID)
@@ -32,12 +34,20 @@ func mergeLinuxGPUHotspots(gpu GPUSet, path string, now time.Time) GPUSet {
 		readings := byPCI[id]
 		if len(readings) > 1 {
 			device.HotspotTemperature.Error = "ambiguous GPU hotspot PCI identity"
+			device.VRAMTemperature.Error = "ambiguous GPU hotspot PCI identity"
 		} else if len(readings) == 1 {
 			reading := readings[0]
 			if reading.Error != "" {
 				device.HotspotTemperature.Error = reading.Error
 			} else if reading.Celsius != nil && validGPUHotspot(*reading.Celsius) {
 				device.HotspotTemperature = availableNumber(*reading.Celsius, "C")
+			}
+			// A helper from before the VRAM register sends neither field,
+			// and the default message stands.
+			if reading.VRAMError != "" {
+				device.VRAMTemperature.Error = reading.VRAMError
+			} else if reading.VRAMCelsius != nil && validGPUVRAM(*reading.VRAMCelsius) {
+				device.VRAMTemperature = availableNumber(*reading.VRAMCelsius, "C")
 			}
 		}
 	}

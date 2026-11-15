@@ -40,6 +40,10 @@ const state = {
   // whether the pairing screen holds the app, and the "Paired devices" panel.
   pairing: null,
   pairingLocked: false,
+  // pairingViewOnly: an unpaired browser on the host itself. The agent passes
+  // its reads (loopback, no proxy), so it gets the dashboard without a PIN;
+  // its controls open the PIN form instead of a request that would 401.
+  pairingViewOnly: false,
   // hostLocked: the host in view is a peer refusing this agent (423); its
   // metrics stop until it is paired or left. hostPair is its PIN dialog.
   hostLocked: false,
@@ -155,7 +159,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v173";
+const dashboardBuild = "sysmon-static-v176";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -343,6 +347,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("keydown", handleGPUAlarmKeydown);
   $("pairForm").addEventListener("submit", submitPairing);
   $("pairInstallBrowser").addEventListener("click", pairThisBrowser);
+  $("pairBack").addEventListener("click", leaveViewOnlyPairing);
   $("pairAnotherBtn").addEventListener("click", openPairingWindow);
   $("hostPairForm").addEventListener("submit", submitHostPair);
   $("hostPairCancel").addEventListener("click", cancelHostPair);
@@ -373,7 +378,7 @@ document.addEventListener("DOMContentLoaded", () => {
   restoreHostPreference();
   // Ask first whether this device must pair; the 401s from the fetches below
   // then find that check already under way instead of starting their own.
-  fetchPairingState();
+  const pairingKnown = Promise.resolve(fetchPairingState());
   fetchSettings();
   fetchStatus();
   // One quota fetch at load reveals (or hides) the fourth page; afterwards the
@@ -385,7 +390,9 @@ document.addEventListener("DOMContentLoaded", () => {
   syncVisibleTimers();
   fetchMetrics();
   fetchHistory();
-  sendClientCheck();
+  // The first client check waits for the pairing state: a browser on the
+  // host that turns out view only must not send this write.
+  pairingKnown.finally(() => sendClientCheck());
 });
 
 // setupPager wires the iOS StandBy-style horizontal pager: native CSS scroll-snap
@@ -810,7 +817,7 @@ function scheduleClientCheck() {
 }
 
 function shouldSendClientCheck() {
-  return document.visibilityState === "visible";
+  return document.visibilityState === "visible" && !state.pairingViewOnly;
 }
 
 function refreshVisibleDashboard() {
@@ -1016,6 +1023,10 @@ async function fetchWithTimeout(path, options, timeoutMS) {
 }
 
 function sendClientCheck(options = {}) {
+  if (state.pairingViewOnly) {
+    // A client check is a write, which the agent refuses an unpaired browser.
+    return Promise.resolve(false);
+  }
   const clientCheckOptions = normalizeClientCheckOptions(options);
   if (state.clientCheckInFlight) {
     if (clientCheckOptions.interaction) {
@@ -1132,7 +1143,7 @@ function acceptedClientCheckModeLabel(clientCheck) {
 }
 
 function sendClientCheckBeacon() {
-  if (typeof navigator.sendBeacon !== "function" || typeof Blob !== "function") {
+  if (state.pairingViewOnly || typeof navigator.sendBeacon !== "function" || typeof Blob !== "function") {
     return false;
   }
   const blob = new Blob([JSON.stringify(clientCheckPayload())], { type: "application/json" });
@@ -1246,7 +1257,8 @@ function renderStatus(status) {
   renderDisplayModeIssues();
   const uptime = formatDuration(status?.uptime_seconds);
   const persistence = status?.settings_persisted ? "saved" : "memory";
-  $("agentMeta").textContent = `up ${uptime} / ${persistence} / ${clientModeLabel(currentDisplayMode())}${clientCheckAgeLabel(statusProofClientCheck(status))}`;
+  const viewOnly = state.pairingViewOnly ? "view only / " : "";
+  $("agentMeta").textContent = `${viewOnly}up ${uptime} / ${persistence} / ${clientModeLabel(currentDisplayMode())}${clientCheckAgeLabel(statusProofClientCheck(status))}`;
 }
 
 function renderStatusIssues(status) {
@@ -1793,6 +1805,12 @@ async function submitHostPair(event) {
   if (!pair || state.hostPairSubmitting) {
     return;
   }
+  if (state.pairingViewOnly) {
+    // Pairing a peer is a write on this agent too: pair this browser first.
+    cancelHostPair();
+    openViewOnlyPairing();
+    return;
+  }
   const pin = String($("hostPairPin").value || "").replace(/\D/g, "");
   if (pin.length !== 6) {
     showHostPairError(`Enter the 6-digit PIN shown on ${pair.name}.`);
@@ -1901,15 +1919,19 @@ function renderAgentVersion(status) {
   badge.hidden = false;
   badge.classList.toggle("is-release", isRelease);
   badge.classList.toggle("is-dev", !isRelease);
-  badge.textContent = isRelease ? `release ${version}` : version;
+  // Just the number: the colour already says release or dev, and the strip
+  // shares its row with the host name, which a longer badge squeezed.
+  badge.textContent = isRelease ? version.replace(/^v/, "") : version;
   badge.title = isRelease
     ? `Running release ${version}`
     : `Running a development build (${version}) - self-update is disabled`;
 }
 
 // renderBuildToken shows the in-view host's dashboard build as "v155" beside
-// the channel badge. Every hand-built binary reads "dev", so the token is what
-// tells which build a host runs; for a peer it can differ from this app's own.
+// the channel badge, where it tells something: every hand-built binary reads
+// "dev", so for those (and agents too old to say) the token is what tells
+// which build a host runs, and a host on another build than this app's own
+// says so. A release on this app's own build needs no second badge.
 function renderBuildToken(status) {
   const badge = $("buildToken");
   if (!badge) {
@@ -1917,7 +1939,8 @@ function renderBuildToken(status) {
   }
   const build = String(status?.dashboard_build || "").trim();
   const match = /^sysmon-static-(v\d+)$/.exec(build);
-  badge.hidden = !match;
+  const redundant = state.agentChannel === "release" && build === dashboardBuild;
+  badge.hidden = !match || redundant;
   badge.textContent = match ? match[1] : "";
   badge.title = !match ? "" : build === dashboardBuild ? `Dashboard build ${build}` :
     `Host dashboard build ${build}; this app is ${dashboardBuild}`;
@@ -2005,6 +2028,9 @@ function renderUpdatePanel(status) {
 // and the dashboard reloads). Non-202 outcomes are surfaced in the banner so
 // the user can see why it refused (501 unsupported, 409 disabled, 502 network).
 async function sendUpdate() {
+  if (openViewOnlyPairing()) {
+    return;
+  }
   if (state.updateApplying) {
     return;
   }
@@ -2308,6 +2334,9 @@ async function fetchSettings(options = {}) {
 }
 
 async function updateSettings(update, interaction = "") {
+  if (openViewOnlyPairing()) {
+    return;
+  }
   const requestSeq = state.settingsRequestSeq + 1;
   state.settingsRequestSeq = requestSeq;
   state.settingsInFlight = true;
@@ -2420,10 +2449,10 @@ function writeStoredBoolean(key, value) {
 function render(metrics) {
   renderDeviceActivity(metrics.device_activity, metrics.timestamp);
   $("hostname").textContent = metrics.hostname || "unknown";
-  const platform = [metrics.os, metrics.arch, metrics.platform].filter(Boolean).join(" / ");
+  const system = [metrics.os, metrics.arch].filter(Boolean).join(" / ");
   // Viewing a peer says so in words as well as in the accent tint: the
   // control row above every page acts on whatever host this line names.
-  $("platform").textContent = state.hostID ? joinDetail([`via ${homeHostName()}`, platform]) : platform;
+  renderPlatform(state.hostID ? joinDetail([`via ${homeHostName()}`, system]) : system, metrics.platform);
   renderMetricTimestamp(metrics.timestamp, metrics.collection_duration_ms);
   renderMetricAlerts(metrics);
   renderCollectionErrors(metrics.collection_errors);
@@ -2941,6 +2970,16 @@ function addGPUGuardAlerts(messages, guard) {
     const limit = line !== null ? ` (warning at ${formatTemp(line)})` : "";
     messages.push(`GPU hotspot is ${amount}above the core under load${limit}: poor thermal contact?`);
   }
+  // The guard's message names the sensor that leads. When the die leads and
+  // the memory junction is over a line too, the memory gets its own line.
+  const vramReason = reasons.find((r) => r === "vram_warn" || r === "vram_critical");
+  const dieReason = reasons.some((r) => /^(hotspot|core)_(warn|critical)$/.test(r));
+  if (vramReason && dieReason) {
+    const vram = numberMetric(guard.vram_celsius);
+    const lines = gpuGuardVRAMLines(guard);
+    const line = vramReason === "vram_critical" ? `critical at ${formatTemp(lines.critical_c)}` : `warning at ${formatTemp(lines.warn_c)}`;
+    messages.push(`GPU memory (VRAM) ${vram.available ? formatTemp(vram.value) : "hot"}, ${line}`);
+  }
 }
 
 // gpuGuardLines are the hotspot's warn and critical lines for colouring.
@@ -2951,6 +2990,33 @@ function gpuGuardLines(guard) {
     warn_c: warn ?? gpuGuardDefaultLines.warn_c,
     critical_c: crit ?? gpuGuardDefaultLines.critical_c,
   };
+}
+
+// gpuGuardVRAMLines are the memory junction's lines (gpuguard
+// DefaultVRAMWarnC / DefaultVRAMCritC when the guard publishes none).
+const gpuGuardDefaultVRAMLines = { warn_c: 100, critical_c: 106 };
+
+function gpuGuardVRAMLines(guard) {
+  const warn = finiteNumber(guard?.thresholds?.vram_warn_c);
+  const crit = finiteNumber(guard?.thresholds?.vram_critical_c);
+  return {
+    warn_c: warn ?? gpuGuardDefaultVRAMLines.warn_c,
+    critical_c: crit ?? gpuGuardDefaultVRAMLines.critical_c,
+  };
+}
+
+// gpuTempSpan is one extra GPU reading on the card's detail line, coloured
+// by its own lines rather than the core's warn colour.
+function gpuTempSpan(className, label, value, lines, separated) {
+  const span = document.createElement("span");
+  span.className = className;
+  if (value >= lines.critical_c) {
+    span.classList.add("crit");
+  } else if (value >= lines.warn_c) {
+    span.classList.add("warn");
+  }
+  span.textContent = `${separated ? " · " : ""}${label} ${formatTemp(value)}`;
+  return span;
 }
 
 function renderGPUAlarm(metrics) {
@@ -2966,17 +3032,24 @@ function renderGPUAlarm(metrics) {
     return;
   }
   const core = guard.source === "core";
-  const lead = numberMetric(core ? guard.core_celsius : guard.hotspot_celsius);
+  const reasons = Array.isArray(guard.reasons) ? guard.reasons : [];
+  // The memory junction leads when it alone is critical.
+  const memory = reasons.includes("vram_critical") && !reasons.includes("hotspot_critical") && !reasons.includes("core_critical");
+  const lead = numberMetric(memory ? guard.vram_celsius : core ? guard.core_celsius : guard.hotspot_celsius);
   $("gpuAlarmHost").textContent = nonEmptyText(metrics.hostname) || "This host";
   $("gpuAlarmTitle").textContent = lead.available
-    ? `GPU ${core ? "core" : "hotspot"} ${formatTemp(lead.value)}`
+    ? `GPU ${memory ? "memory" : core ? "core" : "hotspot"} ${formatTemp(lead.value)}`
     : "GPU overheating";
+  const hotTemp = numberMetric(guard.hotspot_celsius);
   const coreTemp = numberMetric(guard.core_celsius);
   const delta = numberMetric(guard.delta_celsius);
+  const vramTemp = numberMetric(guard.vram_celsius);
   const power = numberMetric(guard.power_watts);
   $("gpuAlarmReadings").textContent = joinDetail([
-    !core && coreTemp.available ? `core ${formatTemp(coreTemp.value)}` : "",
-    !core && delta.available ? `delta ${formatTemp(delta.value)}` : "",
+    memory && hotTemp.available ? `hotspot ${formatTemp(hotTemp.value)}` : "",
+    (memory || !core) && coreTemp.available ? `core ${formatTemp(coreTemp.value)}` : "",
+    !memory && !core && delta.available ? `delta ${formatTemp(delta.value)}` : "",
+    !memory && vramTemp.available ? `VRAM ${formatTemp(vramTemp.value)}` : "",
     power.available ? formatPower(power.value) : "",
   ]) || "--";
   $("gpuAlarmMessage").textContent = nonEmptyText(guard.message) || "GPU critical temperature";
@@ -3559,20 +3632,18 @@ function renderPrimaryCardDetails(metrics, primaryGPU) {
     gpuTemp.available ? formatTemp(gpuTemp.value) : "",
     gpuPower.available ? formatPower(gpuPower.value) : "",
   ]), gpuTemp, tempWarn);
+  // Hotspot and VRAM are coloured by the GPU guard's lines, apart from the
+  // core's warn colour on the rest of the line: different sensors, different
+  // limits.
+  const gpuVRAM = primaryGPU ? numberMetric(primaryGPU.vram_temperature_celsius) : unavailable();
+  let gpuDetailHasText = gpuTemp.available || gpuPower.available;
+  if (!gpuDetailHasText && (gpuHotspot.available || gpuVRAM.available)) $("gpuDetail").textContent = "";
   if (gpuHotspot.available) {
-    const hotspot = document.createElement("span");
-    hotspot.className = "gpu-hotspot-detail";
-    // Coloured by the GPU guard's lines, apart from the core's warn colour on
-    // the rest of the line: the two are different sensors with different limits.
-    const lines = gpuGuardLines(gpuGuardState(metrics));
-    if (gpuHotspot.value >= lines.critical_c) {
-      hotspot.classList.add("crit");
-    } else if (gpuHotspot.value >= lines.warn_c) {
-      hotspot.classList.add("warn");
-    }
-    hotspot.textContent = `${gpuTemp.available || gpuPower.available ? " · " : ""}Hotspot ${formatTemp(gpuHotspot.value)}`;
-    if (!gpuTemp.available && !gpuPower.available) $("gpuDetail").textContent = "";
-    $("gpuDetail").append(hotspot);
+    $("gpuDetail").append(gpuTempSpan("gpu-hotspot-detail", "Hotspot", gpuHotspot.value, gpuGuardLines(gpuGuardState(metrics)), gpuDetailHasText));
+    gpuDetailHasText = true;
+  }
+  if (gpuVRAM.available) {
+    $("gpuDetail").append(gpuTempSpan("gpu-vram-detail", "VRAM", gpuVRAM.value, gpuGuardVRAMLines(gpuGuardState(metrics)), gpuDetailHasText));
   }
 
   const swap = capacityPercent(metrics.memory_swap);
@@ -4716,6 +4787,24 @@ function joinDetail(parts) {
   return parts.filter(Boolean).join(" · ");
 }
 
+// renderPlatform writes the line under the host name as two lines, each cut
+// short on its own: the system and architecture, then the kernel or OS build.
+// On one line a phone's header hid the build behind the alerts and actions.
+// The build drops Windows' "Microsoft ", which the first line already says.
+function renderPlatform(system, build) {
+  const el = $("platform");
+  el.textContent = "";
+  for (const text of [system, String(build || "").replace(/^Microsoft\s+/i, "")]) {
+    if (!text) {
+      continue;
+    }
+    const line = document.createElement("span");
+    line.className = "platform-line";
+    line.textContent = text;
+    el.append(line);
+  }
+}
+
 function setCardDetail(id, text, tempMetric, warnThreshold) {
   const el = $(id);
   if (!el) { return; }
@@ -4851,6 +4940,9 @@ function applyControlCapabilities(controls) {
 // status line -- it never throws.
 async function sendControl(action, button) {
   if (!button || button.disabled || pendingControlActions.has(action)) {
+    return;
+  }
+  if (openViewOnlyPairing()) {
     return;
   }
   // Lock Screen is destructive enough to require an arm-then-confirm: the first
@@ -5681,10 +5773,14 @@ function pairingRequired() {
 function applyPairingState(pairing) {
   state.pairing = pairing && typeof pairing === "object" ? pairing : null;
   if (pairingRequired() && state.pairing.paired === false) {
+    if (state.pairing.local === true) {
+      enterViewOnly();
+      return;
+    }
     showPairingScreen();
     return;
   }
-  if (state.pairingLocked) {
+  if (state.pairingLocked || state.pairingViewOnly) {
     // Paired meanwhile (another tab, or the same app after a resume): start
     // over, so every route is fetched again with the cookie.
     window.location.reload();
@@ -5845,6 +5941,8 @@ function showPairingScreen() {
   // On the host itself, say first where this machine's PIN comes from; the
   // list for other devices below would only bury it.
   const onHost = state.pairing?.local === true;
+  $("pairIntro").textContent = state.pairingViewOnly ? pairIntroViewOnly : pairIntroDefault;
+  $("pairBack").hidden = !state.pairingViewOnly;
   $("pairHost").hidden = !onHost;
   $("pairHowTitle").hidden = onHost;
   $("pairHow").hidden = onHost;
@@ -5878,6 +5976,46 @@ function showPairingScreen() {
       focusElement(linkPIN ? $("pairSubmit") : $("pairPin"));
     }
   }
+}
+
+const pairIntroDefault = "This agent shows its data only to devices paired with it. Enter the PIN from the host to pair this one.";
+const pairIntroViewOnly = "This browser runs on the host, so it shows the dashboard without a PIN. Its controls and settings need one: enter the PIN from the host to pair it.";
+
+// enterViewOnly keeps an unpaired browser on the host on the dashboard. The
+// agent answers its reads (loopback, no proxy header) and refuses its writes,
+// so nothing here needs a PIN until a control is used. Pairing reloads, as
+// from the PIN screen, and turns the controls on.
+function enterViewOnly() {
+  const first = !state.pairingViewOnly;
+  state.pairingViewOnly = true;
+  if (first) {
+    // The status may have landed first; redraw its meta line as view only.
+    fetchStatus();
+  }
+}
+
+// openViewOnlyPairing opens the PIN form for a control used in view-only
+// mode, and reports whether it did, so the caller sends nothing.
+function openViewOnlyPairing() {
+  if (!state.pairingViewOnly) {
+    return false;
+  }
+  showPairingScreen();
+  return true;
+}
+
+// leaveViewOnlyPairing is the PIN form's "Back to the dashboard": the
+// timers the form stopped start again and the data refreshes at once.
+function leaveViewOnlyPairing() {
+  if (!state.pairingViewOnly) {
+    return;
+  }
+  $("pairScreen").hidden = true;
+  setShellInert(false);
+  state.pairingLocked = false;
+  showPairingError("");
+  syncVisibleTimers();
+  refreshVisibleDashboard();
 }
 
 // hostPairingHint tells a browser on the host how to get a PIN there. A

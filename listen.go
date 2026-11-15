@@ -18,6 +18,9 @@ type listenConfig struct {
 	// plain HTTP on the same port stays open to loopback (tls_auto.go).
 	networkTLS  bool
 	networkCert *tls.Certificate
+	// mdnsName is the label of a .local name the agent goes by in place of
+	// its hostname's (-mdns-name, mdns_responder.go).
+	mdnsName string
 }
 
 type listenFunc func(network, address string) (net.Listener, error)

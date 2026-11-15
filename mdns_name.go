@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/pem"
+	"fmt"
 	"net"
 	"net/netip"
 	"net/url"
@@ -73,11 +75,7 @@ func pairingMDNSName(config listenConfig, dir, address string) (string, bool) {
 	if err != nil || !source.Is4() || !source.IsPrivate() {
 		return "", false
 	}
-	hostname, err := pairingHostname()
-	if err != nil {
-		return "", false
-	}
-	label, ok := mdnsLabel(hostname)
+	label, ok := mdnsNameLabel(config)
 	if !ok {
 		return "", false
 	}
@@ -89,6 +87,20 @@ func pairingMDNSName(config listenConfig, dir, address string) (string, bool) {
 		return "", false
 	}
 	return name, true
+}
+
+// mdnsNameLabel is the label of the .local name this agent goes by: the one
+// -mdns-name gives, which the agent answers for itself (mdns_responder.go),
+// else the hostname's, which the operating system answers for.
+func mdnsNameLabel(config listenConfig) (string, bool) {
+	if config.mdnsName != "" {
+		return mdnsLabel(config.mdnsName)
+	}
+	hostname, err := pairingHostname()
+	if err != nil {
+		return "", false
+	}
+	return mdnsLabel(hostname)
 }
 
 // mdnsLabel is the single DNS label a hostname is known by over mDNS, lower
@@ -186,66 +198,95 @@ func ownInterfaceAddrs() map[netip.Addr]bool {
 	return own
 }
 
-// queryMDNSOwnName sends one legacy unicast mDNS query (RFC 6762 section
-// 6.7: from a port other than 5353, so a responder answers by unicast to that
-// port, echoing the query ID) for name's A record. The socket is bound to
-// source because multicast otherwise leaves by whichever interface the
-// routing table prefers, which on a Windows host with WSL is its virtual
-// adapter, and the answers would be for that network. A host with no
-// responder stays silent; a second host using the name answers with an
-// address that is not one of own. It listens out the whole timeout, since a
-// second host's answer can come after this host's.
+// queryMDNSOwnName reports whether name answers from source and from no
+// address that is not one of own. A host with no responder stays silent; a
+// second host using the name answers with an address that is not one of own.
+// It listens out the whole timeout, since a second host's answer can come
+// after this host's.
 func queryMDNSOwnName(name string, source netip.Addr, own map[netip.Addr]bool, timeout time.Duration) bool {
-	conn, err := net.ListenUDP("udp4", net.UDPAddrFromAddrPort(netip.AddrPortFrom(source, 0)))
+	addrs, err := mdnsAnswers(name, source, timeout, func(addr netip.Addr) bool { return !own[addr] })
 	if err != nil {
 		return false
+	}
+	sawSource := false
+	for _, addr := range addrs {
+		if !own[addr] {
+			return false
+		}
+		if addr == source {
+			sawSource = true
+		}
+	}
+	return sawSource
+}
+
+// mdnsAnswers sends one legacy unicast mDNS query (RFC 6762 section 6.7:
+// from a port other than 5353, so a responder answers by unicast to that
+// port, echoing the query ID) for name's A record and returns every address
+// answered within timeout, stopping at the first one stop accepts. The
+// socket is bound to source because multicast otherwise leaves by whichever
+// interface the routing table prefers, which on a Windows host with WSL is
+// its virtual adapter, and the answers would be for that network.
+func mdnsAnswers(name string, source netip.Addr, timeout time.Duration, stop func(netip.Addr) bool) ([]netip.Addr, error) {
+	conn, err := net.ListenUDP("udp4", net.UDPAddrFromAddrPort(netip.AddrPortFrom(source, 0)))
+	if err != nil {
+		return nil, err
 	}
 	defer conn.Close()
 	var idBytes [2]byte
 	if _, err := rand.Read(idBytes[:]); err != nil {
-		return false
+		return nil, err
 	}
 	id := binary.BigEndian.Uint16(idBytes[:])
 	query, ok := mdnsQuery(id, name)
 	if !ok {
-		return false
+		return nil, fmt.Errorf("%q cannot be asked for over mDNS", name)
 	}
 	if _, err := conn.WriteToUDP(query, mdnsGroup); err != nil {
-		return false
+		return nil, err
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(timeout))
 	buf := make([]byte, 9000)
-	sawSource := false
+	var answers []netip.Addr
 	for {
 		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			return sawSource
+			return answers, nil
 		}
 		addrs, ok := mdnsAnswerAddrs(buf[:n], id, name)
 		if !ok {
 			continue
 		}
 		for _, addr := range addrs {
-			if !own[addr] {
-				return false
-			}
-			if addr == source {
-				sawSource = true
+			answers = append(answers, addr)
+			if stop != nil && stop(addr) {
+				return answers, nil
 			}
 		}
 	}
 }
 
 func mdnsQuery(id uint16, name string) ([]byte, bool) {
+	encoded, ok := encodeDNSName(name)
+	if !ok {
+		return nil, false
+	}
 	msg := []byte{byte(id >> 8), byte(id), 0, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	msg = append(msg, encoded...)
+	return append(msg, 0, 1, 0, 1), true // type A, class IN
+}
+
+// encodeDNSName writes name as uncompressed labels ending in the root label.
+func encodeDNSName(name string) ([]byte, bool) {
+	var out []byte
 	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
 		if label == "" || len(label) > 63 {
 			return nil, false
 		}
-		msg = append(msg, byte(len(label)))
-		msg = append(msg, label...)
+		out = append(out, byte(len(label)))
+		out = append(out, label...)
 	}
-	return append(msg, 0, 0, 1, 0, 1), true // root, type A, class IN
+	return append(out, 0), true
 }
 
 // mdnsAnswerAddrs reads the A records for name out of a response to query
@@ -287,10 +328,34 @@ func mdnsAnswerAddrs(msg []byte, id uint16, name string) (addrs []netip.Addr, ok
 // offset just past it in the message.
 func readDNSName(msg []byte, off int) (string, int, bool) {
 	var labels []string
+	next, ok := walkDNSName(msg, off, func(label []byte) bool {
+		labels = append(labels, string(label))
+		return true
+	})
+	if !ok {
+		return "", 0, false
+	}
+	return strings.Join(labels, "."), next, true
+}
+
+// maxDNSNameLength is the longest a name may be on the wire (RFC 1035).
+const maxDNSNameLength = 255
+
+// walkDNSName calls visit with each label of the possibly compressed name at
+// off, stopping early when visit returns false, and returns the offset just
+// past the name in the message. The packets come from anyone on the LAN, so
+// the walk is bounded: a name is at most 255 bytes, a compression pointer may
+// only point back to an earlier offset, and a name follows at most 16 of them.
+// Once visit has its answer and a pointer has been met, the end of the name
+// in the message is known and the walk stops, so a packet of many questions
+// pointing at one long name costs no more than its own bytes.
+func walkDNSName(msg []byte, off int, visit func(label []byte) bool) (int, bool) {
 	next := -1
-	for jumps := 0; jumps < 16; {
+	size, jumps := 0, 0
+	answered := false
+	for {
 		if off >= len(msg) {
-			return "", 0, false
+			return 0, false
 		}
 		length := int(msg[off])
 		switch {
@@ -298,25 +363,56 @@ func readDNSName(msg []byte, off int) (string, int, bool) {
 			if next < 0 {
 				next = off + 1
 			}
-			return strings.Join(labels, "."), next, true
+			return next, true
 		case length&0xC0 == 0xC0:
 			if off+1 >= len(msg) {
-				return "", 0, false
+				return 0, false
+			}
+			target := int(binary.BigEndian.Uint16(msg[off:]) & 0x3FFF)
+			if jumps++; target >= off || jumps > 16 {
+				return 0, false
 			}
 			if next < 0 {
 				next = off + 2
 			}
-			off = int(binary.BigEndian.Uint16(msg[off:]) & 0x3FFF)
-			jumps++
+			if answered {
+				return next, true
+			}
+			off = target
 		case length&0xC0 != 0:
-			return "", 0, false
+			return 0, false
 		default:
 			if off+1+length > len(msg) {
-				return "", 0, false
+				return 0, false
 			}
-			labels = append(labels, string(msg[off+1:off+1+length]))
+			if size += length + 1; size > maxDNSNameLength {
+				return 0, false
+			}
+			if !answered && !visit(msg[off+1:off+1+length]) {
+				// The caller has its answer; only where the name ends is left.
+				answered = true
+				if next >= 0 {
+					return next, true
+				}
+			}
 			off += 1 + length
 		}
 	}
-	return "", 0, false
+}
+
+// dnsNameIs reports whether the name at off is the one whose labels are want,
+// ignoring ASCII case and without allocating, and returns the offset just
+// past it. ok is false for a malformed name.
+func dnsNameIs(msg []byte, off int, want [][]byte) (next int, ok, equal bool) {
+	i := 0
+	equal = true
+	next, ok = walkDNSName(msg, off, func(label []byte) bool {
+		if i >= len(want) || !bytes.EqualFold(label, want[i]) {
+			equal = false
+			return false
+		}
+		i++
+		return true
+	})
+	return next, ok, ok && equal && i == len(want)
 }

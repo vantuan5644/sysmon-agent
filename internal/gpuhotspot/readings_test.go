@@ -27,3 +27,16 @@ func TestDecode(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeVRAM(t *testing.T) {
+	// Upper bits are not part of the reading.
+	got, err := DecodeVRAM(0x12340000 | 3088)
+	if err != nil || got != 96.5 {
+		t.Fatalf("decode vram: %v, %v", got, err)
+	}
+	for _, raw := range []uint32{0, 0xffffffff, 127 * 32, 0xfff, 0xfdf} {
+		if _, err := DecodeVRAM(raw); err == nil {
+			t.Fatalf("accepted vram register %x", raw)
+		}
+	}
+}

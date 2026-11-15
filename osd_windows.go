@@ -21,6 +21,7 @@ func (c *systemCollector) CollectOSDHardware(ctx context.Context) osdHardware {
 	result.CPUTemperature, result.TemperatureName = pickCPUTemperatureSensor(temperatures)
 	for i := range bridge.GPU {
 		bridge.GPU[i].HotspotTemperature = unavailableNumber("C", "hotspot is not sampled for OSD")
+		bridge.GPU[i].VRAMTemperature = unavailableNumber("C", "GPU memory junction is not sampled for OSD")
 	}
 	result.GPU = GPUSet{Available: len(bridge.GPU) > 0, Devices: bridge.GPU}
 	return result

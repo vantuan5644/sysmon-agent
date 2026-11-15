@@ -75,7 +75,7 @@ type Recoverer interface {
 
 func (l *Loop) Run(ctx context.Context) {
 	cfg := l.guard.Config()
-	l.logf("gpu guard: %s mode, hotspot warn %.0f C / critical %.0f C, delta warn %.0f C", cfg.Mode, cfg.HotspotWarnC, cfg.HotspotCritC, cfg.DeltaWarnC)
+	l.logf("gpu guard: %s mode, hotspot warn %.0f C / critical %.0f C, delta warn %.0f C, vram warn %.0f C / critical %.0f C", cfg.Mode, cfg.HotspotWarnC, cfg.HotspotCritC, cfg.DeltaWarnC, cfg.VRAMWarnC, cfg.VRAMCritC)
 	// A fresh state machine knows nothing of a limit the last run lowered,
 	// so it would never restore it. Put it back now; if the card is still
 	// hot, the first critical episode lowers it again within seconds.
@@ -152,8 +152,8 @@ func readSampleSafely(ctx context.Context, source Source) (sample Sample) {
 func (l *Loop) execute(parent context.Context, cmd Command, state State, dryRun bool) error {
 	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
-	readings := fmt.Sprintf("hotspot %s, core %s, delta %s, power %s",
-		state.Hotspot, state.Core, state.Delta, state.Power)
+	readings := fmt.Sprintf("hotspot %s, core %s, delta %s, vram %s, power %s",
+		state.Hotspot, state.Core, state.Delta, state.VRAM, state.Power)
 	if cmd.Kind == CmdNotify {
 		l.logf("gpu guard %s: %s (%s)", cmd.Level, cmd.Message, readings)
 		if err := l.actor.Notify(ctx, cmd.Level, cmd.Message); err != nil {
@@ -196,7 +196,7 @@ func (r Reading) String() string {
 }
 
 // TestSource lets a file stand in for some readings
-// ({"core":60,"hotspot":96,"power":400}), so the alarm and the dry-run log
+// ({"core":60,"hotspot":96,"vram":104,"power":400}), so the alarm and the dry-run log
 // can be checked end to end without heating the card. Fields left out keep
 // the real reading; with the file absent, every reading is real.
 type TestSource struct {
@@ -207,6 +207,7 @@ type TestSource struct {
 type testReading struct {
 	Core    *float64 `json:"core"`
 	Hotspot *float64 `json:"hotspot"`
+	VRAM    *float64 `json:"vram"`
 	Power   *float64 `json:"power"`
 }
 
@@ -225,6 +226,9 @@ func (s TestSource) ReadSample(ctx context.Context) Sample {
 	}
 	if fake.Hotspot != nil {
 		sample.Hotspot = fake.Hotspot
+	}
+	if fake.VRAM != nil {
+		sample.VRAM = fake.VRAM
 	}
 	if fake.Power != nil {
 		sample.Power = fake.Power

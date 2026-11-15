@@ -86,13 +86,16 @@ type TemperatureSet struct {
 }
 
 type GPUMetric struct {
-	HotspotTemperature NumberMetric   `json:"hotspot_temperature_celsius"`
-	PCIBusID           string         `json:"-"` // Internal identity for joining Linux helper readings.
-	Name               string         `json:"name"`
-	Usage              NumberMetric   `json:"usage_percent"`
-	Power              NumberMetric   `json:"power_watts"`
-	Memory             CapacityMetric `json:"memory"`
-	Temperature        NumberMetric   `json:"temperature_celsius"`
+	HotspotTemperature NumberMetric `json:"hotspot_temperature_celsius"`
+	// VRAMTemperature is the GDDR6X memory junction, read by the Linux hotspot
+	// helper (docs/nvidia-hotspot.md). nvidia-smi does not report it on GeForce.
+	VRAMTemperature NumberMetric   `json:"vram_temperature_celsius"`
+	PCIBusID        string         `json:"-"` // Internal identity for joining Linux helper readings.
+	Name            string         `json:"name"`
+	Usage           NumberMetric   `json:"usage_percent"`
+	Power           NumberMetric   `json:"power_watts"`
+	Memory          CapacityMetric `json:"memory"`
+	Temperature     NumberMetric   `json:"temperature_celsius"`
 	// Engines is each engine type's utilization, busiest first (gpu_engines.go).
 	// Absent when the platform reports none for this device.
 	Engines []GPUEngine `json:"engines,omitempty"`

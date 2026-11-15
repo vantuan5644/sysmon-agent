@@ -133,7 +133,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v173"`,
+		`const STATIC_CACHE = "sysmon-static-v176"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -415,7 +415,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 5000;`,
-		`const dashboardBuild = "sysmon-static-v173";`,
+		`const dashboardBuild = "sysmon-static-v176";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -1138,7 +1138,9 @@ func TestNarrowDeviceHeaderKeepsHostnameUsable(t *testing.T) {
 	for _, needle := range []string{
 		`@media (max-width: 480px) {`,
 		`.topbar {`,
-		`grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);`,
+		// The name takes what its two platform lines need, up to 55%, once
+		// the status strip has its 140px.
+		`grid-template-columns: fit-content(55%) minmax(140px, 1fr);`,
 		`.top-actions {`,
 		`grid-column: 1 / -1;`,
 		`grid-template-columns: repeat(4, 40px);`,

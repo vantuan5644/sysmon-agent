@@ -46,6 +46,8 @@ func main() {
 	warnC := flag.Int("hotspot-warn", envInt("SYSMON_GPU_HOTSPOT_WARN", 0), "hotspot warning in Celsius (70-105); 0 uses 90")
 	critC := flag.Int("hotspot-crit", envInt("SYSMON_GPU_HOTSPOT_CRIT", 0), "hotspot critical level in Celsius (80-110); 0 uses 95")
 	deltaC := flag.Int("delta-warn", envInt("SYSMON_GPU_DELTA_WARN", 0), "hotspot above core under load, in Celsius (10-40); 0 uses 20")
+	vramWarnC := flag.Int("vram-warn", envInt("SYSMON_GPU_VRAM_WARN", 0), "memory junction warning in Celsius (80-110); 0 uses 100")
+	vramCritC := flag.Int("vram-crit", envInt("SYSMON_GPU_VRAM_CRIT", 0), "memory junction critical level in Celsius (90-115); 0 uses 106")
 	spare := flag.String("spare", envString("SYSMON_GPU_GUARD_SPARE", ""), "process names never ended, comma-separated, besides the built-in desktop, terminal, sysmon and streaming list")
 	output := flag.String("output", gpuguard.StatePath, "state file the agent reads")
 	hotspotPath := flag.String("hotspot-file", "/run/sysmon-gpu-hotspot/readings.json", "readings of the sysmon-gpu-hotspot helper")
@@ -72,6 +74,12 @@ func main() {
 	}
 	if *deltaC != 0 {
 		cfg.DeltaWarnC = float64(*deltaC)
+	}
+	if *vramWarnC != 0 {
+		cfg.VRAMWarnC = float64(*vramWarnC)
+	}
+	if *vramCritC != 0 {
+		cfg.VRAMCritC = float64(*vramCritC)
 	}
 	if err := cfg.Validate(); err != nil {
 		log.Fatal(err)

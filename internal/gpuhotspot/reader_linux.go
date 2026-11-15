@@ -13,7 +13,12 @@ import (
 	"syscall"
 )
 
-const hotspotOffset = uint64(0x2046c)
+// Both registers sit in BAR0. The VRAM one is the GDDR6/GDDR6X temperature
+// ADC, read the same way on GA102 (RTX 3090) and AD102 (RTX 4090).
+const (
+	hotspotOffset = uint64(0x2046c)
+	vramOffset    = uint64(0xe2a8)
+)
 
 func supportedDevice(vendor, device string) bool {
 	return strings.TrimSpace(vendor) == "0x10de" && (strings.TrimSpace(device) == "0x2204" || strings.TrimSpace(device) == "0x2684")
@@ -42,25 +47,34 @@ func ReadDevices(sysRoot, memoryPath string) ([]Device, error) {
 		}
 		reading := Device{PCIBusID: id}
 		resource, err := os.ReadFile(filepath.Join(path, "resource"))
-		var value float64
+		var bar0 uint64
 		if err == nil {
-			var address uint64
-			address, err = registerAddress(string(resource))
-			if err == nil {
-				value, err = readRegister(memoryPath, address)
-			}
+			bar0, err = barStart(string(resource))
 		}
 		if err != nil {
 			reading.Error = "GPU hotspot register unavailable: " + err.Error()
+			reading.VRAMError = "GPU VRAM register unavailable: " + err.Error()
+			devices = append(devices, reading)
+			continue
+		}
+		if value, err := readRegister(memoryPath, bar0+hotspotOffset, Decode); err != nil {
+			reading.Error = "GPU hotspot register unavailable: " + err.Error()
 		} else {
 			reading.Celsius = &value
+		}
+		if value, err := readRegister(memoryPath, bar0+vramOffset, DecodeVRAM); err != nil {
+			reading.VRAMError = "GPU VRAM register unavailable: " + err.Error()
+		} else {
+			reading.VRAMCelsius = &value
 		}
 		devices = append(devices, reading)
 	}
 	return devices, nil
 }
 
-func registerAddress(resource string) (uint64, error) {
+// barStart returns BAR0's start once BAR0 is a memory BAR large enough to
+// hold both registers.
+func barStart(resource string) (uint64, error) {
 	fields := strings.Fields(strings.SplitN(resource, "\n", 2)[0])
 	if len(fields) != 3 {
 		return 0, fmt.Errorf("invalid BAR0 resource")
@@ -74,14 +88,15 @@ func registerAddress(resource string) (uint64, error) {
 		values[i] = value
 	}
 	start, end, flags := values[0], values[1], values[2]
-	// IORESOURCE_MEM=0x200. Never map I/O ports, empty BARs, or an overflowing range.
+	// IORESOURCE_MEM=0x200. Never map I/O ports, empty BARs, or an overflowing
+	// range. hotspotOffset is the higher of the two registers.
 	if start == 0 || end < start || flags&0x200 == 0 || end-start < hotspotOffset+3 || start > math.MaxInt64-hotspotOffset-3 {
-		return 0, fmt.Errorf("BAR0 does not contain the hotspot register")
+		return 0, fmt.Errorf("BAR0 does not contain the sensor registers")
 	}
-	return start + hotspotOffset, nil
+	return start, nil
 }
 
-func readRegister(path string, address uint64) (float64, error) {
+func readRegister(path string, address uint64, decode func(uint32) (float64, error)) (float64, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return 0, err
@@ -92,12 +107,12 @@ func readRegister(path string, address uint64) (float64, error) {
 	offset := int(address - base)
 	length := offset + 4
 	if length > int(pageSize) || base > math.MaxInt64 {
-		return 0, fmt.Errorf("invalid hotspot mapping range")
+		return 0, fmt.Errorf("invalid register mapping range")
 	}
 	mapping, err := syscall.Mmap(int(file.Fd()), int64(base), length, syscall.PROT_READ, syscall.MAP_SHARED)
 	if err != nil {
 		return 0, err
 	}
 	defer syscall.Munmap(mapping)
-	return Decode(binary.LittleEndian.Uint32(mapping[offset : offset+4]))
+	return decode(binary.LittleEndian.Uint32(mapping[offset : offset+4]))
 }

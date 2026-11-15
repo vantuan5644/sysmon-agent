@@ -70,6 +70,8 @@ type Config struct {
 	CoreWarnC      float64 // used only when no hotspot is reported
 	CoreCritC      float64
 	DeltaWarnC     float64
+	VRAMWarnC      float64 // memory junction; judged only when reported
+	VRAMCritC      float64
 	DeltaMinPowerW float64 // the delta is judged only while the GPU draws this much
 	HoldSamples    int
 	DeltaHold      time.Duration
@@ -100,6 +102,19 @@ const (
 	MinDeltaWarnC, MaxDeltaWarnC     = 10, 40
 )
 
+// VRAM (GDDR6X memory junction) lines, chosen 2026-11-14 for the RTX 3090,
+// whose back-side memory is the part that runs hottest under long compute
+// loads. The card slows its memory by itself at about 110 C; warn 100 /
+// critical 106 acts before that throttling starts. Only the Linux helper
+// reads the junction so far, so on Windows these lines are idle.
+const (
+	DefaultVRAMWarnC = 100
+	DefaultVRAMCritC = 106
+
+	MinVRAMWarnC, MaxVRAMWarnC = 80, 110
+	MinVRAMCritC, MaxVRAMCritC = 90, 115
+)
+
 func DefaultConfig() Config {
 	return Config{
 		Mode:           ModeWarn,
@@ -108,6 +123,8 @@ func DefaultConfig() Config {
 		CoreWarnC:      DefaultCoreWarnC,
 		CoreCritC:      DefaultCoreCritC,
 		DeltaWarnC:     DefaultDeltaWarnC,
+		VRAMWarnC:      DefaultVRAMWarnC,
+		VRAMCritC:      DefaultVRAMCritC,
 		DeltaMinPowerW: 150,
 		HoldSamples:    3,
 		DeltaHold:      60 * time.Second,
@@ -136,6 +153,15 @@ func (c Config) Validate() error {
 	if c.DeltaWarnC < MinDeltaWarnC || c.DeltaWarnC > MaxDeltaWarnC {
 		return fmt.Errorf("gpu hotspot-core delta warn %g C: want %d-%d", c.DeltaWarnC, MinDeltaWarnC, MaxDeltaWarnC)
 	}
+	if c.VRAMWarnC < MinVRAMWarnC || c.VRAMWarnC > MaxVRAMWarnC {
+		return fmt.Errorf("gpu vram warn %g C: want %d-%d", c.VRAMWarnC, MinVRAMWarnC, MaxVRAMWarnC)
+	}
+	if c.VRAMCritC < MinVRAMCritC || c.VRAMCritC > MaxVRAMCritC {
+		return fmt.Errorf("gpu vram critical %g C: want %d-%d", c.VRAMCritC, MinVRAMCritC, MaxVRAMCritC)
+	}
+	if c.VRAMCritC <= c.VRAMWarnC {
+		return fmt.Errorf("gpu vram critical %g C must be above warn %g C", c.VRAMCritC, c.VRAMWarnC)
+	}
 	if c.HoldSamples < 1 {
 		return fmt.Errorf("gpu guard hold samples must be at least 1")
 	}
@@ -148,8 +174,12 @@ type Sample struct {
 	GPU     string
 	Core    *float64
 	Hotspot *float64
+	VRAM    *float64 // memory junction
 	Power   *float64
 	Error   string
+	// VRAMError is a junction register that a helper tried and failed to
+	// read. A helper with no junction support sends none, and that is no fault.
+	VRAMError string
 }
 
 // Reading mirrors the agent's NumberMetric JSON shape.
@@ -160,9 +190,11 @@ type Reading struct {
 }
 
 type Thresholds struct {
-	WarnC  float64 `json:"warn_c"`
-	CritC  float64 `json:"critical_c"`
-	DeltaC float64 `json:"delta_warn_c"`
+	WarnC     float64 `json:"warn_c"`
+	CritC     float64 `json:"critical_c"`
+	DeltaC    float64 `json:"delta_warn_c"`
+	VRAMWarnC float64 `json:"vram_warn_c"`
+	VRAMCritC float64 `json:"vram_critical_c"`
 }
 
 const (
@@ -171,6 +203,8 @@ const (
 	ReasonCoreWarn        = "core_warn"
 	ReasonCoreCritical    = "core_critical"
 	ReasonDeltaWarn       = "delta_warn"
+	ReasonVRAMWarn        = "vram_warn"
+	ReasonVRAMCritical    = "vram_critical"
 
 	SourceHotspot = "hotspot"
 	SourceCore    = "core"
@@ -192,6 +226,7 @@ type State struct {
 	Hotspot    Reading    `json:"hotspot_celsius"`
 	Core       Reading    `json:"core_celsius"`
 	Delta      Reading    `json:"delta_celsius"`
+	VRAM       Reading    `json:"vram_celsius"`
 	Power      Reading    `json:"power_watts"`
 	Thresholds Thresholds `json:"thresholds"`
 	Action     string     `json:"action"`
@@ -202,6 +237,7 @@ type State struct {
 	LastActionAt  *time.Time `json:"last_action_at,omitempty"`
 	CriticalSince *time.Time `json:"critical_since,omitempty"`
 	Error         string     `json:"error,omitempty"`
+	VRAMError     string     `json:"vram_error,omitempty"`
 	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
@@ -223,11 +259,21 @@ type Command struct {
 type Guard struct {
 	cfg Config
 
-	tempLevel  Level // ok|warn|critical, from the temperature alone
+	tempLevel  Level // ok|warn|critical, from the die temperature alone
 	source     string
 	overWarn   int
 	overCrit   int
 	belowSince time.Time // reading continuously below the current level's clear point
+
+	// The memory junction is a second sensor with its own lines and the same
+	// hold and hysteresis. An episode runs while either one is critical.
+	vramLevel        Level
+	vramOverWarn     int
+	vramOverCrit     int
+	vramBelowSince   time.Time
+	vramWarnNotified bool
+	vramSeen         bool      // this card has reported a junction reading
+	vramLostSince    time.Time // the junction reading has been missing since
 
 	deltaOn     bool
 	deltaSince  time.Time // over the delta threshold continuously since
@@ -247,8 +293,20 @@ type Guard struct {
 }
 
 func New(cfg Config) *Guard {
-	return &Guard{cfg: cfg, tempLevel: LevelOK, source: SourceNone}
+	return &Guard{cfg: cfg, tempLevel: LevelOK, vramLevel: LevelOK, source: SourceNone}
 }
+
+// level is the worse of the die's and the memory junction's levels.
+func (g *Guard) level() Level {
+	if levelRank(g.vramLevel) > levelRank(g.tempLevel) {
+		return g.vramLevel
+	}
+	return g.tempLevel
+}
+
+// vramLeads says the memory junction, not the die, sets the level, so the
+// messages name it.
+func (g *Guard) vramLeads() bool { return levelRank(g.vramLevel) > levelRank(g.tempLevel) }
 
 func (g *Guard) Config() Config { return g.cfg }
 
@@ -294,6 +352,44 @@ func (g *Guard) Observe(s Sample) (State, []Command) {
 	if source != SourceNone {
 		g.stepTemperature(now, temp, warn, crit)
 	}
+	vram := reading(s.VRAM, "C")
+	if vram.Available {
+		g.vramSeen, g.vramLostSince = true, time.Time{}
+		g.stepVRAM(now, *s.VRAM)
+	} else {
+		// Losing the junction reading is no evidence that the memory cooled
+		// down. Its level holds, so a reading that drops out for a sample
+		// neither ends a warning nor warns again when it comes back. Only a
+		// warning lost for longer than the clear hold ends, or it could
+		// never end; a critical level holds until a reading clears it.
+		g.vramOverWarn, g.vramOverCrit, g.vramBelowSince = 0, 0, time.Time{}
+		if g.vramLostSince.IsZero() {
+			g.vramLostSince = now
+		}
+		if g.vramLevel == LevelWarn && now.Sub(g.vramLostSince) >= g.cfg.ClearHold {
+			g.vramLevel = LevelOK
+		}
+	}
+	// Any reading at all, die or memory, can end or start an episode.
+	measured := source != SourceNone || vram.Available
+	vramTemp := 0.0
+	if vram.Available {
+		vramTemp = *s.VRAM
+	}
+	lead := func() string {
+		if g.vramLeads() {
+			return g.vramMessage(vramTemp, vram.Available)
+		}
+		return g.message(source, temp, warn, crit)
+	}
+	// overCritNow: a sensor that is itself critical reads over its critical
+	// line in this very sample. One unheld sample from the other sensor
+	// does not count.
+	overCritNow := (source != SourceNone && g.tempLevel == LevelCritical && g.overCrit > 0) ||
+		(vram.Available && g.vramLevel == LevelCritical && g.vramOverCrit > 0)
+	// unreadCritical: a critical sensor that has no reading to say it cooled.
+	unreadCritical := (g.tempLevel == LevelCritical && source == SourceNone) ||
+		(g.vramLevel == LevelCritical && !vram.Available)
 	delta := Reading{Unit: "C"}
 	power := reading(s.Power, "W")
 	if hot.Available && core.Available {
@@ -304,11 +400,11 @@ func (g *Guard) Observe(s Sample) (State, []Command) {
 	}
 
 	// Commands follow the level just computed.
-	if g.tempLevel == LevelCritical {
+	if g.level() == LevelCritical {
 		if g.criticalSince.IsZero() {
 			g.criticalSince = now
 			g.lastAlarm = now
-			cmds = append(cmds, Command{Kind: CmdNotify, Level: LevelCritical, Message: g.message(source, temp, warn, crit)})
+			cmds = append(cmds, Command{Kind: CmdNotify, Level: LevelCritical, Message: lead()})
 			if !g.powerLimited {
 				g.powerLimited = true
 				cmds = append(cmds, Command{Kind: CmdLimitPower, Level: LevelCritical})
@@ -321,7 +417,7 @@ func (g *Guard) Observe(s Sample) (State, []Command) {
 			// the critical line: a card the lower limit already cooled sits
 			// out the clear hold at the critical level, and needs nothing
 			// ended for it.
-			if source != SourceNone && g.overCrit > 0 && !now.Before(g.nextKill) {
+			if overCritNow && !now.Before(g.nextKill) {
 				g.appsStopped = true
 				g.nextKill = now.Add(g.cfg.KillEvery)
 				cmds = append(cmds, Command{Kind: CmdStopApps, Level: LevelCritical})
@@ -329,22 +425,31 @@ func (g *Guard) Observe(s Sample) (State, []Command) {
 			// The host alarm repeats while the reading is still over the line,
 			// or while there is none to say otherwise. A reading that shows the
 			// card cooling through the clear hold gets no fresh system-modal box.
-			stillHot := source == SourceNone || g.overCrit > 0
+			stillHot := overCritNow || unreadCritical
 			if stillHot && g.cfg.AlarmRepeat > 0 && now.Sub(g.lastAlarm) >= g.cfg.AlarmRepeat {
 				g.lastAlarm = now
-				cmds = append(cmds, Command{Kind: CmdNotify, Level: LevelCritical, Message: g.message(source, temp, warn, crit)})
+				cmds = append(cmds, Command{Kind: CmdNotify, Level: LevelCritical, Message: lead()})
 			}
 		}
-	} else if source != SourceNone {
+	} else if measured {
 		g.criticalSince = time.Time{}
 	}
 
-	if g.tempLevel == LevelWarn && !g.warnNotified {
+	// Each sensor warns once per episode of its own; during a critical
+	// episode the critical alarm speaks for both.
+	if g.tempLevel == LevelWarn && !g.warnNotified && g.vramLevel != LevelCritical {
 		g.warnNotified = true
 		cmds = append(cmds, Command{Kind: CmdNotify, Level: LevelWarn, Message: g.message(source, temp, warn, crit)})
 	}
 	if g.tempLevel == LevelOK {
 		g.warnNotified = false
+	}
+	if g.vramLevel == LevelWarn && !g.vramWarnNotified && g.tempLevel != LevelCritical {
+		g.vramWarnNotified = true
+		cmds = append(cmds, Command{Kind: CmdNotify, Level: LevelWarn, Message: g.vramMessage(vramTemp, vram.Available)})
+	}
+	if g.vramLevel == LevelOK {
+		g.vramWarnNotified = false
 	}
 	if g.deltaOn && !g.deltaNotify {
 		g.deltaNotify = true
@@ -354,15 +459,18 @@ func (g *Guard) Observe(s Sample) (State, []Command) {
 		g.deltaNotify = false
 	}
 
-	// Restore the power limit once the card has been cool for a while.
+	// Restore the power limit once the card has been cool for a while: the
+	// die, and the memory junction on a card that reports one. A junction
+	// seen before and missing now is not cool; it keeps the limit lowered.
 	if g.powerLimited && source != SourceNone {
-		if temp < warn-g.cfg.RestoreMarginC {
+		vramCool := !g.vramSeen || (vram.Available && vramTemp < g.cfg.VRAMWarnC-g.cfg.RestoreMarginC)
+		if temp < warn-g.cfg.RestoreMarginC && vramCool {
 			if g.coolSince.IsZero() {
 				g.coolSince = now
 			}
-			if g.tempLevel != LevelCritical && now.Sub(g.coolSince) >= g.cfg.RestoreAfter {
+			if g.level() != LevelCritical && now.Sub(g.coolSince) >= g.cfg.RestoreAfter {
 				g.powerLimited, g.appsStopped, g.coolSince = false, false, time.Time{}
-				cmds = append(cmds, Command{Kind: CmdRestorePower, Level: g.tempLevel})
+				cmds = append(cmds, Command{Kind: CmdRestorePower, Level: g.level()})
 			}
 		} else {
 			g.coolSince = time.Time{}
@@ -379,55 +487,70 @@ func (g *Guard) Observe(s Sample) (State, []Command) {
 			}
 		}
 	}
-	return g.state(now, s, source, temp, warn, crit, hot, core, delta, power), cmds
+	return g.state(now, s, source, temp, warn, crit, hot, core, delta, vram, power), cmds
 }
 
 func (g *Guard) stepTemperature(now time.Time, temp, warn, crit float64) {
+	if g.stepSensor(now, temp, warn, crit, &g.tempLevel, &g.overWarn, &g.overCrit, &g.belowSince) {
+		g.warnNotified = true // the critical alarm already said it
+	}
+}
+
+func (g *Guard) stepVRAM(now time.Time, temp float64) {
+	if g.stepSensor(now, temp, g.cfg.VRAMWarnC, g.cfg.VRAMCritC, &g.vramLevel, &g.vramOverWarn, &g.vramOverCrit, &g.vramBelowSince) {
+		g.vramWarnNotified = true
+	}
+}
+
+// stepSensor moves one sensor's level: up after HoldSamples readings over a
+// line, down after ClearHold below it by ClearMarginC. It reports a fall
+// from critical to warn, which needs no fresh warning.
+func (g *Guard) stepSensor(now time.Time, temp, warn, crit float64, level *Level, overWarn, overCrit *int, belowSince *time.Time) bool {
 	if temp >= crit {
-		g.overCrit++
+		*overCrit++
 	} else {
-		g.overCrit = 0
+		*overCrit = 0
 	}
 	if temp >= warn {
-		g.overWarn++
+		*overWarn++
 	} else {
-		g.overWarn = 0
+		*overWarn = 0
 	}
 	hold := g.cfg.HoldSamples
 	switch {
-	case g.overCrit >= hold && g.tempLevel != LevelCritical:
-		g.tempLevel, g.belowSince = LevelCritical, time.Time{}
-		return
-	case g.overWarn >= hold && g.tempLevel == LevelOK:
-		g.tempLevel, g.belowSince = LevelWarn, time.Time{}
-		return
+	case *overCrit >= hold && *level != LevelCritical:
+		*level, *belowSince = LevelCritical, time.Time{}
+		return false
+	case *overWarn >= hold && *level == LevelOK:
+		*level, *belowSince = LevelWarn, time.Time{}
+		return false
 	}
 	clearAt := 0.0
-	switch g.tempLevel {
+	switch *level {
 	case LevelCritical:
 		clearAt = crit - g.cfg.ClearMarginC
 	case LevelWarn:
 		clearAt = warn - g.cfg.ClearMarginC
 	default:
-		return
+		return false
 	}
 	if temp >= clearAt {
-		g.belowSince = time.Time{}
-		return
+		*belowSince = time.Time{}
+		return false
 	}
-	if g.belowSince.IsZero() {
-		g.belowSince = now
+	if belowSince.IsZero() {
+		*belowSince = now
 	}
-	if now.Sub(g.belowSince) < g.cfg.ClearHold {
-		return
+	if now.Sub(*belowSince) < g.cfg.ClearHold {
+		return false
 	}
-	g.belowSince = time.Time{}
-	if g.tempLevel == LevelCritical && temp >= warn-g.cfg.ClearMarginC {
-		g.tempLevel = LevelWarn
-		g.warnNotified = true // the critical alarm already said it
-		return
+	*belowSince = time.Time{}
+	if *level == LevelCritical && temp >= warn-g.cfg.ClearMarginC {
+		*level = LevelWarn
+		return true
 	}
-	g.tempLevel = LevelOK
+	*level = LevelOK
+	return false
 }
 
 func (g *Guard) stepDelta(now time.Time, delta float64, power Reading) {
@@ -481,25 +604,46 @@ func (g *Guard) deltaMessage(delta float64) string {
 	return fmt.Sprintf("GPU hotspot is %.0f°C above the core under load (warning at %.0f°C): poor thermal contact?", delta, g.cfg.DeltaWarnC)
 }
 
-func (g *Guard) state(now time.Time, s Sample, source string, temp, warn, crit float64, hot, core, delta, power Reading) State {
-	st := State{
-		Mode:       g.cfg.Mode,
-		Source:     source,
-		GPU:        s.GPU,
-		Hotspot:    hot,
-		Core:       core,
-		Delta:      delta,
-		Power:      power,
-		Thresholds: Thresholds{WarnC: warn, CritC: crit, DeltaC: g.cfg.DeltaWarnC},
-		Action:     ActionNone,
-		Error:      s.Error,
-		UpdatedAt:  now.UTC(),
+// vramMessage follows message's wording for the memory junction.
+func (g *Guard) vramMessage(temp float64, available bool) string {
+	warn, crit := g.cfg.VRAMWarnC, g.cfg.VRAMCritC
+	switch {
+	case !available:
+		return fmt.Sprintf("GPU memory junction reading lost during a %s episode", g.vramLevel)
+	case g.vramLevel == LevelCritical && temp < crit:
+		return fmt.Sprintf("GPU memory (VRAM) %.0f°C, cooling after reaching the critical %.0f°C", temp, crit)
+	case g.vramLevel == LevelCritical:
+		return fmt.Sprintf("GPU memory (VRAM) %.0f°C, critical at %.0f°C", temp, crit)
+	case temp < warn:
+		return fmt.Sprintf("GPU memory (VRAM) %.0f°C, cooling after reaching the warning %.0f°C", temp, warn)
 	}
-	level := g.tempLevel
+	return fmt.Sprintf("GPU memory (VRAM) %.0f°C, warning at %.0f°C", temp, warn)
+}
+
+func (g *Guard) state(now time.Time, s Sample, source string, temp, warn, crit float64, hot, core, delta, vram, power Reading) State {
+	st := State{
+		Mode:    g.cfg.Mode,
+		Source:  source,
+		GPU:     s.GPU,
+		Hotspot: hot,
+		Core:    core,
+		Delta:   delta,
+		VRAM:    vram,
+		Power:   power,
+		Thresholds: Thresholds{
+			WarnC: warn, CritC: crit, DeltaC: g.cfg.DeltaWarnC,
+			VRAMWarnC: g.cfg.VRAMWarnC, VRAMCritC: g.cfg.VRAMCritC,
+		},
+		Action:    ActionNone,
+		Error:     s.Error,
+		VRAMError: s.VRAMError,
+		UpdatedAt: now.UTC(),
+	}
+	level := g.level()
 	if g.deltaOn && levelRank(level) < levelRank(LevelWarn) {
 		level = LevelWarn
 	}
-	if source == SourceNone && level == LevelOK {
+	if source == SourceNone && !vram.Available && level == LevelOK {
 		level = LevelUnknown
 	}
 	st.Level = level
@@ -513,10 +657,20 @@ func (g *Guard) state(now time.Time, s Sample, source string, temp, warn, crit f
 	case g.tempLevel == LevelWarn:
 		st.Reasons = append(st.Reasons, ReasonHotspotWarn)
 	}
+	switch g.vramLevel {
+	case LevelCritical:
+		st.Reasons = append(st.Reasons, ReasonVRAMCritical)
+	case LevelWarn:
+		st.Reasons = append(st.Reasons, ReasonVRAMWarn)
+	}
 	if g.deltaOn {
 		st.Reasons = append(st.Reasons, ReasonDeltaWarn)
 	}
 	switch {
+	case g.vramLeads():
+		st.Message = g.vramMessage(vram.Value, vram.Available)
+	case source == SourceNone && levelRank(g.tempLevel) == 0 && vram.Available:
+		// The memory junction alone is fine and says so by its silence.
 	case source == SourceNone && levelRank(g.tempLevel) == 0:
 		st.Message = "no GPU temperature reported"
 	case source == SourceNone && g.powerLimited && g.cfg.Mode == ModeAct:
