@@ -126,6 +126,19 @@ function Get-NvidiaHotspot($hardware) {
     }
 }
 
+# The memory junction (GDDR6X, GDDR7), on the cards that report one. LHM
+# names it 'GPU Memory Junction'; a card with older memory has no such sensor.
+function Get-NvidiaMemoryJunction($hardware) {
+    if (-not $hardware.HardwareType -or $hardware.HardwareType.ToString() -ne 'GpuNvidia') { return }
+    $sensor = $hardware.Sensors | Where-Object {
+        $_.SensorType -eq 'Temperature' -and $_.Name -match '^GPU Memory Junction$' -and
+        $_.Value -ne $null -and (Test-PlausibleTemperature ([double]$_.Value))
+    } | Select-Object -First 1
+    if ($sensor) {
+        @{ name = $hardware.Name; identifier = $hardware.Identifier.ToString(); value = [math]::Round([double]$sensor.Value, 2) }
+    }
+}
+
 
 # --- Drive temperatures do not come from LibreHardwareMonitor. ---
 #
@@ -249,11 +262,13 @@ function Read-LhmSnapshot($computer) {
     $psuOutputPower = $null
     $temperatures = New-Object System.Collections.Generic.List[object]
     $gpuHotspots = New-Object System.Collections.Generic.List[object]
+    $gpuVram = New-Object System.Collections.Generic.List[object]
 
     foreach ($hw in $computer.Hardware) {
         try { $hw.Update() } catch {}
         $sensors = @($hw.Sensors)
         foreach ($reading in @(Get-NvidiaHotspot $hw)) { $gpuHotspots.Add($reading) }
+        foreach ($reading in @(Get-NvidiaMemoryJunction $hw)) { $gpuVram.Add($reading) }
         # First CPU node that reports package power wins. The per-rail breakdown
         # is read from that same node so the parts always sum against the total
         # they were measured with.
@@ -347,6 +362,7 @@ function Read-LhmSnapshot($computer) {
         cpu_clock_peak_core = if ($null -ne $cpuClockPeakCore -and $cpuClockPeakCore -gt 0) { @{ available = $true; value = [math]::Round($cpuClockPeakCore, 0) } } else { $null }
         psu_output_power = if ($null -ne $psuOutputPower) { @{ available = $true; value = [math]::Round($psuOutputPower, 2) } } else { $null }
         gpu_hotspots     = $gpuHotspots
+        gpu_vram         = $gpuVram
         temperatures     = $temperatures
     }
     return $result | ConvertTo-Json -Compress -Depth 6
@@ -355,9 +371,9 @@ function Read-LhmSnapshot($computer) {
 # OSD requests update only CPU/GPU nodes. They use the same already-open
 # Computer and skip storage, motherboard, PSU, and the full result traversal.
 # The GPU guard's 'gpu' request ($GpuOnly) updates only the GPU nodes. Both
-# carry the hotspot and package power, so core and hotspot come from one
-# Update() of one node and their difference is not skewed by the five seconds
-# nvidia-smi's core reading is cached for.
+# carry the hotspot, memory junction and package power, so core and hotspot
+# come from one Update() of one node and their difference is not skewed by the
+# five seconds nvidia-smi's core reading is cached for.
 function Read-LhmOsdSnapshot($computer, [bool]$GpuOnly = $false) {
     $temperatures = New-Object System.Collections.Generic.List[object]
     $devices = New-Object System.Collections.Generic.List[object]
@@ -400,10 +416,14 @@ function Read-LhmOsdSnapshot($computer, [bool]$GpuOnly = $false) {
             $hot = $null
             if ($updated) { $hot = Get-NvidiaHotspot $hw }
             if ($hot) { $hotspot = @{available=$true;value=$hot.value;unit='C'} }
+            $vram = @{available=$false;value=0;unit='C';error='GPU memory junction unavailable'}
+            $junction = $null
+            if ($updated) { $junction = Get-NvidiaMemoryJunction $hw }
+            if ($junction) { $vram = @{available=$true;value=$junction.value;unit='C'} }
             $pkg = $sensors | Where-Object { $_.SensorType -eq 'Power' -and $_.Name -eq 'GPU Package' -and $null -ne $_.Value } | Select-Object -First 1
             $power = @{available=$false;value=0;unit='W';error='GPU package power unavailable'}
             if ($pkg -and [double]$pkg.Value -gt 0) { $power = @{available=$true;value=[math]::Round([double]$pkg.Value,1);unit='W'} }
-            $devices.Add(@{name=$hw.Name;usage_percent=$usage;temperature_celsius=$temperature;hotspot_temperature_celsius=$hotspot;power_watts=$power})
+            $devices.Add(@{name=$hw.Name;usage_percent=$usage;temperature_celsius=$temperature;hotspot_temperature_celsius=$hotspot;vram_temperature_celsius=$vram;power_watts=$power})
         }
     }
     return @{available=$true;temperatures=$temperatures;gpu=$devices} | ConvertTo-Json -Compress -Depth 6

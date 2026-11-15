@@ -18,10 +18,11 @@ import (
 	"sysmon-agent/internal/gpuguard"
 )
 
-// ReadGPUGuardSample reads the NVIDIA GPU's core, hotspot and package power
-// from one GPU-only daemon request (lhm-bridge-daemon.ps1 'gpu'), so the
-// delta between core and hotspot comes from a single Update(). Without the
-// daemon it falls back to nvidia-smi, which has no hotspot.
+// ReadGPUGuardSample reads the NVIDIA GPU's core, hotspot, memory junction and
+// package power from one GPU-only daemon request (lhm-bridge-daemon.ps1 'gpu'),
+// so the delta between core and hotspot comes from a single Update(). Without
+// the daemon it falls back to nvidia-smi, which has neither hotspot nor memory
+// junction.
 func (c *systemCollector) ReadGPUGuardSample(ctx context.Context) gpuguard.Sample {
 	sample := gpuguard.Sample{At: time.Now()}
 	c.lhmMu.Lock()
@@ -92,6 +93,8 @@ func guardSampleFromGPU(sample gpuguard.Sample, device GPUMetric) gpuguard.Sampl
 	}
 	sample.Core = value(device.Temperature)
 	sample.Hotspot = value(device.HotspotTemperature)
+	// Judged only when reported: a card without GDDR6X or GDDR7 has no junction.
+	sample.VRAM = value(device.VRAMTemperature)
 	sample.Power = value(device.Power)
 	if sample.Core == nil && sample.Hotspot == nil {
 		sample.Error = strings.TrimSpace(device.Temperature.Error + " " + device.HotspotTemperature.Error)

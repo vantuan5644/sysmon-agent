@@ -87,8 +87,9 @@ type TemperatureSet struct {
 
 type GPUMetric struct {
 	HotspotTemperature NumberMetric `json:"hotspot_temperature_celsius"`
-	// VRAMTemperature is the GDDR6X memory junction, read by the Linux hotspot
-	// helper (docs/nvidia-hotspot.md). nvidia-smi does not report it on GeForce.
+	// VRAMTemperature is the GDDR6X/GDDR7 memory junction, read by the Linux
+	// hotspot helper (docs/nvidia-hotspot.md) and on Windows from
+	// LibreHardwareMonitor. nvidia-smi does not report it on GeForce.
 	VRAMTemperature NumberMetric   `json:"vram_temperature_celsius"`
 	PCIBusID        string         `json:"-"` // Internal identity for joining Linux helper readings.
 	Name            string         `json:"name"`

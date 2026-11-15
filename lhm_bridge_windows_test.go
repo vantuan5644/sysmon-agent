@@ -55,7 +55,7 @@ func TestLhmOSDScriptUpdatesOnlyCPUAndGPU(t *testing.T) {
 $ErrorActionPreference = 'Stop'
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'lhm-bridge-daemon.ps1'),[ref]$tokens,[ref]$errors)
-foreach ($name in @('Test-CpuNode','Test-PlausibleTemperature','Test-LiveTemperature','Get-NvidiaHotspot','Read-LhmOsdSnapshot')) {
+foreach ($name in @('Test-CpuNode','Test-PlausibleTemperature','Test-LiveTemperature','Get-NvidiaHotspot','Get-NvidiaMemoryJunction','Read-LhmOsdSnapshot')) {
     $function=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)
     . ([scriptblock]::Create($function.Extent.Text))
 }
@@ -76,11 +76,14 @@ if (($script:updates -join ',') -ne 'CPU,GPU,broken GPU') { throw 'OSD updated u
 if ($result.temperatures[0].value -ne 61 -or $result.gpu.Count -ne 2 -or $result.gpu[0].usage_percent.value -ne 79 -or $result.gpu[0].temperature_celsius.value -ne 54) { throw 'Incorrect OSD sensor selection' }
 if ($result.gpu[1].usage_percent.available) { throw 'Failed GPU update emitted an old reading' }
 if ($result.gpu[0].hotspot_temperature_celsius.value -ne 66.25 -or $result.gpu[0].power_watts.value -ne 312.4) { throw 'OSD GPU lacks hotspot or package power' }
+if ($result.gpu[0].vram_temperature_celsius.value -ne 96) { throw 'OSD GPU lacks the memory junction' }
 if ($result.gpu[1].hotspot_temperature_celsius.available -or $result.gpu[1].power_watts.available) { throw 'Failed GPU update emitted an old hotspot or power' }
+if ($result.gpu[1].vram_temperature_celsius.available) { throw 'Failed GPU update emitted a memory junction' }
 $script:updates.Clear()
 $result=Read-LhmOsdSnapshot ([pscustomobject]@{Hardware=@($cpu,$storage,$gpu,$board,$broken,$psu)}) $true | ConvertFrom-Json
 if (($script:updates -join ',') -ne 'GPU,broken GPU') { throw "GPU-only request updated $($script:updates -join ',')" }
 if ($result.temperatures.Count -ne 0 -or $result.gpu[0].hotspot_temperature_celsius.value -ne 66.25 -or $result.gpu[0].temperature_celsius.value -ne 54) { throw 'Incorrect GPU-only sensor selection' }
+if ($result.gpu[0].vram_temperature_celsius.value -ne 96) { throw 'GPU-only request lacks the memory junction' }
 Write-Output 'PASS: CPU/GPU-only sensor updates and partial failure'
 `
 	output, err := exec.Command(shell, "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()

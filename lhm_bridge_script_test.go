@@ -17,7 +17,8 @@ func TestLhmNvidiaHotspotSelection(t *testing.T) {
 	for _, name := range lhmBridgeScriptFiles {
 		t.Run(name, func(t *testing.T) {
 			source := readLhmBridgeScript(t, name)
-			functions := sliceFunction(t, source, "Test-PlausibleTemperature") + "\n}\n" + sliceFunction(t, source, "Get-NvidiaHotspot") + "\n}\n"
+			functions := sliceFunction(t, source, "Test-PlausibleTemperature") + "\n}\n" + sliceFunction(t, source, "Get-NvidiaHotspot") + "\n}\n" +
+				sliceFunction(t, source, "Get-NvidiaMemoryJunction") + "\n}\n"
 			script := `$ErrorActionPreference = 'Stop'
 ` + functions + `
 $core = [pscustomobject]@{SensorType='Temperature'; Name='GPU Core'; Value=48}
@@ -36,8 +37,17 @@ $spot.Value = 82.5
 $spot.Name = 'GPU Hot Spot Limit'
 if (@(Get-NvidiaHotspot $hw).Count -ne 0) { throw 'threshold accepted' }
 $spot.Name = 'GPU Hotspot'
+$m = @(Get-NvidiaMemoryJunction $hw)
+if ($m.Count -ne 1 -or $m[0].value -ne 96 -or $m[0].name -ne $hw.Name) { throw 'wrong memory junction sensor or identity' }
+$memory.Value = 0
+if (@(Get-NvidiaMemoryJunction $hw).Count -ne 0) { throw 'zero memory junction accepted' }
+$memory.Value = 96
+$memory.Name = 'GPU Memory Junction Limit'
+if (@(Get-NvidiaMemoryJunction $hw).Count -ne 0) { throw 'memory junction limit accepted' }
+$memory.Name = 'GPU Memory Junction'
 $hw.HardwareType = 'GpuAmd'
 if (@(Get-NvidiaHotspot $hw).Count -ne 0) { throw 'non-NVIDIA accepted' }
+if (@(Get-NvidiaMemoryJunction $hw).Count -ne 0) { throw 'non-NVIDIA memory junction accepted' }
 `
 			// The budget is for pwsh's cold start, not the fixture, which runs in
 			// well under a second. A fresh CI runner took longer than the 10 s
@@ -61,9 +71,31 @@ func TestWindowsGPUHotspotBothCollectionPaths(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(string(data), "mergeWindowsGPUHotspots(gpu, bridgeResult.GPUHotspots, bridgeResult.Available && bridgeErr == nil)") {
-			t.Fatalf("%s does not attach hotspot readings to GPU metrics", name)
+		if !strings.Contains(string(data), "mergeWindowsGPUSensors(gpu, bridgeResult.GPUHotspots, bridgeResult.GPUVRAM, bridgeResult.Available && bridgeErr == nil)") {
+			t.Fatalf("%s does not attach hotspot and memory junction readings to GPU metrics", name)
 		}
+	}
+}
+
+// Both scripts must emit the memory junction in the full read, and the one-shot
+// must clear it between its retry passes, as it does the hotspot.
+func TestLhmBridgeScriptsEmitTheMemoryJunction(t *testing.T) {
+	for _, name := range lhmBridgeScriptFiles {
+		script := readLhmBridgeScript(t, name)
+		for _, want := range []string{
+			"foreach ($reading in @(Get-NvidiaMemoryJunction $hw)) { $gpuVram.Add($reading) }",
+			"gpu_vram         = $gpuVram",
+		} {
+			if !strings.Contains(script, want) {
+				t.Errorf("%s lacks %q", name, want)
+			}
+		}
+	}
+	if !strings.Contains(readLhmBridgeScript(t, "lhm-bridge.ps1"), "$gpuVram.Clear()") {
+		t.Error("lhm-bridge.ps1 keeps memory junction readings across retry passes")
+	}
+	if !strings.Contains(readLhmBridgeScript(t, "lhm-bridge-daemon.ps1"), "vram_temperature_celsius=$vram") {
+		t.Error("the daemon's GPU-only reply lacks the memory junction the guard reads")
 	}
 }
 
