@@ -1743,7 +1743,7 @@ function Install-Agent {
         Show-DeviceHandoff
         Write-Host ''
         Write-Host 'Pairing is required: other devices see this host only once they are paired. For a'
-        Write-Host 'PIN, open Start, Sysmon Agent, Pair a device, or run install-windows.ps1 -Action Pair.'
+        Write-Host 'PIN, type sysmon in Start and choose Pair a device, or run install-windows.ps1 -Action Pair.'
         return
     }
     # The PIN goes last, where the output ends. -pair lists the device URLs

@@ -19,6 +19,10 @@
 #   sudoedit /etc/systemd/system/sysmon-agent.service   # set User= for this host
 #   sudo systemctl daemon-reload && sudo systemctl enable --now sysmon-agent.service
 #
+# Update: `sudo sysmon-agent -update` installs the latest verified release and
+# restarts this unit. `sudo sysmon-agent -update-setup -update-user USER` (the
+# User= above) once lets the dashboard's Update button do it.
+#
 # Publish to the tailnet for the PWA (recommended):
 #   sudo tailscale serve --bg --https=9443 http://127.0.0.1:9099
 #

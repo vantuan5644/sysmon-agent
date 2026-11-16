@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# dist/build-installer.sh — build the release exe, then the NSIS installer.
+# dist/build-installer.sh — build the release exe, the Linux binaries, then the
+# NSIS installer and the checksum manifest that covers all of them.
 #
 # Cross-compilable: makensis runs natively on Linux/macOS/Windows, so you can
 # produce a Windows Setup .exe from any of them without wine.
@@ -9,7 +10,8 @@
 #   ./dist/build-installer.sh 1.2.3          # explicit version
 #
 # Requires: Go 1.22+, makensis (NSIS), and (optional) ImageMagick for the icon.
-# Output: dist/out/SysmonAgent-Setup-<VERSION>.exe
+# Output: dist/out/SysmonAgent-Setup-<VERSION>.exe, sysmon-agent.exe,
+#         sysmon-agent-linux-amd64, sysmon-agent-linux-arm64, SHA256SUMS.txt
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +28,18 @@ fi
 
 echo "==> Building release exe"
 "$SCRIPT_DIR/build-windows.sh" "$VERSION"
+
+# The Linux root updater (`sudo sysmon-agent -update`) installs
+# sysmon-agent-linux-<GOARCH> from the latest release, after checking it
+# against SHA256SUMS.txt and against its own -version. Static, so one binary
+# runs on any distribution.
+LINUX_ARCHES=(amd64 arm64)
+for arch in "${LINUX_ARCHES[@]}"; do
+    echo "==> Building sysmon-agent $VERSION for linux/$arch"
+    CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+        -ldflags="-s -w -X main.version=$VERSION" \
+        -o "$ROOT/dist/out/sysmon-agent-linux-$arch" .
+done
 
 MAKENSIS="$(command -v makensis 2>/dev/null || true)"
 if [[ -z "$MAKENSIS" ]]; then
@@ -70,18 +84,22 @@ OUT="$ROOT/dist/out/SysmonAgent-Setup-$VERSION.exe"
 # to proceed when this asset is missing from the release.
 echo "==> Writing SHA256SUMS.txt"
 SUMS="$ROOT/dist/out/SHA256SUMS.txt"
+ASSETS=("sysmon-agent.exe" "SysmonAgent-Setup-$VERSION.exe")
+for arch in "${LINUX_ARCHES[@]}"; do
+    ASSETS+=("sysmon-agent-linux-$arch")
+done
 (
     # Run from the output dir so the manifest carries bare file names: both
     # engines match the release asset name exactly, with no directory part.
     cd "$ROOT/dist/out"
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "sysmon-agent.exe" "SysmonAgent-Setup-$VERSION.exe"
+        sha256sum "${ASSETS[@]}"
     elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "sysmon-agent.exe" "SysmonAgent-Setup-$VERSION.exe"
+        shasum -a 256 "${ASSETS[@]}"
     elif command -v certutil >/dev/null 2>&1; then
         # Windows fallback: reshape certutil's multi-line output into the
         # coreutils "<hex>  <name>" form the engines parse.
-        for f in "sysmon-agent.exe" "SysmonAgent-Setup-$VERSION.exe"; do
+        for f in "${ASSETS[@]}"; do
             hash="$(certutil -hashfile "$f" SHA256 | sed -n '2p' | tr -d ' \r')"
             printf '%s  %s\n' "$hash" "$f"
         done
@@ -93,8 +111,8 @@ SUMS="$ROOT/dist/out/SHA256SUMS.txt"
 ) > "$SUMS"
 
 # Fail loudly rather than shipping an empty or short manifest.
-if [[ "$(grep -c . "$SUMS")" -ne 2 ]]; then
-    echo "ERROR: $SUMS does not contain exactly 2 entries:" >&2
+if [[ "$(grep -c . "$SUMS")" -ne "${#ASSETS[@]}" ]]; then
+    echo "ERROR: $SUMS does not contain exactly ${#ASSETS[@]} entries:" >&2
     cat "$SUMS" >&2
     exit 1
 fi
@@ -107,9 +125,12 @@ echo
 echo "    Test on a Windows host: double-click to install, then open"
 echo "    http://localhost:9099/  (from a phone: https://<PC's LAN IP>:9099/ and the PIN the install log ends with)."
 echo
-echo "    Publish ALL THREE assets - the update engines refuse a release"
-echo "    without SHA256SUMS.txt:"
+echo "    Publish EVERY asset - the update engines refuse a release without"
+echo "    SHA256SUMS.txt, and Linux hosts update from the linux binaries:"
 echo "      gh release create v$VERSION \\"
 echo "        \"$ROOT/dist/out/sysmon-agent.exe\" \\"
+for arch in "${LINUX_ARCHES[@]}"; do
+    echo "        \"$ROOT/dist/out/sysmon-agent-linux-$arch\" \\"
+done
 echo "        \"$OUT\" \\"
 echo "        \"$SUMS\""

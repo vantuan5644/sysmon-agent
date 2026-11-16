@@ -70,7 +70,25 @@ anyway**. On its last page, **Pair a device now** opens a window with a pairing 
 code: scan the code with your phone's camera and the dashboard opens with the PIN filled in.
 See [Pairing](#pairing).
 
-### Linux / build from source
+### Linux
+
+Each release carries static binaries for `amd64` and `arm64`, listed in its
+`SHA256SUMS.txt`:
+
+```bash
+arch=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+base=https://github.com/vantuan5644/sysmon-agent/releases/latest/download
+curl -fLO "$base/sysmon-agent-linux-$arch" -fLO "$base/SHA256SUMS.txt"
+sha256sum --ignore-missing -c SHA256SUMS.txt   # must print: sysmon-agent-linux-...: OK
+sudo install -m0755 "sysmon-agent-linux-$arch" /usr/local/bin/sysmon-agent
+sysmon-agent -settings ./settings.json         # serves on 0.0.0.0:9099
+sysmon-agent -pair -settings ./settings.json   # in a second terminal: a PIN and a QR code for one device
+```
+
+To run it at boot, open **Deploy as a service** further down. Later releases install with
+`sudo sysmon-agent -update` (see [Updating on Linux](#updating-on-linux)).
+
+### Build from source
 
 Needs **Go 1.22+** (only to build — a prebuilt binary has no Go requirement).
 
@@ -120,9 +138,9 @@ data and control route answers `401 {"error":"pairing_required"}`. This is the d
 
 1. **Get a PIN on the host.** It is 6 digits, valid for 10 minutes and for one device; five
    wrong tries close it.
-   - **Windows:** the setup wizard's last page offers **Pair a device now**. For another, open
-     **Start → Sysmon Agent → Pair a device**, or run `install-windows.ps1 -Action Pair` from
-     an elevated PowerShell.
+   - **Windows:** the setup wizard's last page offers **Pair a device now**. For another, type
+     `sysmon` (or `pair`, or `system monitor`) in Start and choose **Pair a device**, or run
+     `install-windows.ps1 -Action Pair` from an elevated PowerShell.
    - **Linux:** run `-pair` as the agent's own user, with the same `-settings` path it runs
      with:
      ```bash
@@ -220,7 +238,10 @@ carries no proxy header as local, so a proxy that adds none makes every client l
 An agent that updates itself, or is updated with `-Action Update`, keeps its old service
 command line. That line has no `-pairing` flag, so the new agent requires pairing, and every
 dashboard shows the PIN form until it is paired. On Linux, a new binary under an old unit
-file does the same. Get a PIN as above. Devices that used
+file does the same. From 0.2.6 the agent then shows a PIN on the host's own screen, once, on
+its first start with nothing paired: a message box on Windows, a desktop notification from a
+Linux user unit. A host with no screen logs the `-pair` command instead. Or get a PIN as
+above. Devices that used
 `http://HOST:9099/` are sent to `https://` and see the certificate warning once.
 
 ### Turning it off
@@ -383,7 +404,7 @@ SYSMON_BIND=127.0.0.1 SYSMON_PORT=9099 ./sysmon-agent
 | `/api/hosts/{id}/…` | `metrics`, `stream`, `status`, `quota`, `codex-usage` and `control`, forwarded to another agent |
 | `/api/settings` | GET or POST display settings (dim, screen shift, update check) |
 | `/api/control` | POST a host control: mic, camera, media, speaker, lock |
-| `/api/update` | POST to self-update (Windows service only) |
+| `/api/update` | POST to self-update (Windows service; Linux after `-update-setup`) |
 | `/api/pair/state` | whether this device is paired (open without pairing) |
 | `/api/pair` | POST a PIN and a device name to pair this device (HTTPS or this machine only) |
 | `/api/pair/devices` | GET the paired devices, or `DELETE /api/pair/devices/{id}` to remove one |
@@ -464,7 +485,24 @@ Both units bind `127.0.0.1` for Tailscale Serve or a reverse proxy. For a system
 /var/lib/sysmon-agent/settings.json`): a PIN written by root is unreadable to the agent.
 
 [`run-linux.sh`](run-linux.sh) rebuilds, reinstalls to `/usr/local/bin`, and restarts the
-right unit. Don't add `ProtectSystem`/`PrivateDevices`/`ProtectKernelModules` — they break
+right unit.
+
+<a id="updating-on-linux"></a>**Updating on Linux.** The agent runs unprivileged and its
+binary belongs to root, so root installs updates:
+
+```bash
+sudo sysmon-agent -update                          # now: the latest release, verified
+sudo sysmon-agent -update-setup -update-user USER  # once: the dashboard's Update button
+```
+
+`-update` downloads `sysmon-agent-linux-<arch>`, checks it against the release's
+`SHA256SUMS.txt` and against its own `-version`, stops the systemd units running
+`/usr/local/bin/sysmon-agent` (system and user units), swaps the binary, starts them again,
+and puts the old binary back if a unit does not stay up. `-update-setup` makes a request
+folder the agent's account (`USER`) can write and installs `sysmon-agent-update.path`, which
+runs `-update` as root when the dashboard asks. The request carries nothing the updater
+trusts: it fetches and verifies the release itself. Before setup the update banner shows the
+`sudo` command instead of a button. `-update-setup` prints how to undo it. Don't add `ProtectSystem`/`PrivateDevices`/`ProtectKernelModules` — they break
 the `/proc`, sysfs, hwmon, and RAPL reads.
 
 **CPU package power (recommended).** The kernel ships the RAPL `energy_uj` counter as
@@ -503,7 +541,7 @@ integration — the same binary is both console app and service). From an elevat
 .\install-windows.ps1 -Action Install
 .\install-windows.ps1 -Action Install -TempWarn 85   # AMD: Tctl idles hot, 70 C warns constantly
 .\install-windows.ps1 -Action Install -TailscaleServe  # also publish https://<machine>.<tailnet>.ts.net:9443
-.\install-windows.ps1 -Action Pair        # a new pairing PIN (also: Start, Sysmon Agent, Pair a device)
+.\install-windows.ps1 -Action Pair        # a new pairing PIN (also: Pair a device in Start)
 .\install-windows.ps1 -Action Install -Pairing off  # open to every device, as before pairing
 .\install-windows.ps1 -Action Install -LanSubnet 192.168.1.0/24  # LAN access on a Public network
 .\install-windows.ps1 -Action Status      # checks /readyz, reports settings, pairing, AI usage sources, Serve
@@ -547,10 +585,10 @@ production, or CPU power and board temps degrade.
 Coming from a release before pairing, see
 [Upgrading from a release before pairing](#upgrading-from-a-release-before-pairing).
 
-Self-update is confined to the **LocalSystem Windows service** — console runs and Linux
-hosts refuse it (HTTP 501) and should use the installer or the systemd/package path. Every
-release **must** publish `SHA256SUMS.txt`: it is what authenticates the download before a
-SYSTEM-privileged process executes it, and both engines refuse to update without it.
+Self-update from the dashboard works on the **LocalSystem Windows service** and on Linux
+after `-update-setup` (below). A console run refuses it (HTTP 501). Every release **must**
+publish `SHA256SUMS.txt`: it is what authenticates the download before a SYSTEM or root
+process executes it, and every engine refuses to update without it.
 
 **Turning the check off.** It is on by default. Toggle `update_check_enabled` via
 `POST /api/settings`, or hard-disable it host-side with `-no-update-check` /

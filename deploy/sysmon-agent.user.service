@@ -15,6 +15,10 @@
 #   systemctl --user enable --now sysmon-agent.service
 #   sudo loginctl enable-linger "$USER"   # also run at boot, before/without login
 #
+# Update: `sudo sysmon-agent -update` installs the latest verified release and
+# restarts this unit. `sudo sysmon-agent -update-setup -update-user "$USER"`
+# once lets the dashboard's Update button do it.
+#
 # Pair a device (pairing is on by default; see "Pairing" in README.md):
 #   sysmon-agent -pair -settings ~/.local/state/sysmon-agent/settings.json
 #

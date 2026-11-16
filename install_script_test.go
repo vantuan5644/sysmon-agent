@@ -268,7 +268,12 @@ func TestWindowsInstallerPairing(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, needle := range []string{
-		`Pair a device.lnk`,
+		// Start search matches words of the shortcut's name only.
+		`!define PAIR_LINK "Pair a device - Sysmon Agent (System Monitor).lnk"`,
+		`CreateShortCut "$SMPROGRAMS\${APPNAME}\${PAIR_LINK}"`,
+		// An upgrade from 0.2.5 or older drops the shortcut's old name.
+		`!define OLD_PAIR_LINK "Pair a device.lnk"`,
+		`Delete "$SMPROGRAMS\${APPNAME}\${OLD_PAIR_LINK}"`,
 		`-Action Pair -PauseAtEnd`,
 		// The PIN shows in a console after Finish, with its QR code, so the
 		// install itself opens no pairing window.

@@ -9,7 +9,8 @@
 ;   - asks how the GPU overheat guard should act (a page of its own), keeping
 ;     what an installed service runs with on an upgrade
 ;   - adds Start Menu / Desktop shortcuts to the dashboard, and a Start Menu
-;     "Pair a device" shortcut that prints a new pairing PIN
+;     "Pair a device" shortcut that prints a new pairing PIN, named so that a
+;     Start search for sysmon, system monitor or pair finds it
 ;   - offers "Pair a device now" on its last page: a console with a PIN and a
 ;     QR code that opens the dashboard with that PIN filled in
 ;   - registers a clean uninstaller (Add/Remove Programs)
@@ -40,6 +41,8 @@
 !define UNINSTKEY      "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME_SHORT}"
 !define SERVICE_URL    "http://localhost:9099/"
 !define SERVICE_NAME   "SysmonAgent"
+!define PAIR_LINK "Pair a device - Sysmon Agent (System Monitor).lnk"
+!define OLD_PAIR_LINK "Pair a device.lnk"
 
 Name "${APPNAME} ${VERSION}"
 OutFile "out\${APPNAME_SHORT}Agent-Setup-${VERSION}.exe"
@@ -93,7 +96,7 @@ Page custom GpuGuardPage GpuGuardPageLeave
 !insertmacro MUI_PAGE_INSTFILES
 ; The install itself opens no pairing window (-SkipPair): "Pair a device now"
 ; opens one in a console, with a QR code, after Finish.
-!define MUI_FINISHPAGE_TEXT "Sysmon Agent is installed.$\r$\n$\r$\nOther devices see this computer's data only once they are paired. Pair a device now opens a window with a PIN, and a QR code to scan with the device's camera.$\r$\n$\r$\nLater, open Start, Sysmon Agent, Pair a device, or choose Pair another device on a dashboard that is already paired."
+!define MUI_FINISHPAGE_TEXT "Sysmon Agent is installed.$\r$\n$\r$\nOther devices see this computer's data only once they are paired. Pair a device now opens a window with a PIN, and a QR code to scan with the device's camera.$\r$\n$\r$\nLater, type sysmon in Start and choose Pair a device, or choose Pair another device on a dashboard that is already paired."
 !define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_TEXT "Pair a device now"
 !define MUI_FINISHPAGE_RUN_FUNCTION PairDeviceNow
@@ -235,7 +238,11 @@ Section "Start Menu shortcut" SecStartMenu
   WriteINIStr "$SMPROGRAMS\${APPNAME}\${APPNAME} Dashboard.url" "InternetShortcut" "IconIndex" "0"
   ; Prints a new 10-minute pairing PIN. The script asks for elevation itself
   ; and waits for Enter, so the PIN stays on screen.
-  CreateShortCut "$SMPROGRAMS\${APPNAME}\Pair a device.lnk" "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-windows.ps1" -Action Pair -PauseAtEnd' "$INSTDIR\sysmon-agent.exe" 0
+  ; Start search matches the start of any word in a shortcut's name, and only
+  ; its name, so the words people search for are in it. 0.2.5 and older
+  ; called it plain "Pair a device".
+  Delete "$SMPROGRAMS\${APPNAME}\${OLD_PAIR_LINK}"
+  CreateShortCut "$SMPROGRAMS\${APPNAME}\${PAIR_LINK}" "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\install-windows.ps1" -Action Pair -PauseAtEnd' "$INSTDIR\sysmon-agent.exe" 0 SW_SHOWNORMAL "" "Show a PIN to pair a phone or another device with Sysmon Agent"
 SectionEnd
 
 Section "Desktop shortcut" SecDesktop
@@ -464,7 +471,8 @@ Section "Uninstall"
   RMDir "$INSTDIR"
 
   Delete "$SMPROGRAMS\${APPNAME}\${APPNAME} Dashboard.url"
-  Delete "$SMPROGRAMS\${APPNAME}\Pair a device.lnk"
+  Delete "$SMPROGRAMS\${APPNAME}\${PAIR_LINK}"
+  Delete "$SMPROGRAMS\${APPNAME}\${OLD_PAIR_LINK}"
   RMDir  "$SMPROGRAMS\${APPNAME}"
   Delete "$DESKTOP\${APPNAME} Dashboard.url"
 

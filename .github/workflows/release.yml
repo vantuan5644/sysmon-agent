@@ -2,13 +2,14 @@ name: release
 
 # Build and publish a release when a v* tag is pushed.
 #
-# The three assets are a contract, not a convention: the agent's in-dashboard
-# self-update (update.go) and `install-windows.ps1 -Action Update` both download
-# SHA256SUMS.txt and verify the binary against it before swapping it in. The
-# service runs as LocalSystem, so an unverified swap would be a SYSTEM-level RCE
-# vector — both engines refuse to proceed when that asset is missing. Publishing
-# by hand is how a release ends up missing one; this workflow makes all three
-# come from the same build.
+# The assets are a contract, not a convention: the agent's in-dashboard
+# self-update (update.go), `install-windows.ps1 -Action Update` and the Linux
+# root updater (`sudo sysmon-agent -update`) all download SHA256SUMS.txt and
+# verify the binary against it before swapping it in. They replace a binary run
+# by LocalSystem or root, so an unverified swap would be a privileged RCE
+# vector, and every engine refuses to proceed when that asset is missing. Linux
+# hosts look for sysmon-agent-linux-<arch>. Publishing by hand is how a release
+# ends up missing one; this workflow makes all of them come from the same build.
 #
 # Everything is produced by dist/build-installer.sh, the same script used for
 # manual builds, so CI and a local build cannot drift.
@@ -77,18 +78,20 @@ jobs:
       - name: Build exe + installer + checksums
         run: ./dist/build-installer.sh "${{ steps.version.outputs.version }}"
 
-      - name: Verify the checksum manifest covers both binaries
+      - name: Verify the checksum manifest covers every binary
         run: |
           set -euo pipefail
           cd dist/out
           version="${{ steps.version.outputs.version }}"
-          for asset in "sysmon-agent.exe" "SysmonAgent-Setup-$version.exe"; do
+          for asset in "sysmon-agent.exe" "SysmonAgent-Setup-$version.exe" sysmon-agent-linux-amd64 sysmon-agent-linux-arm64; do
             [ -f "$asset" ] || { echo "::error::missing build output $asset"; exit 1; }
             grep -qF "$asset" SHA256SUMS.txt || { echo "::error::SHA256SUMS.txt has no entry for $asset"; exit 1; }
           done
           # Re-verify rather than trust the generator: this is the exact check
           # both update engines perform against the published file.
           sha256sum -c SHA256SUMS.txt
+          # The updater runs the staged binary's -version before swapping it in.
+          [ "$(./sysmon-agent-linux-amd64 -version)" = "$version" ] || { echo "::error::sysmon-agent-linux-amd64 -version does not print $version"; exit 1; }
           echo "checksum manifest verified"
           cat SHA256SUMS.txt
 
@@ -98,6 +101,8 @@ jobs:
           name: sysmon-agent-${{ steps.version.outputs.version }}
           path: |
             dist/out/sysmon-agent.exe
+            dist/out/sysmon-agent-linux-amd64
+            dist/out/sysmon-agent-linux-arm64
             dist/out/SysmonAgent-Setup-${{ steps.version.outputs.version }}.exe
             dist/out/SHA256SUMS.txt
           if-no-files-found: error
@@ -115,5 +120,7 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
             "dist/out/sysmon-agent.exe" \
+            "dist/out/sysmon-agent-linux-amd64" \
+            "dist/out/sysmon-agent-linux-arm64" \
             "dist/out/SysmonAgent-Setup-$version.exe" \
             "dist/out/SHA256SUMS.txt"
