@@ -543,7 +543,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v177",
+    dashboard_build: "sysmon-static-v178",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -561,7 +561,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v177",
+    dashboard_build: "sysmon-static-v178",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -807,6 +807,9 @@ const context = {
     getItem: (key) => localStorageValues.get(key) ?? null,
     setItem: (key, value) => {
       localStorageValues.set(key, String(value));
+    },
+    removeItem: (key) => {
+      localStorageValues.delete(key);
     },
   },
   caches: {
@@ -1313,7 +1316,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v177, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v178, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1361,7 +1364,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v177; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v178; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1371,7 +1374,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v177",
+    dashboard_build: "sysmon-static-v178",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1381,7 +1384,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v177",
+    dashboard_build: "sysmon-static-v178",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1516,7 +1519,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v177", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v178", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -2053,6 +2056,122 @@ await flushMicrotasks();
 await flushMicrotasks();
 assert(document.getElementById("statusText").textContent === "Client check sent (web)", "status strip tap did not use accepted client-check display mode");
 runTimeouts();
+
+// --- Status-strip tap checks for updates -----------------------------------
+// On the agent that served the app, running a release, the tap also asks the
+// agent to check GitHub now (POST /api/update/check) and the strip says what
+// it found. A peer, a dev build and a view-only browser on the host are left
+// out, and an agent without the route is not asked again.
+const appState = (expression) => vm.runInContext(expression, context);
+let updateCheckPosts = [];
+let updateCheckAnswer = () => response({ asked: true, update: { available: false, latest_version: "v0.2.6" } });
+let tapStatus = { ...sampleStatus(), version: "v0.2.6", update_check_supported: true };
+context.fetch = async (path, options = {}) => {
+  if (path === "/api/metrics") {
+    metricsRequests += 1;
+    return response(sampleMetrics());
+  }
+  if (path === "/api/status") {
+    statusRequests += 1;
+    return response(tapStatus);
+  }
+  if (path === "/api/settings") {
+    return response(settings);
+  }
+  if (path === "/api/client-check" && options.method === "POST") {
+    clientCheckRequests += 1;
+    return response({ seen: true, display_mode: "standalone", standalone: true });
+  }
+  if (path === "/api/update/check") {
+    updateCheckPosts.push(options);
+    return updateCheckAnswer();
+  }
+  return response({ error: "not found" }, 404);
+};
+async function tapStrip() {
+  await document.getElementById("statusStrip").click();
+  for (let i = 0; i < 6; i += 1) {
+    await flushMicrotasks();
+  }
+}
+context.renderStatus(tapStatus);
+
+const pendingCheck = deferredResponse({ asked: true, update: { available: false, latest_version: "v0.2.6" } });
+updateCheckAnswer = () => pendingCheck.promise;
+const statusBeforeCheck = statusRequests;
+await document.getElementById("statusStrip").click();
+await flushMicrotasks();
+assert(updateCheckPosts.length === 1, "a release's status strip tap did not ask for an update check");
+assert(updateCheckPosts[0].method === "POST" && updateCheckPosts[0].body === "", "the update check was not an empty POST");
+assert(document.getElementById("statusText").textContent === "Checking for updates", `the tap said "${document.getElementById("statusText").textContent}" while checking for updates`);
+pendingCheck.resolve();
+for (let i = 0; i < 6; i += 1) {
+  await flushMicrotasks();
+}
+assert(document.getElementById("statusText").textContent === "Up to date (0.2.6)", `an up-to-date check said "${document.getElementById("statusText").textContent}"`);
+assert(statusRequests === statusBeforeCheck + 2, "the status was not fetched again after the check");
+runTimeouts();
+
+updateCheckPosts = [];
+updateCheckAnswer = () => response({ asked: true, update: { available: true, latest_version: "v0.2.7" } });
+tapStatus = { ...tapStatus, update: { available: true, latest_version: "v0.2.7", url: "https://example.com/v0.2.7" } };
+// This browser closed the 0.2.7 banner with its x earlier; a tap that finds
+// 0.2.7 offers it again.
+context.renderStatus(tapStatus);
+await document.getElementById("updateDismissBtn").click();
+await flushMicrotasks();
+assert(document.getElementById("updatePanel").hidden === true, "the x did not close the 0.2.7 banner");
+await tapStrip();
+assert(document.getElementById("statusText").textContent === "Update 0.2.7 available", `a check finding 0.2.7 said "${document.getElementById("statusText").textContent}"`);
+assert(localStorageValues.has("sysmon:update-dismissed-v0.2.7") === false, "a check finding 0.2.7 kept its dismissal");
+assert(document.getElementById("updatePanel").hidden === false, "the banner did not show the release the check found");
+assert(/v0\.2\.7 available - Update/.test(document.getElementById("updateText").textContent), "the banner did not name the release the check found");
+runTimeouts();
+tapStatus = { ...tapStatus, update: { available: false, latest_version: "v0.2.6" } };
+context.renderStatus(tapStatus);
+
+updateCheckAnswer = () => response({ asked: true, update: { available: false }, error: "dial tcp: no route to host" }, 502);
+await tapStrip();
+assert(document.getElementById("statusText").textContent === "Update check failed", "a failed check was not reported");
+runTimeouts();
+
+// The agent has the check turned off: the tap reads as before.
+updateCheckAnswer = () => response({ asked: false, update: { available: false }, error: "the update check is turned off" }, 409);
+await tapStrip();
+assert(document.getElementById("statusText").textContent === "Client check sent (app)", "a turned-off check replaced the client-check message");
+runTimeouts();
+
+// Not asked: a view-only browser on the host, a dev build, a peer in view.
+updateCheckPosts = [];
+updateCheckAnswer = () => response({ asked: true, update: { available: false, latest_version: "v0.2.6" } });
+appState("state.pairingViewOnly = true");
+await tapStrip();
+appState("state.pairingViewOnly = false");
+assert(updateCheckPosts.length === 0, "a view-only browser asked for an update check");
+runTimeouts();
+tapStatus = { ...tapStatus, version: "dev" };
+context.renderStatus(tapStatus);
+await tapStrip();
+assert(updateCheckPosts.length === 0, "a dev build asked for an update check");
+runTimeouts();
+tapStatus = { ...tapStatus, version: "v0.2.6" };
+context.renderStatus(tapStatus);
+appState("state.hostID = 'peer-1'");
+assert(context.canCheckForUpdates() === false, "a peer in view would be asked for an update check");
+appState("state.hostID = ''");
+assert(context.canCheckForUpdates() === true, "the agent's own release would not be asked for an update check");
+
+// An agent without the route (an older one behind this cached shell) answers
+// 405 once and is not asked again.
+updateCheckAnswer = () => response({ error: "method not allowed" }, 405);
+await tapStrip();
+assert(updateCheckPosts.length === 1, "the tap did not try the update check");
+assert(document.getElementById("statusText").textContent === "Client check sent (app)", "an agent without the route changed the tap's message");
+runTimeouts();
+await tapStrip();
+assert(updateCheckPosts.length === 1, "an agent without the route was asked again");
+runTimeouts();
+context.renderStatus(sampleStatus());
 
 context.fetch = async (path, options = {}) => {
   if (path === "/api/metrics") {
@@ -3121,7 +3240,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v177" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v178" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],

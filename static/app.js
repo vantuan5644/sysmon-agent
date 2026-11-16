@@ -95,6 +95,10 @@ const state = {
   // device's clock.
   updateLastApplyAt: "",
   updateApplyBaseline: "",
+  // updateCheckUnsupported latches once the agent answers the status-strip
+  // tap's POST /api/update/check with 404 or 405: an older agent behind a
+  // newer cached shell has no such route.
+  updateCheckUnsupported: false,
   autoShellRefreshAttempted: false,
   // agentVersion is the running binary's version tag from /api/status, and
   // agentChannel is "release" for a real vX.Y.Z tag or "dev" for an untagged
@@ -166,7 +170,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v177";
+const dashboardBuild = "sysmon-static-v178";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -931,15 +935,116 @@ async function refreshNow() {
     await refreshStaticAssets();
     return;
   }
-  showTransientStatus("Refreshing");
+  const generation = state.hostGeneration;
+  const updateCheck = canCheckForUpdates() ? checkForUpdates() : null;
+  showTransientStatus(updateCheck ? "Checking for updates" : "Refreshing");
   const clientCheck = sendClientCheck({ interaction: "status_strip_tap" });
   fetchStatus();
   const metrics = fetchMetrics();
-  Promise.allSettled([clientCheck, metrics]).then(([clientCheckResult]) => {
+  if (updateCheck) {
+    // The metrics landing put the connection state back on the strip; while
+    // GitHub is still being asked, say so again.
+    let checked = false;
+    updateCheck.finally(() => {
+      checked = true;
+    });
+    metrics.finally(() => {
+      if (!checked && isCurrentHost(generation)) {
+        showTransientStatus("Checking for updates");
+      }
+    });
+  }
+  Promise.allSettled([clientCheck, metrics, updateCheck]).then(([clientCheckResult, , updateResult]) => {
+    const update = updateResult.status === "fulfilled" ? updateResult.value : null;
+    if (update && isCurrentHost(generation)) {
+      if (!update.failed) {
+        // Asking is the opposite of the banner's ×: a release this browser
+        // closed the banner for is offered again when a tap finds it.
+        undismissUpdate(update.update);
+        // The status poll that went out with the tap may have been answered
+        // before the check; this one paints the banner from its result.
+        fetchStatus();
+      }
+      showTransientStatus(updateCheckMessage(update));
+      return;
+    }
     if (clientCheckResult.status === "fulfilled" && clientCheckResult.value) {
       showTransientStatus(`Client check sent (${acceptedClientCheckModeLabel(clientCheckResult.value)})`);
     }
   });
+}
+
+// updateCheckTimeoutMS covers the agent's answer to POST /api/update/check:
+// its own 15 s budget for GitHub, plus up to as long again when a check it
+// was already making has to finish first.
+const updateCheckTimeoutMS = 40 * 1000;
+
+// canCheckForUpdates says whether a status-strip tap also asks this agent to
+// check for a newer release now. Only on the agent that served the app (a
+// peer checks its own), only for a release build (a dev build has nothing to
+// compare with), and only for a device that may write: a view-only browser on
+// the host would be refused, and a refresh tap must not open the PIN form.
+function canCheckForUpdates() {
+  return (
+    !state.hostID &&
+    !state.pairingViewOnly &&
+    state.agentChannel === "release" &&
+    !state.updateApplying &&
+    !state.updateCheckUnsupported
+  );
+}
+
+// checkForUpdates posts the tap's update check. It resolves to null when there
+// is nothing to say (the agent has the check turned off, or is too old to
+// have the route), else to { update, asked } or { failed, error }.
+async function checkForUpdates() {
+  try {
+    const response = await fetchWithTimeout(
+      "/api/update/check",
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "" },
+      updateCheckTimeoutMS,
+    );
+    if (response.status === 404 || response.status === 405) {
+      state.updateCheckUnsupported = true;
+      return null;
+    }
+    const answer = await response.json().catch(() => ({}));
+    if (response.status === 409) {
+      return null;
+    }
+    if (!response.ok) {
+      return { failed: true, error: String(answer?.error || `HTTP ${response.status}`) };
+    }
+    return { update: answer?.update || {}, asked: answer?.asked === true };
+  } catch (error) {
+    return { failed: true, error: error?.message || "request failed" };
+  }
+}
+
+// undismissUpdate forgets this browser's dismissal of the release an update
+// check found available, so the banner the × closed shows again.
+function undismissUpdate(update) {
+  const latest = String(update?.latest_version || "").trim();
+  if (update?.available !== true || latest === "") {
+    return;
+  }
+  try {
+    window.localStorage?.removeItem(updateDismissedKeyPrefix + latest);
+  } catch {
+  }
+}
+
+// updateCheckMessage is what the status strip says after the tap's check.
+function updateCheckMessage(result) {
+  if (result.failed) {
+    return "Update check failed";
+  }
+  const latest = String(result.update?.latest_version || "").trim();
+  if (result.update?.available === true && latest !== "") {
+    return `Update ${latest.replace(/^v/, "")} available`;
+  }
+  const running = String(state.agentVersion || "").replace(/^v/, "");
+  return running ? `Up to date (${running})` : "Up to date";
 }
 
 // checkDashboardLiveness is the periodic health tick: repair a dead stream
@@ -2202,7 +2307,9 @@ function showUpdateError(decision, status) {
 
 // dismissUpdate records a per-version dismissal in localStorage so the banner
 // does not nag every load. A newer release ships under a new tag, which changes
-// the dismissal key, so the banner re-appears for that release once.
+// the dismissal key, so the banner re-appears for that release once, and a
+// status-strip tap that finds a dismissed release clears its dismissal
+// (undismissUpdate), so closing the banner never hides an update for good.
 function dismissUpdate() {
   // An explicit dismissal always wins, including out of the "Updating..."
   // state. Without this, renderUpdatePanel's applying branch re-shows the box

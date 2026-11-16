@@ -54,6 +54,13 @@ const updateDownloadTimeout = 2 * time.Minute
 // spawn syscall can sit before the agent returns 202.
 const updateApplySpawnTimeout = 10 * time.Second
 
+// updateCheckRequestGap is the least time between two GitHub asks made for a
+// dashboard (POST /api/update/check, the status-strip tap). The tap also
+// refreshes the metrics, so people make it often; within the gap the last
+// answer is served again. The background check counts as an ask, so a tap
+// right after it is answered from its result.
+const updateCheckRequestGap = time.Minute
+
 // updateAssetName is the standalone Windows binary published on each
 // release. We swap the binary directly (no installer re-run) so this is the
 // file the agent downloads and the file the SHA-256 sum is looked up for.
@@ -172,6 +179,17 @@ type UpdateChecker struct {
 	// answered without a restart (nothing newer, a refused release).
 	applying    bool
 	requestedAt time.Time
+	// askedAt and askErr describe the last time GitHub was asked, by the
+	// background check or a dashboard, and how it went. A failed ask keeps
+	// the cached status, so askErr is what says the cache is not fresh.
+	askedAt time.Time
+	askErr  error
+
+	// checkMu lets one check ask GitHub at a time. A dashboard check that
+	// arrives during another check waits for it, then answers from its
+	// result rather than asking again.
+	checkMu sync.Mutex
+	clock   func() time.Time
 
 	stop    chan struct{}
 	stopped chan struct{}
@@ -227,6 +245,7 @@ func newUpdateChecker(opts UpdateCheckerOptions) *UpdateChecker {
 		mode:         updatePlatformMode,
 		request:      requestRootUpdate,
 		lastResult:   lastUpdaterResult,
+		clock:        time.Now,
 		// Bind the resolved client into the default implementations so an
 		// injected HTTPClient (tests, or a future proxy-aware transport) is
 		// actually used rather than silently ignored.
@@ -363,14 +382,70 @@ func (c *UpdateChecker) settleRequestLocked(now time.Time) {
 	}
 }
 
-// CheckNow forces a single check on-demand and returns the fresh status. Used
-// by the apply path (re-verify right before downloading) and could back a
-// future "check now" dashboard affordance. It does not require the background
-// loop to be running.
+// CheckNow asks GitHub once, whenever it was last asked, and returns the
+// answer. It does not need the background loop to be running. A failed ask
+// leaves the cached status as it was.
 func (c *UpdateChecker) CheckNow(ctx context.Context) (UpdateStatus, error) {
+	c.checkMu.Lock()
+	defer c.checkMu.Unlock()
+	return c.checkLocked(ctx)
+}
+
+// CheckOnRequest is the dashboard's check (POST /api/update/check). It asks
+// GitHub unless it was asked within updateCheckRequestGap or an update is
+// being installed, and reports whether it asked. Either way the status is the
+// one /api/status now serves. A failed ask returns its error with the cached
+// status, and so does a request inside the gap after one, since that cache is
+// what the failure left. It refuses with errUpdateDisabled when the check is
+// off and errUpdateUnsupported on a dev build, which has no release to
+// compare with; neither makes a call.
+func (c *UpdateChecker) CheckOnRequest(ctx context.Context) (UpdateStatus, bool, error) {
+	if !c.Enabled() {
+		return c.Status(), false, errUpdateDisabled
+	}
+	if !c.versionKnown() {
+		return c.Status(), false, errUpdateUnsupported
+	}
+	c.checkMu.Lock()
+	defer c.checkMu.Unlock()
+	c.mu.RLock()
+	recent := !c.askedAt.IsZero() && c.clock().Sub(c.askedAt) < updateCheckRequestGap
+	lastErr := c.askErr
+	busy := c.applying
+	c.mu.RUnlock()
+	if busy {
+		return c.Status(), false, nil
+	}
+	if recent {
+		return c.Status(), false, lastErr
+	}
+	if _, err := c.checkLocked(ctx); err != nil {
+		return c.Status(), true, err
+	}
+	return c.Status(), true, nil
+}
+
+// checkLocked runs one check with checkMu held, records the ask and caches a
+// good answer. While an update is being installed the answer is cached as
+// not available, so the banner does not offer the release being installed;
+// settleRequestLocked offers it again if that install fails.
+func (c *UpdateChecker) checkLocked(ctx context.Context) (UpdateStatus, error) {
+	asked := c.Enabled() && c.versionKnown()
 	status, err := c.checkOnce(ctx)
-	c.cacheStatus(status)
-	return status, err
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if asked {
+		c.askedAt = c.clock()
+		c.askErr = err
+	}
+	if err != nil {
+		return status, err
+	}
+	if c.applying {
+		status.Available = false
+	}
+	c.cached = status
+	return status, nil
 }
 
 func (c *UpdateChecker) loop() {
@@ -394,12 +469,9 @@ func (c *UpdateChecker) loop() {
 }
 
 func (c *UpdateChecker) checkAndCache(ctx context.Context) {
-	status, err := c.checkOnce(ctx)
-	if err != nil {
+	if _, err := c.CheckNow(ctx); err != nil {
 		c.logf("update check failed: %v", err)
-		return
 	}
-	c.cacheStatus(status)
 }
 
 func (c *UpdateChecker) cacheStatus(status UpdateStatus) {

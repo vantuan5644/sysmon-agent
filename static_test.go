@@ -133,7 +133,7 @@ func TestServiceWorkerCachingPolicy(t *testing.T) {
 	}
 	sw := string(data)
 	for _, needle := range []string{
-		`const STATIC_CACHE = "sysmon-static-v177"`,
+		`const STATIC_CACHE = "sysmon-static-v178"`,
 		`const STATIC_ASSET_SET = new Set(STATIC_ASSETS);`,
 		`self.skipWaiting()`,
 		`self.clients.claim()`,
@@ -415,7 +415,7 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 	for _, needle := range []string{
 		`const metricsTimeoutMS = 4500;`,
 		`const auxiliaryTimeoutMS = 5000;`,
-		`const dashboardBuild = "sysmon-static-v177";`,
+		`const dashboardBuild = "sysmon-static-v178";`,
 		`const clientCheckIntervalMS = 30000;`,
 		`const clientCheckStaleAfterMS = clientCheckIntervalMS * 3;`,
 		`const clientCheckDebounceMS = 500;`,
@@ -460,8 +460,10 @@ func TestDashboardStatusAndSettingsUseTimeouts(t *testing.T) {
 		`return document.visibilityState === "visible";`,
 		`function refreshNow() {`,
 		`const clientCheck = sendClientCheck({ interaction: "status_strip_tap" });`,
-		`showTransientStatus("Refreshing");`,
-		`Promise.allSettled([clientCheck, metrics]).then(([clientCheckResult]) => {`,
+		`showTransientStatus(updateCheck ? "Checking for updates" : "Refreshing");`,
+		`Promise.allSettled([clientCheck, metrics, updateCheck]).then(([clientCheckResult, , updateResult]) => {`,
+		`"/api/update/check",`,
+		`updateCheckTimeoutMS,`,
 		`clientCheckResult.value`,
 		`function sendClientCheck(options = {}) {`,
 		`clientCheckPayload(options)`,

@@ -324,17 +324,9 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 	// missing-asset failure; 500 if the helper could not start or the root
 	// updater did not take the request.
 	mux.HandleFunc("POST /api/update", func(w http.ResponseWriter, r *http.Request) {
-		if !sameOriginBrowserRequest(r) {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "self-update requires same-origin browser requests"})
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
-		defer r.Body.Close()
 		// Empty body is the only accepted request; reject any JSON to keep the
 		// trust surface minimal (no caller-supplied data drives the swap).
-		buffer := make([]byte, 1)
-		if n, _ := r.Body.Read(buffer); n > 0 {
-			writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "request body must be empty"})
+		if !emptySameOriginPost(w, r, "self-update") {
 			return
 		}
 
@@ -367,9 +359,78 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 			writeJSON(w, http.StatusInternalServerError, decision)
 		}
 	})
+	// POST /api/update/check is the status-strip tap: ask GitHub for the
+	// latest release now instead of at the next daily check. It shares the
+	// guards of /api/update (same origin, empty body, a paired device when
+	// pairing is required) and is left out of the peer relay, since each agent
+	// checks its own release. GitHub is asked at most once a minute
+	// (updateCheckRequestGap); a tap inside that is answered from the last
+	// ask, with asked false. 200 with the update status /api/status now
+	// serves; 409 when the check is off or this is a dev build, neither of
+	// which asks anything; 502 when GitHub could not be asked, with the
+	// status it left.
+	mux.HandleFunc("POST /api/update/check", func(w http.ResponseWriter, r *http.Request) {
+		if !emptySameOriginPost(w, r, "the update check") {
+			return
+		}
+		checker := state.UpdateChecker()
+		if checker == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "update checker is not available"})
+			return
+		}
+		// A check already asking GitHub can hold this one for its own
+		// updateRequestTimeout before this one gets the answer.
+		ctx, cancel := context.WithTimeout(r.Context(), 2*updateRequestTimeout+5*time.Second)
+		defer cancel()
+		status, asked, err := checker.CheckOnRequest(ctx)
+		status.LastApply = lastUpdaterResult()
+		answer := UpdateCheckAnswer{Asked: asked, Update: status}
+		switch {
+		case err == nil:
+			writeJSON(w, http.StatusOK, answer)
+		case errors.Is(err, errUpdateDisabled):
+			answer.Error = "the update check is turned off"
+			writeJSON(w, http.StatusConflict, answer)
+		case errors.Is(err, errUpdateUnsupported):
+			answer.Error = "a development build has no release to compare with"
+			writeJSON(w, http.StatusConflict, answer)
+		default:
+			answer.Error = err.Error()
+			writeJSON(w, http.StatusBadGateway, answer)
+		}
+	})
 	registerPairingRoutes(mux, state)
 	mux.Handle("GET /", staticAssetHandler(staticSub))
 	return securityHeaders(requirePairing(state, mux)), nil
+}
+
+// UpdateCheckAnswer is the body of POST /api/update/check. Update has the
+// shape of /api/status's update field, so the dashboard reads both the same
+// way.
+type UpdateCheckAnswer struct {
+	// Asked is true when this request asked GitHub, false when it was
+	// answered from a check made less than updateCheckRequestGap ago.
+	Asked  bool         `json:"asked"`
+	Update UpdateStatus `json:"update"`
+	Error  string       `json:"error,omitempty"`
+}
+
+// emptySameOriginPost applies the guards the update routes share: a
+// same-origin request whose body is empty, so nothing a caller sends steers
+// what the agent does. It writes the refusal and returns false when one
+// fails.
+func emptySameOriginPost(w http.ResponseWriter, r *http.Request, what string) bool {
+	if !sameOriginBrowserRequest(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": what + " requires same-origin browser requests"})
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	buffer := make([]byte, 1)
+	if n, _ := r.Body.Read(buffer); n > 0 {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "request body must be empty"})
+		return false
+	}
+	return true
 }
 
 func withPeerRegistry(state *RuntimeState, handle func(*peerRegistry, http.ResponseWriter, *http.Request)) http.HandlerFunc {

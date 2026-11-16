@@ -84,7 +84,7 @@ func checkPairing(handler http.Handler, store *pairingStore) (http.Handler, stri
 			return nil, "", fmt.Errorf("pairing: unpaired GET %s returned %d, want 401", path, rec.Code)
 		}
 	}
-	for path, body := range map[string]string{"/api/control": `{"action":"lock_screen"}`, "/api/settings": `{"dim":true}`, "/api/update": " "} {
+	for path, body := range map[string]string{"/api/control": `{"action":"lock_screen"}`, "/api/settings": `{"dim":true}`, "/api/update": " ", "/api/update/check": " "} {
 		if rec := serveSelfCheckRequest(handler, http.MethodPost, path, body); rec.Code != http.StatusUnauthorized {
 			return nil, "", fmt.Errorf("pairing: unpaired POST %s returned %d, want 401", path, rec.Code)
 		}
@@ -758,7 +758,7 @@ func checkClientCheck(handler http.Handler) error {
 		return fmt.Errorf("GET /api/client-checks was not empty before dashboard POST")
 	}
 
-	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v177","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
+	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v178","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
 	if post.Code != http.StatusOK {
 		return fmt.Errorf("POST /api/client-check returned %d: %s", post.Code, strings.TrimSpace(post.Body.String()))
 	}
