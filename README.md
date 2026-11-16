@@ -405,6 +405,7 @@ SYSMON_BIND=127.0.0.1 SYSMON_PORT=9099 ./sysmon-agent
 | `/api/settings` | GET or POST display settings (dim, screen shift, update check) |
 | `/api/control` | POST a host control: mic, camera, media, speaker, lock |
 | `/api/update` | POST to self-update (Windows service; Linux after `-update-setup`) |
+| `/api/update/check` | POST to check for a newer release now, as a status-strip tap does (GitHub is asked at most once a minute) |
 | `/api/pair/state` | whether this device is paired (open without pairing) |
 | `/api/pair` | POST a PIN and a device name to pair this device (HTTPS or this machine only) |
 | `/api/pair/devices` | GET the paired devices, or `DELETE /api/pair/devices/{id}` to remove one |
@@ -565,7 +566,9 @@ production, or CPU power and board temps degrade.
 **Updating.** Three paths, in order of convenience:
 
 1. **In-dashboard.** The agent checks for a newer release once at startup and every 24 h,
-   and the dashboard shows a `vX.Y.Z available - Update` banner. One tap downloads the new
+   and again when you tap the status strip (at most one GitHub call a minute; the strip
+   says `Up to date` or `Update X.Y.Z available`), and the dashboard shows a
+   `vX.Y.Z available - Update` banner. One tap downloads the new
    binary, **SHA-256 verifies it against the release's `SHA256SUMS.txt`**, then hands it to
    a detached helper that stops the service, swaps the binary, restarts, polls `/readyz`,
    and **rolls back to the previous binary if the new one fails readiness**. The dashboard
