@@ -118,6 +118,7 @@ func TestPairingRefusesUnpairedNetworkClients(t *testing.T) {
 		"/api/control":      `{"action":"lock_screen"}`,
 		"/api/settings":     `{"dim":true}`,
 		"/api/update":       "",
+		"/api/update/check": "",
 		"/api/client-check": `{}`,
 		"/api/pair/window":  "",
 		"/api/pair/logout":  "",

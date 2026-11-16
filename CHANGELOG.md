@@ -4,6 +4,25 @@ Versions are plain numbers. What each one changes is written here, not in its na
 The full notes of a published release are on its
 [GitHub release page](https://github.com/vantuan5644/sysmon-agent/releases).
 
+## 0.2.7 (2026-11-16)
+
+Checking for an update no longer waits a day. Dashboard build v177 to v178.
+
+### New
+
+- **Tapping the status strip checks for an update.** The tap that refreshes the
+  dashboard now also asks the agent to look for a newer release right away, on the
+  agent that served the dashboard, running a release, from a paired device (or any
+  device when pairing is off). The strip says `Checking for updates`, then
+  `Up to date (0.2.7)`, `Update 0.2.8 available` (with the banner) or
+  `Update check failed`. The agent asks GitHub at most once a minute and answers a tap
+  inside that minute with the last result, its own daily check included. Nothing
+  changes where the update check is turned off, on a development build, or while
+  another host is in view. The route is `POST /api/update/check`.
+- **Closing the update banner no longer hides that release for good.** Its × used to
+  hide a version in that browser until a newer one came out, with no way back. A tap
+  that finds the release now shows its banner again.
+
 ## 0.2.6 (2026-11-16)
 
 Updates on Linux, and three fixes to how older installs update. Dashboard build v176 to
