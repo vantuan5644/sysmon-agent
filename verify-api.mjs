@@ -19,7 +19,7 @@ const timeoutMS = 5000;
 // `sysmon-agent -pair-token <name>`, is sent as a bearer token when set.
 const pairingToken = String(process.env.SYSMON_TOKEN || "").trim();
 const authHeaders = pairingToken ? { Authorization: `Bearer ${pairingToken}` } : {};
-const dashboardBuild = "sysmon-static-v176";
+const dashboardBuild = "sysmon-static-v177";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,
@@ -353,6 +353,12 @@ function validateStatus(status, expectedSettings = {}) {
   assertNonEmptyString(status.version, "status.version");
   validateUpdateBlock(status.update);
   assert(typeof status.update_check_supported === "boolean", "status.update_check_supported must be boolean");
+  // The command to run on the host, given only where the dashboard cannot
+  // update it (Linux before -update-setup).
+  if (status.update_command !== undefined) {
+    assertNonEmptyString(status.update_command, "status.update_command");
+    assert(!status.update_check_supported, "status.update_command is only for a host without dashboard updates");
+  }
   validateClientCheck(status.client_check);
   validateClientCheck(status.device_client_check);
 }
@@ -365,6 +371,15 @@ function validateUpdateBlock(update) {
   }
   if (update.checked_at !== undefined && update.checked_at !== null) {
     assertTimestamp(update.checked_at, "status.update.checked_at", { allowStale: true });
+  }
+  // The Linux root updater's last result.
+  if (update.last_apply !== undefined) {
+    assertObject(update.last_apply, "status.update.last_apply");
+    assert(typeof update.last_apply.ok === "boolean", "status.update.last_apply.ok must be boolean");
+    assertTimestamp(update.last_apply.finished_at, "status.update.last_apply.finished_at", { allowStale: true });
+    if (!update.last_apply.ok) {
+      assertNonEmptyString(update.last_apply.error, "status.update.last_apply.error");
+    }
   }
 }
 

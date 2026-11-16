@@ -11,7 +11,8 @@ import (
 // The binary swap + rollback contract, shared by the two independent
 // implementations of it:
 //
-//   - this file, used by the agent's detached --apply-update helper, and
+//   - this file, used by the agent's detached --apply-update helper on
+//     Windows and by the root updater (sysmon-agent -update) on Linux, and
 //   - install-windows.ps1's Invoke-VerifiedSwap.
 //
 // They cannot literally share code (the PowerShell engine must work without the
@@ -51,6 +52,10 @@ type updateSwapOps struct {
 	// violation every time. The Windows implementation falls back to scheduling
 	// the delete for the next reboot. Optional; nil means plain os.Remove.
 	RemoveBackup func(path string) error
+	// BackupSuffix names the rollback copy (<exe><suffix>). Optional; empty
+	// means updateBackupSuffix. Linux uses ".old", since its binary has no
+	// .exe to keep.
+	BackupSuffix string
 }
 
 // updateBackupSuffix is the suffix on the rollback copy of the live exe. The
@@ -70,7 +75,11 @@ func applyVerifiedSwap(svcName, current, verified, readyURL string, readyTimeout
 	if ops.StopAndWait == nil || ops.Start == nil || ops.WaitReady == nil {
 		return errors.New("update swap: incomplete service ops")
 	}
-	backup := current + updateBackupSuffix
+	suffix := ops.BackupSuffix
+	if suffix == "" {
+		suffix = updateBackupSuffix
+	}
+	backup := current + suffix
 
 	if err := ops.StopAndWait(svcName); err != nil {
 		return fmt.Errorf("stop service: %w", err)

@@ -44,6 +44,9 @@ func main() {
 	controlEmit := flag.String("control-emit", "", "internal: emit one host input (media_play_pause|lock_screen) in the current session, then exit")
 	applyUpdate := flag.String("apply-update", "", "internal: detached helper that swaps in a verified update binary, then restarts the service (Windows-only)")
 	noUpdateCheck := flag.Bool("no-update-check", false, "disable the periodic update check and the in-dashboard self-update")
+	rootUpdate := flag.Bool("update", false, "Linux, as root: install the latest release over this binary when it is newer (verified against SHA256SUMS.txt), restart the services running it, and exit")
+	updateSetup := flag.Bool("update-setup", false, "Linux, as root: let the dashboard's Update button install releases here, by installing the root updater units, and exit")
+	updateUser := flag.String("update-user", "", "with -update-setup: the account the agent runs as (default: the account running this binary's services)")
 	// Claude quota page. The config dir defaults to $CLAUDE_CONFIG_DIR then
 	// $HOME/.claude; a path that does not exist turns the feature (and the
 	// dashboard page) off. Note the LocalSystem trap: the Windows service's
@@ -125,6 +128,23 @@ func main() {
 			log.Fatalf("apply-update %q: %v", *applyUpdate, err)
 		}
 		log.Printf("apply-update %q ok", *applyUpdate)
+		return
+	}
+
+	// -update and -update-setup are the Linux root updater (update_linux.go,
+	// update_updater.go). Like -apply-update they exit before any server setup.
+	if *rootUpdate {
+		if err := runRootUpdateCommand(os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "sysmon-agent -update: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *updateSetup {
+		if err := runUpdaterSetup(*updateUser, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "sysmon-agent -update-setup: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -283,7 +303,22 @@ func main() {
 	if store := state.Pairing(); store != nil {
 		stopPairing := store.Start(log.Printf)
 		defer stopPairing()
+		// Required only by default: show a PIN on this host's screen once, so an
+		// agent upgraded from a release older than pairing, or installed without
+		// saying, can be paired at all (pairing_host_pin.go).
+		exe, _ := os.Executable()
+		go maybeShowHostPIN(hostPINInput{
+			Store:       store,
+			Dir:         pairingDirFor(*settingsPath),
+			FromDefault: pairingRequiredByDefault(),
+			Command:     hostPairCommand(exe, *settingsPath),
+			Display:     newHostPINDisplay(),
+			Logf:        log.Printf,
+		})
 	}
+	// After the dashboard's Update button swapped the binary, Windows'
+	// Installed apps would still show the version the installer wrote.
+	syncInstalledVersionRecord(log.Printf)
 
 	// Wired after -self-check returns, so the self-check can never reach the
 	// tailnet: discovery is demand-driven, but this makes it structural.

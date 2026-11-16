@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -581,7 +582,7 @@ func TestClientCheckHandlerRecordsDashboardVisit(t *testing.T) {
 	}
 
 	post := httptest.NewRecorder()
-	postReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v176","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
+	postReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v177","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
 	postReq.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
 	postReq.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile Safari")
 	handler.ServeHTTP(post, postReq)
@@ -686,7 +687,7 @@ func TestStatusKeepsDeviceClientCheckAfterHistoryRotates(t *testing.T) {
 	}
 
 	device := httptest.NewRecorder()
-	deviceReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v176","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
+	deviceReq := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/client-check", strings.NewReader(`{"dashboard_build":"sysmon-static-v177","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`))
 	deviceReq.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
 	deviceReq.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile Safari")
 	handler.ServeHTTP(device, deviceReq)
@@ -1649,12 +1650,17 @@ func TestUpdateHandlerRejectsRequestBody(t *testing.T) {
 }
 
 func TestUpdateHandlerGatesOnSelfUpdateSupported(t *testing.T) {
-	// On non-Windows / console (the test host), self-update is not supported,
-	// so the handler returns 501 with a clear message rather than touching the
-	// network. On the Windows service CI host this same test would need a
-	// different assertion; for now we just document the gate behavior.
+	// A host with no way to update from the dashboard answers 501 with this
+	// OS's reason (install-windows.ps1 on Windows, the -update command on
+	// Linux) and never touches the network.
 	state := NewMemoryRuntimeState()
-	state.SetUpdateChecker(newUpdateChecker(UpdateCheckerOptions{CurrentVersion: "v1.0.0", Enabled: true}))
+	checker := newUpdateChecker(UpdateCheckerOptions{CurrentVersion: "v1.0.0", Enabled: true})
+	checker.mode = func() string { return updateModeNone }
+	checker.fetchRelease = func(context.Context, string) (ReleaseInfo, error) {
+		t.Error("an unsupported host asked GitHub")
+		return ReleaseInfo{}, errors.New("unexpected")
+	}
+	state.SetUpdateChecker(checker)
 	handler, err := newHTTPHandlerWithController(fakeCollector{}, testStaticFS(), state, &fakeController{})
 	if err != nil {
 		t.Fatal(err)
@@ -1664,14 +1670,43 @@ func TestUpdateHandlerGatesOnSelfUpdateSupported(t *testing.T) {
 	req.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	if selfUpdateSupported() {
-		t.Skip("self-update is supported on this host; the 501 assertion only holds for console / non-Windows")
-	}
 	if rec.Code != http.StatusNotImplemented {
 		t.Fatalf("status = %d, want %d (self-update unsupported on this host)", rec.Code, http.StatusNotImplemented)
 	}
-	if !strings.Contains(rec.Body.String(), "install-windows.ps1") {
-		t.Fatalf("body = %q, want install-windows.ps1 hint", rec.Body.String())
+	var decision UpdateDecision
+	if err := json.Unmarshal(rec.Body.Bytes(), &decision); err != nil || decision.Error != updateUnsupportedReason() {
+		t.Fatalf("body = %q, want this OS's reason %q", rec.Body.String(), updateUnsupportedReason())
+	}
+}
+
+func TestUpdateHandlerAsksTheLinuxRootUpdater(t *testing.T) {
+	state := NewMemoryRuntimeState()
+	checker := newUpdateChecker(UpdateCheckerOptions{CurrentVersion: "v1.0.0", Enabled: true})
+	checker.mode = func() string { return updateModeUpdater }
+	checker.lastResult = func() *updaterResult { return nil }
+	asked := ""
+	checker.request = func(_ context.Context, tag string) error { asked = tag; return nil }
+	checker.fetchRelease = func(context.Context, string) (ReleaseInfo, error) {
+		return ReleaseInfo{Tag: "v1.1.0", Assets: map[string]string{
+			linuxUpdateAssetName(runtime.GOARCH): "https://example.com/linux",
+			updateChecksumAssetName:              "https://example.com/sums",
+		}}, nil
+	}
+	state.SetUpdateChecker(checker)
+	handler, err := newHTTPHandlerWithController(fakeCollector{}, testStaticFS(), state, &fakeController{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://sysmon.tailnet.example:9443/api/update", strings.NewReader(""))
+	req.Header.Set("Origin", "https://sysmon.tailnet.example:9443")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted || asked != "v1.1.0" {
+		t.Fatalf("status = %d, asked %q; want 202 and a request for v1.1.0 (%s)", rec.Code, asked, rec.Body.String())
+	}
+	var decision UpdateDecision
+	if err := json.Unmarshal(rec.Body.Bytes(), &decision); err != nil || decision.Stage != "requested" {
+		t.Fatalf("body = %q, want stage requested", rec.Body.String())
 	}
 }
 

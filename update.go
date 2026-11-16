@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,10 +54,37 @@ const updateDownloadTimeout = 2 * time.Minute
 // spawn syscall can sit before the agent returns 202.
 const updateApplySpawnTimeout = 10 * time.Second
 
-// updateAssetName is the standalone binary asset name published on each
+// updateAssetName is the standalone Windows binary published on each
 // release. We swap the binary directly (no installer re-run) so this is the
 // file the agent downloads and the file the SHA-256 sum is looked up for.
+// Linux binaries are published beside it, one per architecture; see
+// linuxUpdateAssetName.
 const updateAssetName = "sysmon-agent.exe"
+
+// linuxUpdateAssetName is the release asset holding the Linux binary for
+// goarch: sysmon-agent-linux-amd64 or sysmon-agent-linux-arm64. A plain
+// binary, not an archive, so SHA256SUMS.txt covers exactly the bytes that are
+// installed.
+func linuxUpdateAssetName(goarch string) string {
+	return "sysmon-agent-linux-" + goarch
+}
+
+// How a host installs an update from the dashboard. The mode decides what
+// ApplyNow does after it has found a newer release.
+const (
+	// updateModeNone: the dashboard cannot install it here. /api/status says
+	// what to run instead (update_command) when there is a command to run.
+	updateModeNone = ""
+	// updateModeHelper: the Windows service downloads and verifies the binary
+	// itself and hands it to the detached --apply-update helper.
+	updateModeHelper = "helper"
+	// updateModeUpdater: a Linux agent, which runs unprivileged and cannot
+	// replace its own root-owned binary, asks the root updater service
+	// (sysmon-agent -update, started by sysmon-agent-update.path) to do it.
+	// The agent passes no file and no data the updater trusts: the updater
+	// fetches and verifies the release by itself.
+	updateModeUpdater = "updater"
+)
 
 // updateChecksumAssetName is the release artifact that authenticates the
 // download. It is produced by the release flow (sha256sum over the binary and
@@ -82,6 +110,10 @@ type UpdateStatus struct {
 	URL           string     `json:"url,omitempty"`
 	PublishedAt   *time.Time `json:"published_at,omitempty"`
 	CheckedAt     *time.Time `json:"checked_at,omitempty"`
+	// LastApply is the Linux root updater's last result (result.json beside
+	// its request folder), so a dashboard waiting on a tapped update can show
+	// why it rolled back instead of waiting out its timer. Absent elsewhere.
+	LastApply *updaterResult `json:"last_apply,omitempty"`
 }
 
 // UpdateDecision is the synchronous result of `UpdateChecker.ApplyNow` and the
@@ -118,6 +150,13 @@ type UpdateChecker struct {
 	logf          func(format string, args ...any)
 	fetchRelease  func(ctx context.Context, repo string) (ReleaseInfo, error)
 	downloadAsset func(ctx context.Context, url string) ([]byte, error)
+	// mode reports how this host installs an update (updateMode*), and
+	// request asks the Linux root updater for one. Both are fields so tests
+	// can drive each mode on any OS.
+	mode    func() string
+	request func(ctx context.Context, tag string) error
+	// lastResult reads the root updater's last result (nil when none).
+	lastResult func() *updaterResult
 
 	mu     sync.RWMutex
 	cached UpdateStatus
@@ -127,7 +166,12 @@ type UpdateChecker struct {
 	// loser's os.Remove(backup) deletes the winner's rollback copy. It is set
 	// for the rest of the process lifetime once a helper is spawned: the agent
 	// is about to be stopped by that helper, so there is no "done" to reset on.
-	applying bool
+	// A request to the Linux root updater is different, since the updater
+	// restarts the agent only when it installs something: requestedAt marks
+	// it, and settleRequestLocked releases the slot once the updater has
+	// answered without a restart (nothing newer, a refused release).
+	applying    bool
+	requestedAt time.Time
 
 	stop    chan struct{}
 	stopped chan struct{}
@@ -180,6 +224,9 @@ func newUpdateChecker(opts UpdateCheckerOptions) *UpdateChecker {
 		httpClient:   opts.HTTPClient,
 		apply:        defaultUpdateApplier{},
 		logf:         opts.Logf,
+		mode:         updatePlatformMode,
+		request:      requestRootUpdate,
+		lastResult:   lastUpdaterResult,
 		// Bind the resolved client into the default implementations so an
 		// injected HTTPClient (tests, or a future proxy-aware transport) is
 		// actually used rather than silently ignored.
@@ -194,10 +241,12 @@ func newUpdateChecker(opts UpdateCheckerOptions) *UpdateChecker {
 
 // Start launches the background check loop. It is safe to call when disabled:
 // the loop parks without making any network calls so the agent never phones
-// home for a host that has opted out. Start is idempotent.
+// home for a host that has opted out. A build without a version (a plain
+// `go build`, "dev") starts no loop either: no release can be compared with
+// it, so a check would only ever report "no update". Start is idempotent.
 func (c *UpdateChecker) Start() {
 	c.mu.Lock()
-	if c.started || !c.enabled {
+	if c.started || !c.enabled || !c.versionKnown() {
 		c.mu.Unlock()
 		return
 	}
@@ -226,6 +275,20 @@ func (c *UpdateChecker) Stop() {
 	<-stopped
 }
 
+// versionKnown reports whether the running build has a version a release can
+// be compared with.
+func (c *UpdateChecker) versionKnown() bool {
+	return c.current != "" && c.current != "dev"
+}
+
+// ApplyMode reports how this host installs an update (updateMode*).
+func (c *UpdateChecker) ApplyMode() string {
+	if c.mode == nil {
+		return updateModeNone
+	}
+	return c.mode()
+}
+
 // Enabled reports whether the checker is permitted to make outbound calls.
 // /api/status surfaces this so the dashboard can explain "no checks are being
 // made" rather than showing an empty update block.
@@ -251,6 +314,7 @@ func (c *UpdateChecker) SetEnabled(enabled bool) {
 func (c *UpdateChecker) beginApply() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.settleRequestLocked(time.Now())
 	if c.applying {
 		return false
 	}
@@ -269,9 +333,34 @@ func (c *UpdateChecker) endApply() {
 
 // Status returns the cached update state for /api/status.
 func (c *UpdateChecker) Status() UpdateStatus {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.settleRequestLocked(time.Now())
 	return c.cached
+}
+
+// settleRequestLocked releases the apply slot held for a root-updater request
+// once the updater has written a result newer than the request, or when it
+// has not within its own time limit. Unless the update went through, the
+// banner offers it again, so a refused or failed update can be retried
+// without waiting a day for the next check.
+func (c *UpdateChecker) settleRequestLocked(now time.Time) {
+	if !c.applying || c.requestedAt.IsZero() {
+		return
+	}
+	var result *updaterResult
+	if c.lastResult != nil {
+		result = c.lastResult()
+	}
+	answered := result != nil && !result.FinishedAt.Before(c.requestedAt)
+	if !answered && now.Sub(c.requestedAt) < linuxUpdaterTimeout+time.Minute {
+		return
+	}
+	c.applying = false
+	c.requestedAt = time.Time{}
+	if (!answered || !result.OK) && isVersionNewer(c.cached.LatestVersion, c.current) {
+		c.cached.Available = true
+	}
 }
 
 // CheckNow forces a single check on-demand and returns the fresh status. Used
@@ -320,7 +409,7 @@ func (c *UpdateChecker) cacheStatus(status UpdateStatus) {
 }
 
 func (c *UpdateChecker) checkOnce(ctx context.Context) (UpdateStatus, error) {
-	if !c.Enabled() {
+	if !c.Enabled() || !c.versionKnown() {
 		return UpdateStatus{Available: false, CheckedAt: timeNowUTCPtr()}, nil
 	}
 	release, err := c.fetchRelease(ctx, c.repo)
@@ -355,11 +444,12 @@ func (c *UpdateChecker) ApplyNow(ctx context.Context) (UpdateDecision, error) {
 	if !c.Enabled() {
 		return UpdateDecision{Error: "update check is disabled"}, errUpdateDisabled
 	}
-	if c.current == "" || c.current == "dev" {
+	if !c.versionKnown() {
 		return UpdateDecision{Error: "current agent version is unknown; cannot self-update a dev build"}, errUpdateUnsupported
 	}
-	if !selfUpdateSupported() {
-		return UpdateDecision{Error: "self-update is supported only for the Windows service; use install-windows.ps1 -Action Update on this host"}, errUpdateUnsupported
+	mode := c.ApplyMode()
+	if mode != updateModeHelper && mode != updateModeUpdater {
+		return UpdateDecision{Error: updateUnsupportedReason()}, errUpdateUnsupported
 	}
 	// Single-flight: two concurrent applies would download twice and spawn two
 	// detached helpers that race the same swap, with the second clobbering the
@@ -385,13 +475,44 @@ func (c *UpdateChecker) ApplyNow(ctx context.Context) (UpdateDecision, error) {
 			Error:          fmt.Sprintf("latest release %s is not newer than current %s", release.Tag, c.current),
 		}, errUpdateNotNewer
 	}
-	assetURL, ok := release.Assets[updateAssetName]
+	assetName := updateAssetName
+	if mode == updateModeUpdater {
+		assetName = linuxUpdateAssetName(runtime.GOARCH)
+	}
+	assetURL, ok := release.Assets[assetName]
 	if !ok || assetURL == "" {
-		return UpdateDecision{LatestVersion: release.Tag, Error: "release is missing the " + updateAssetName + " asset"}, errUpdateMissingAsset
+		return UpdateDecision{LatestVersion: release.Tag, Error: "release is missing the " + assetName + " asset"}, errUpdateMissingAsset
 	}
 	checksumURL, ok := release.Assets[updateChecksumAssetName]
 	if !ok || checksumURL == "" {
 		return UpdateDecision{LatestVersion: release.Tag, Error: "release is missing the " + updateChecksumAssetName + " asset"}, errUpdateMissingAsset
+	}
+
+	if mode == updateModeUpdater {
+		// The root updater downloads and verifies the release itself; the
+		// assets were looked up here only so a release it could not install
+		// is refused now, with its reason, rather than after a wait.
+		asked := time.Now()
+		if err := c.request(ctx, release.Tag); err != nil {
+			return UpdateDecision{LatestVersion: release.Tag, CurrentVersion: c.current, Error: err.Error()}, errUpdateSpawn
+		}
+		applied = true
+		c.mu.Lock()
+		c.requestedAt = asked
+		c.mu.Unlock()
+		c.cacheStatus(UpdateStatus{
+			Available:     false,
+			LatestVersion: release.Tag,
+			URL:           release.URL,
+			CheckedAt:     timeNowUTCPtr(),
+		})
+		return UpdateDecision{
+			Accepted:       true,
+			CurrentVersion: c.current,
+			LatestVersion:  release.Tag,
+			Stage:          "requested",
+			Helper:         linuxUpdaterUnit,
+		}, nil
 	}
 
 	downloadCtx, cancel := context.WithTimeout(ctx, updateDownloadTimeout)
@@ -404,7 +525,7 @@ func (c *UpdateChecker) ApplyNow(ctx context.Context) (UpdateDecision, error) {
 	if err != nil {
 		return UpdateDecision{LatestVersion: release.Tag, Error: "download checksums: " + err.Error()}, errUpdateNetwork
 	}
-	expected, err := parseChecksumForAsset(checksums, updateAssetName)
+	expected, err := parseChecksumForAsset(checksums, assetName)
 	if err != nil {
 		return UpdateDecision{LatestVersion: release.Tag, Error: "parse checksum: " + err.Error()}, errUpdateChecksum
 	}
@@ -661,13 +782,13 @@ func timeNowUTCPtr() *time.Time {
 	return &now
 }
 
-// selfUpdateSupported reports whether the in-dashboard self-update is allowed
-// on this host. It is confined to the Windows service: console runs and any
-// non-Windows host return false (and /api/update reports 501) so the highest-
-// risk surface (a SYSTEM-level binary swap) is only reachable from the vetted
-// deployment shape.
+// selfUpdateSupported reports whether the dashboard's Update button can
+// install an update on this host: the Windows service (the binary swap is
+// only reachable from that vetted shape, never a console run), or a Linux
+// host with the root updater set up (sysmon-agent -update-setup). Anywhere
+// else /api/update reports 501 and /api/status names the command to run.
 func selfUpdateSupported() bool {
-	return updatePlatformSelfUpdateSupported()
+	return updatePlatformMode() != updateModeNone
 }
 
 // updateApplier is the platform-injected helper-spawn interface. The Windows

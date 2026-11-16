@@ -9,6 +9,8 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -312,7 +314,8 @@ func TestUpdateCheckerStartStop(t *testing.T) {
 func TestUpdateCheckerApplyNowVerifiesChecksumAndSpawnsHelper(t *testing.T) {
 	// Build a deterministic "release" where the binary hashes to the sum we
 	// publish. The download func hands back canned bytes; the applier is a
-	// recorder so we can assert it was handed the verified path.
+	// recorder so we can assert it was handed the verified path. The mode is
+	// injected, so the Windows-service path runs on every OS.
 	binary := []byte("this is the new binary")
 	sum := sha256.Sum256(binary)
 	sumHex := hex.EncodeToString(sum[:])
@@ -324,6 +327,7 @@ func TestUpdateCheckerApplyNowVerifiesChecksumAndSpawnsHelper(t *testing.T) {
 		CurrentVersion: "v1.0.0",
 		Enabled:        true,
 	})
+	checker.mode = func() string { return updateModeHelper }
 	checker.fetchRelease = func(ctx context.Context, repo string) (ReleaseInfo, error) {
 		return ReleaseInfo{
 			Tag: "v1.1.0",
@@ -345,34 +349,23 @@ func TestUpdateCheckerApplyNowVerifiesChecksumAndSpawnsHelper(t *testing.T) {
 	}
 	checker.apply = stubApplier{record: &mu, applied: &applied}
 
-	// Stage the binary to a path adjacent to the agent; in the test sandbox
-	// os.Executable() works, but staging may fail if the test temp dir isn't
-	// writable relative to the executable. The helper records the staged path
-	// that ApplyNow produced.
 	decision, err := checker.ApplyNow(context.Background())
 	if err != nil {
-		// selfUpdateSupported gates the spawn; on non-Windows the spawn would
-		// normally be gated earlier. But here we injected `apply`, so ApplyNow
-		// still reaches the spawn step. The spawn step does NOT re-check
-		// selfUpdateSupported because ApplyNow already did. But on Linux,
-		// ApplyNow returns errUpdateUnsupported before reaching the asset
-		// download. To exercise this end-to-end on any platform, bypass the
-		// platform gate via a Windows-tagged helper when present; otherwise
-		// accept the unsupported outcome as the test's assertion.
-		if !errors.Is(err, errUpdateUnsupported) {
-			t.Fatalf("ApplyNow: %v", err)
-		}
-		t.Skipf("self-update is gated on the Windows service; ApplyNow returned the expected %v", err)
+		t.Fatalf("ApplyNow: %v (%+v)", err, decision)
 	}
-	if !decision.Accepted {
-		t.Fatalf("decision not accepted: %+v", decision)
+	t.Cleanup(func() { _ = os.Remove(decision.VerifiedTo) })
+	if !decision.Accepted || decision.Stage != "applied" {
+		t.Fatalf("decision = %+v, want accepted and applied", decision)
 	}
 	if applied == "" {
 		t.Fatalf("applier was not called with a verified path")
 	}
-	// Verify the staged file matches the published binary.
 	if applied != decision.VerifiedTo {
 		t.Errorf("applier path = %q, decision.VerifiedTo = %q", applied, decision.VerifiedTo)
+	}
+	staged, err := os.ReadFile(decision.VerifiedTo)
+	if err != nil || string(staged) != string(binary) {
+		t.Errorf("staged file = %q, %v; want the verified binary", staged, err)
 	}
 }
 
@@ -382,6 +375,7 @@ func TestUpdateCheckerApplyNowRejectsBadChecksum(t *testing.T) {
 		CurrentVersion: "v1.0.0",
 		Enabled:        true,
 	})
+	checker.mode = func() string { return updateModeHelper }
 	checker.fetchRelease = func(ctx context.Context, repo string) (ReleaseInfo, error) {
 		return ReleaseInfo{
 			Tag: "v1.1.0",
@@ -405,44 +399,39 @@ func TestUpdateCheckerApplyNowRejectsBadChecksum(t *testing.T) {
 	checker.apply = stubApplier{applied: new(string), called: &called}
 
 	_, err := checker.ApplyNow(context.Background())
-	if err == nil {
-		t.Skipf("self-update is gated on the Windows service; ApplyNow returned nil on a non-Windows host")
+	if !errors.Is(err, errUpdateChecksum) {
+		t.Errorf("ApplyNow bad checksum err = %v, want errUpdateChecksum", err)
 	}
-	if !errors.Is(err, errUpdateUnsupported) {
-		// We expect either errUpdateUnsupported (non-Windows gate) or
-		// errUpdateChecksum (verification failure on Windows). The latter is
-		// the actual assertion; the former is an environment skip.
-		if !errors.Is(err, errUpdateChecksum) {
-			t.Errorf("ApplyNow bad checksum err = %v, want errUpdateChecksum", err)
-		}
-		if called != 0 {
-			t.Errorf("applier was called %d times despite checksum mismatch", called)
-		}
+	if called != 0 {
+		t.Errorf("applier was called %d times despite checksum mismatch", called)
 	}
 }
 
 func TestUpdateCheckerApplyNowRequiresNewerVersion(t *testing.T) {
-	checker := newUpdateChecker(UpdateCheckerOptions{
-		CurrentVersion: "v2.0.0",
-		Enabled:        true,
-	})
-	checker.fetchRelease = func(ctx context.Context, repo string) (ReleaseInfo, error) {
-		return ReleaseInfo{
-			Tag: "v1.0.0", // older
-			Assets: map[string]string{
-				"sysmon-agent.exe": "https://example.com/sysmon-agent.exe",
-				"SHA256SUMS.txt":   "https://example.com/SHA256SUMS.txt",
-			},
-		}, nil
-	}
-	_, err := checker.ApplyNow(context.Background())
-	if err == nil {
-		t.Skipf("self-update is gated on the Windows service; ApplyNow returned nil on a non-Windows host")
-	}
-	// On non-Windows, the unsupported gate wins first. On Windows, we'd see
-	// errUpdateNotNewer. Assert the latter only on Windows.
-	if !errors.Is(err, errUpdateUnsupported) && !errors.Is(err, errUpdateNotNewer) {
-		t.Errorf("ApplyNow older release err = %v, want errUpdateNotNewer or errUpdateUnsupported", err)
+	for _, mode := range []string{updateModeHelper, updateModeUpdater} {
+		checker := newUpdateChecker(UpdateCheckerOptions{
+			CurrentVersion: "v2.0.0",
+			Enabled:        true,
+		})
+		checker.mode = func() string { return mode }
+		requested := 0
+		checker.request = func(context.Context, string) error { requested++; return nil }
+		checker.fetchRelease = func(ctx context.Context, repo string) (ReleaseInfo, error) {
+			return ReleaseInfo{
+				Tag: "v1.0.0", // older
+				Assets: map[string]string{
+					"sysmon-agent.exe":                   "https://example.com/sysmon-agent.exe",
+					linuxUpdateAssetName(runtime.GOARCH): "https://example.com/linux",
+					"SHA256SUMS.txt":                     "https://example.com/SHA256SUMS.txt",
+				},
+			}, nil
+		}
+		if _, err := checker.ApplyNow(context.Background()); !errors.Is(err, errUpdateNotNewer) {
+			t.Errorf("%s: ApplyNow older release err = %v, want errUpdateNotNewer", mode, err)
+		}
+		if requested != 0 {
+			t.Errorf("%s: the root updater was asked for an older release", mode)
+		}
 	}
 }
 

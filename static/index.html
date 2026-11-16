@@ -73,7 +73,10 @@
     </header>
 
     <section id="updatePanel" class="panel update-panel" role="status" aria-live="polite" hidden>
-      <span id="updateText" class="update-text">--</span>
+      <span class="update-body">
+        <span id="updateText" class="update-text">--</span>
+        <code id="updateCommand" class="update-command" hidden></code>
+      </span>
       <span class="update-actions">
         <button id="updateApplyBtn" class="update-btn" type="button">Update</button>
         <button id="updateDismissBtn" class="update-dismiss" type="button" aria-label="Dismiss update notice">×</button>
@@ -365,7 +368,8 @@
       <p id="pairWaiting" class="pair-help" aria-live="polite">--</p>
       <p id="pairHowTitle" class="pair-help">To get a PIN:</p>
       <ul id="pairHow" class="pair-help pair-how">
-        <li>On Windows, open Start, Sysmon Agent, Pair a device.</li>
+        <li>When the agent starts with pairing on and nothing paired yet, it shows a PIN on the host's own screen for 10 minutes.</li>
+        <li>On Windows, type <code>sysmon</code> in Start and choose Pair a device.</li>
         <li>On Linux, run <code>sysmon-agent -pair</code> as the agent's user.</li>
         <li>On a dashboard already paired, choose Pair another device at the bottom of its second page.</li>
       </ul>

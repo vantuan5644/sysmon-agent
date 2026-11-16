@@ -311,14 +311,18 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 	})
 	// POST /api/update triggers an in-dashboard self-update. Same-origin gated
 	// and body-capped like the other POST routes. The synchronous half runs in
-	// the request: re-check the channel, download the binary + checksum,
-	// SHA-256 verify against the release-published sum, then spawn the detached
-	// apply-update helper (see update.go). The helper swaps the binary and
-	// restarts the service; the dashboard reloads via the existing
-	// dashboard-build staleness path once the new binary is up. Returns 202 on
-	// success; 501 if the host is not the Windows service (console / Linux);
-	// 409 if the check is disabled or the channel is offline; 502 on network /
-	// checksum failure.
+	// the request: re-check the channel, then on the Windows service download
+	// the binary + checksum, SHA-256 verify it against the release-published
+	// sum and spawn the detached apply-update helper; on Linux, ask the root
+	// updater, which fetches and verifies the release itself (see update.go,
+	// update_updater.go). Either one swaps the binary and restarts the agent;
+	// the dashboard reloads via the existing dashboard-build staleness path once
+	// the new binary is up. Returns 202 on success; 501 where this host has no
+	// way to update from the dashboard (a console run, Linux before
+	// -update-setup, other OSes); 409 if the check is disabled, an update is
+	// already under way or nothing is newer; 502 on network / checksum /
+	// missing-asset failure; 500 if the helper could not start or the root
+	// updater did not take the request.
 	mux.HandleFunc("POST /api/update", func(w http.ResponseWriter, r *http.Request) {
 		if !sameOriginBrowserRequest(r) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "self-update requires same-origin browser requests"})
