@@ -8,7 +8,7 @@ import (
 
 var agentStartedAt = time.Now().UTC()
 
-const dashboardBuild = "sysmon-static-v176"
+const dashboardBuild = "sysmon-static-v177"
 
 type AgentStatus struct {
 	Status            string              `json:"status"`
@@ -33,11 +33,15 @@ type AgentStatus struct {
 	// update banner. Available=false covers all "no update" states: the check
 	// has not run yet, the channel is offline, or the host is on the latest.
 	Update UpdateStatus `json:"update"`
-	// UpdateCheckSupported reports whether the in-dashboard self-update flow is
-	// available on this host. It is false outside the Windows service (Linux,
-	// console runs) so the dashboard can hide the self-update affordance and
-	// direct the user to the installer / package manager path.
+	// UpdateCheckSupported reports whether the dashboard's Update button can
+	// install an update on this host: the Windows service, or a Linux host
+	// whose root updater is set up (`sysmon-agent -update-setup`). Console
+	// runs and other hosts report false, and the dashboard hides the button.
 	UpdateCheckSupported bool `json:"update_check_supported"`
+	// UpdateCommand is what to run on the host instead, when the button is
+	// unavailable and there is one command that does the update (Linux:
+	// `sudo /usr/local/bin/sysmon-agent -update`). Empty otherwise.
+	UpdateCommand string `json:"update_command,omitempty"`
 	// Hostname and InstanceID identify this agent to a peer building its host
 	// picker: the first is its display fallback, the second tells one agent
 	// reached under two addresses (or a host list naming the asking agent
@@ -69,6 +73,12 @@ func newAgentStatus(state *RuntimeState, controls []ControlCapability, now time.
 	if checker != nil {
 		status = checker.Status()
 	}
+	status.LastApply = lastUpdaterResult()
+	supported := selfUpdateSupported()
+	command := ""
+	if !supported && version != "" && version != "dev" {
+		command = updateCommandHint()
+	}
 	return AgentStatus{
 		Status:               "ok",
 		DashboardBuild:       dashboardBuild,
@@ -85,7 +95,8 @@ func newAgentStatus(state *RuntimeState, controls []ControlCapability, now time.
 		DeviceClientCheck:    state.GetDeviceClientCheck(),
 		Version:              version,
 		Update:               status,
-		UpdateCheckSupported: selfUpdateSupported(),
+		UpdateCheckSupported: supported,
+		UpdateCommand:        command,
 		Hostname:             hostname,
 		InstanceID:           agentInstanceID,
 	}

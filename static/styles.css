@@ -1788,12 +1788,34 @@ body.host-remote .host-controls {
   background: #1a1010;
 }
 
-.update-text {
+.update-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   flex: 1 1 auto;
   min-width: 0;
+}
+
+.update-text {
   color: #cdd9e5;
   overflow-wrap: anywhere;
   line-height: 1.25;
+}
+
+/* The command to run on the host when the dashboard has no Update button there
+   (Linux before `sysmon-agent -update-setup`). A tap selects all of it, ready
+   to copy. */
+.update-command {
+  display: block;
+  color: var(--text);
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+  -webkit-user-select: all;
+  user-select: all;
+}
+
+.update-command[hidden] {
+  display: none;
 }
 
 .update-panel.update-error .update-text {

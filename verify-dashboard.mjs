@@ -543,7 +543,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v176",
+    dashboard_build: "sysmon-static-v177",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -561,7 +561,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v176",
+    dashboard_build: "sysmon-static-v177",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1277,6 +1277,30 @@ context.renderStatus({ ...releaseApplying, version: "v0.9.9", update: { availabl
 assert(document.getElementById("updatePanel").hidden === true, "a landed update (new version) did not leave the applying state");
 assert(document.getElementById("updateApplyBtn").disabled === false, "apply button stayed disabled after the update landed");
 
+// The Linux root updater reports each run in update.last_apply. A run that
+// finished after the tap belongs to it: a failure ends the wait at once with
+// the updater's reason, instead of after the watchdog. An earlier run's result
+// must not.
+const linuxApplying = {
+  ...releaseApplying,
+  update: { available: true, latest_version: "v0.9.9", last_apply: { ok: true, message: "an earlier run", finished_at: "2026-11-16T01:00:00Z" } },
+};
+context.renderStatus(linuxApplying);
+context.beginUpdateApplying();
+context.renderUpdatePanel(linuxApplying);
+assert(document.getElementById("updatePanel").classList.contains("update-applying") === true, "an earlier updater result ended a new wait");
+context.renderStatus({
+  ...linuxApplying,
+  update: {
+    available: true,
+    latest_version: "v0.9.9",
+    last_apply: { ok: false, error: "checksum mismatch for sysmon-agent-linux-amd64", finished_at: "2026-11-16T02:00:00Z" },
+  },
+});
+assert(document.getElementById("updatePanel").classList.contains("update-error") === true, "a failed root update did not end the wait with an error");
+assert(/checksum mismatch/.test(document.getElementById("updateText").textContent), "the root updater's reason was not shown");
+assert(document.getElementById("updateApplyBtn").disabled === false, "the apply button stayed disabled after the updater failed");
+
 context.renderStatus(sampleStatus());
 assert(document.getElementById("agentVersion").hidden === true, "returning to a versionless status left the build badge visible");
 assert(document.getElementById("buildToken").hidden === false, "a versionless status hid the dashboard build it does report");
@@ -1289,7 +1313,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v176, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v177, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1337,7 +1361,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v176; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v177; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1347,7 +1371,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v176",
+    dashboard_build: "sysmon-static-v177",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1357,7 +1381,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v176",
+    dashboard_build: "sysmon-static-v177",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1492,7 +1516,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v176", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v177", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -2698,6 +2722,19 @@ assert(/v0\.3\.0 available - Update/.test(document.getElementById("updateText").
 // Unsupported host (Linux/console): banner stays hidden even if available.
 context.renderStatus({ ...sampleStatus(), update: { available: true, latest_version: "v0.3.0", url: "https://example.com/v0.3.0" }, update_check_supported: false });
 assert(document.getElementById("updatePanel").hidden === true, "update panel visible on an unsupported host");
+// A Linux host before -update-setup: no button, the command to run instead.
+const updateCommandText = "sudo /usr/local/bin/sysmon-agent -update";
+context.renderStatus({
+  ...sampleStatus(),
+  update: { available: true, latest_version: "v0.3.0", url: "https://example.com/v0.3.0" },
+  update_check_supported: false,
+  update_command: updateCommandText,
+});
+assert(document.getElementById("updatePanel").hidden === false, "a host with an update command hid the banner");
+assert(document.getElementById("updateApplyBtn").hidden === true, "the Update button showed where the dashboard cannot update");
+assert(document.getElementById("updateCommand").hidden === false, "the command to run on the host was hidden");
+assert(document.getElementById("updateCommand").textContent === updateCommandText, "the banner showed a different command");
+assert(/run on the host/.test(document.getElementById("updateText").textContent), "the banner did not say where to run the command");
 // Click Update: dashboard POSTs /api/update, flips into the applying state on
 // 202, and shows the "will reload automatically" message. Test the non-202 path
 // first because the applying state is sticky after a 202 (the banner waits for
@@ -2713,6 +2750,8 @@ context.fetch = async (path, options = {}) => {
   return updateFetch(path, options);
 };
 context.renderStatus({ ...sampleStatus(), update: { available: true, latest_version: "v0.3.0", url: "https://example.com/v0.3.0" }, update_check_supported: true });
+assert(document.getElementById("updateApplyBtn").hidden === false, "the Update button stayed hidden after the host could update again");
+assert(document.getElementById("updateCommand").hidden === true, "the host command stayed up beside the Update button");
 await document.getElementById("updateApplyBtn").click();
 await flushMicrotasks();
 assert(updatePosted && updatePosted.method === "POST", "Update click did not POST /api/update");
@@ -3082,7 +3121,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v176" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v177" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],
@@ -3572,7 +3611,7 @@ async function submitPIN(run, pin) {
 }
 
 for (const [userAgent, how] of [
-  ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36", "open Start, Sysmon Agent, Pair a device"],
+  ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36", "type sysmon in Start and choose Pair a device"],
   ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36", "run sysmon-agent -pair as the agent's user"],
 ]) {
   // A browser on the host itself (localhost) gets the dashboard without a

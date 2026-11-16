@@ -88,6 +88,13 @@ const state = {
   // not fired yet. updateWatchdogTimer is the always-armed escape hatch.
   updateApplyingFromVersion: "",
   updateWatchdogTimer: null,
+  // updateLastApplyAt is the finish time of the Linux root updater's last run
+  // (update.last_apply) as last seen, and updateApplyBaseline its value when
+  // Update was tapped. A different finish time while applying is this
+  // update's own result. Host times compared as strings, never with this
+  // device's clock.
+  updateLastApplyAt: "",
+  updateApplyBaseline: "",
   autoShellRefreshAttempted: false,
   // agentVersion is the running binary's version tag from /api/status, and
   // agentChannel is "release" for a real vX.Y.Z tag or "dev" for an untagged
@@ -159,7 +166,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v176";
+const dashboardBuild = "sysmon-static-v177";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -1957,10 +1964,10 @@ function isDevBuild() {
 
 // renderUpdatePanel surfaces a non-intrusive banner when /api/status reports an
 // update available. The banner says "vX.Y.Z available - Update" and is dismissed
-// per-version (remembered in localStorage so it does not nag every load). When
-// self-update is unsupported on the host (Linux / console run) the banner stays
-// hidden even if an update is available; a one-line status-strip note could be
-// added later if we want to direct users to the installer path.
+// per-version (remembered in localStorage so it does not nag every load). Where
+// the dashboard cannot install it (Linux before `sysmon-agent -update-setup`)
+// the banner shows the agent's update_command instead of the button; with no
+// command either (a console run) it stays hidden.
 function renderUpdatePanel(status) {
   const panel = $("updatePanel");
   if (!panel) {
@@ -1984,6 +1991,24 @@ function renderUpdatePanel(status) {
   panel.classList.remove("update-applying", "update-error");
   const text = $("updateText");
   const applyBtn = $("updateApplyBtn");
+  const commandEl = $("updateCommand");
+  if (commandEl) commandEl.hidden = true;
+  if (applyBtn) applyBtn.hidden = false;
+  const lastApply = update.last_apply && typeof update.last_apply === "object" ? update.last_apply : null;
+  const lastApplyAt = String(lastApply?.finished_at || "");
+
+  // The Linux root updater records each run. A run that finished after the tap
+  // is this update's: a failure is shown now rather than after the watchdog,
+  // and a run that installed nothing (no newer release by then) ends the wait.
+  if (state.updateApplying && lastApplyAt !== "" && lastApplyAt !== state.updateApplyBaseline) {
+    const failed = lastApply.ok !== true;
+    endUpdateApplying();
+    state.updateLastApplyAt = lastApplyAt;
+    if (failed) {
+      showUpdateError({ error: lastApply.error || "the updater failed" }, 0);
+      return;
+    }
+  }
 
   // The agent reporting a version other than the one we started from means the
   // swap landed. Leave the applying state on that signal rather than waiting
@@ -2008,17 +2033,28 @@ function renderUpdatePanel(status) {
     return;
   }
 
+  state.updateLastApplyAt = lastApplyAt;
   const supported = status?.update_check_supported === true;
+  const command = String(status?.update_command || "").trim();
   const dismissed = latest !== "" && readStoredBoolean(updateDismissedKeyPrefix + latest);
-  if (!available || !supported || dismissed) {
+  if (!available || (!supported && command === "") || dismissed) {
     panel.hidden = true;
     if (applyBtn) applyBtn.disabled = false;
     return;
   }
 
   panel.hidden = false;
-  text.textContent = `${latest} available - Update`;
   if (applyBtn) applyBtn.disabled = false;
+  if (!supported) {
+    text.textContent = `${latest} available - run on the host:`;
+    if (commandEl) {
+      commandEl.textContent = command;
+      commandEl.hidden = false;
+    }
+    if (applyBtn) applyBtn.hidden = true;
+    return;
+  }
+  text.textContent = `${latest} available - Update`;
 }
 
 // sendUpdate triggers the in-dashboard self-update: POST /api/update with an
@@ -2042,7 +2078,7 @@ async function sendUpdate() {
     const response = await fetchWithTimeout(
       "/api/update",
       { method: "POST", headers: { "Content-Type": "application/json" }, body: "" },
-      auxiliaryTimeoutMS,
+      updateRequestTimeoutMS,
     );
     const decision = await response.json().catch(() => ({}));
     if (response.status === 202) {
@@ -2063,6 +2099,12 @@ async function sendUpdate() {
 // dashboard waiting for a reload that never comes.
 const updateApplyWatchdogMS = 5 * 60 * 1000;
 
+// updateRequestTimeoutMS covers the agent's own budget for POST /api/update
+// (a two-minute download plus the helper start on Windows; on Linux up to 15 s
+// for the root updater to take the request). The auxiliary 5 s budget cut a
+// slow download short and reported a failure for an update still under way.
+const updateRequestTimeoutMS = 140 * 1000;
+
 // beginUpdateApplying enters the applying state and arms the escape hatch. The
 // watchdog is armed here rather than in scheduleUpdatePoll so it covers every
 // path into this state — including one where the POST succeeds but the poll is
@@ -2070,6 +2112,7 @@ const updateApplyWatchdogMS = 5 * 60 * 1000;
 function beginUpdateApplying() {
   state.updateApplying = true;
   state.updateApplyingFromVersion = state.agentVersion || "";
+  state.updateApplyBaseline = state.updateLastApplyAt || "";
   clearUpdateWatchdog();
   state.updateWatchdogTimer = setTimeout(() => {
     if (!state.updateApplying) {
@@ -2144,12 +2187,17 @@ function showUpdateError(decision, status) {
   }
   panel.hidden = false;
   panel.classList.add("update-error");
+  const commandEl = $("updateCommand");
+  if (commandEl) commandEl.hidden = true;
   const reason = String(decision?.error || `HTTP ${status || "?"}`).trim();
   const latest = state.updateLatestVersion || decision?.latest_version || "";
   const prefix = latest ? `${latest} update failed: ` : "Update failed: ";
   $("updateText").textContent = prefix + reason;
   const applyBtn = $("updateApplyBtn");
-  if (applyBtn) applyBtn.disabled = false;
+  if (applyBtn) {
+    applyBtn.disabled = false;
+    applyBtn.hidden = false;
+  }
 }
 
 // dismissUpdate records a per-version dismissal in localStorage so the banner
@@ -5892,7 +5940,7 @@ function renderPairingInstall() {
   } else if (state.pairing?.window_open) {
     $("pairInstallNote").textContent = "A PIN is open on the host.";
   } else {
-    $("pairInstallNote").textContent = "To get a PIN: on Windows, open Start, Sysmon Agent, Pair a device; on Linux, run sysmon-agent -pair; or choose Pair another device on a paired dashboard.";
+    $("pairInstallNote").textContent = "To get a PIN: on Windows, type sysmon in Start and choose Pair a device; on Linux, run sysmon-agent -pair; or choose Pair another device on a paired dashboard.";
   }
 }
 
@@ -6024,7 +6072,7 @@ function leaveViewOnlyPairing() {
 function hostPairingHint() {
   const platform = String(window.navigator?.userAgentData?.platform || window.navigator?.userAgent || "");
   const how = /windows/i.test(platform)
-    ? "open Start, Sysmon Agent, Pair a device"
+    ? "type sysmon in Start and choose Pair a device"
     : "run sysmon-agent -pair as the agent's user, with its -settings path";
   return `This is the host. For a PIN, ${how}, or choose Pair another device on a dashboard that is already paired. Then enter it here.`;
 }

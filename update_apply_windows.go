@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -45,12 +46,38 @@ const updateApplyReadyPollInterval = 1500 * time.Millisecond
 // what releases the exe lock so the rename-swap can succeed.
 const updateServiceStopTimeout = 30 * time.Second
 
-// updatePlatformSelfUpdateSupported confines the in-dashboard self-update to
-// the Windows service. The check is "running as the service" (session-0 + SCM
+// updatePlatformMode confines the in-dashboard self-update to the Windows
+// service. The check is "running as the service" (session-0 + SCM
 // handshake), not merely "on Windows", so a console run on Windows still
 // reports 501 and the user is pointed at install-windows.ps1.
-func updatePlatformSelfUpdateSupported() bool {
-	return runningAsWindowsService()
+func updatePlatformMode() string {
+	if runningAsWindowsService() {
+		return updateModeHelper
+	}
+	return updateModeNone
+}
+
+func updateUnsupportedReason() string {
+	return "self-update is supported only for the Windows service; use install-windows.ps1 -Action Update on this host"
+}
+
+// updateCommandHint names no command on Windows: the installed service
+// updates from the dashboard, and a console run is a development build.
+func updateCommandHint() string { return "" }
+
+// requestRootUpdate and lastUpdaterResult belong to the Linux root updater.
+func requestRootUpdate(context.Context, string) error {
+	return errors.New("the root updater is Linux-only")
+}
+
+func lastUpdaterResult() *updaterResult { return nil }
+
+func runRootUpdateCommand(io.Writer) error {
+	return errors.New("-update is for Linux; on Windows, update from the dashboard, run the new SysmonAgent-Setup, or install-windows.ps1 -Action Update")
+}
+
+func runUpdaterSetup(string, io.Writer) error {
+	return errors.New("-update-setup is for Linux; the Windows service updates from the dashboard as installed")
 }
 
 // spawnApplyHelper resolves the agent's own exe + service port and launches the

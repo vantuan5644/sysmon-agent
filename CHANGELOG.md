@@ -4,6 +4,45 @@ Versions are plain numbers. What each one changes is written here, not in its na
 The full notes of a published release are on its
 [GitHub release page](https://github.com/vantuan5644/sysmon-agent/releases).
 
+## 0.2.6 (2026-11-16)
+
+Updates on Linux, and three fixes to how older installs update. Dashboard build v176 to
+v177.
+
+### New
+
+- **Linux agents update themselves.** `sudo sysmon-agent -update` installs the latest
+  release: it downloads `sysmon-agent-linux-<arch>`, checks it against
+  `SHA256SUMS.txt` and against its own `-version`, stops the systemd units running that
+  binary (system units and `systemctl --user` ones), swaps it, starts them again, and
+  rolls back if a unit does not stay up. Run `sudo sysmon-agent -update-setup` once and
+  the dashboard's Update button does the same: the agent drops a request file in a
+  folder its own account owns, and a root `sysmon-agent-update.path` unit starts the
+  update. The request carries nothing the updater trusts; it fetches and verifies the
+  release itself. The result shows in the dashboard, a refusal included.
+- **The update banner says what to run where the dashboard cannot update.** A Linux
+  host before `-update-setup` shows the command (`sudo .../sysmon-agent -update`)
+  in place of the Update button.
+
+### Fixes
+
+- **An upgrade from before pairing shows the PIN on the host's screen.** 0.2.1
+  turned pairing on by default, so a host upgraded from 0.2.0 or older came up asking
+  every dashboard for a PIN, with nothing on the host saying where to get one. On its
+  first start with no paired device, the agent now opens a pairing window and shows
+  the PIN on the host: a message box on Windows, a desktop notification on Linux. It
+  does this once, never when `-pairing` or `SYSMON_PAIRING` is set, and a host with no
+  screen logs the `-pair` command instead.
+- **Windows "Installed apps" shows the version that runs.** An update from the
+  dashboard replaced the binary but left the installer's version in Installed apps,
+  so it kept showing the old one. The service now corrects the record at start.
+- **Development builds no longer check GitHub.** A build without a version could never
+  be updated, yet it asked GitHub for a new release every day.
+- **A Start search finds Pair a device (Windows).** The Start menu shortcut is now
+  "Pair a device - Sysmon Agent (System Monitor)", since Start search matches only the
+  words of a shortcut's name: typing `sysmon`, `system monitor` or `pair` finds it.
+  Before, `sysmon` found only the dashboard. Setup removes the old shortcut on upgrade.
+
 ## 0.2.5 (2026-11-15)
 
 The memory junction on Windows. Dashboard build v176, unchanged.
