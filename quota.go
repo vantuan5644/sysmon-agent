@@ -597,8 +597,10 @@ type QuotaChecker struct {
 
 	// Transcript aggregation is costlier than the small quota-file merge, so
 	// the resident usage sampler keeps it warm outside request handling.
-	tokenDays []TokenUsageDay
-	tokenErr  error
+	// tokenScanner keeps per-transcript read positions between passes.
+	tokenDays    []TokenUsageDay
+	tokenErr     error
+	tokenScanner claudeUsageScanner
 
 	stop    chan struct{}
 	stopped chan struct{}
@@ -824,7 +826,7 @@ func (c *QuotaChecker) refreshTokenUsage(now time.Time) {
 	if c == nil || c.configDir == "" {
 		return
 	}
-	days, _, err := scanClaudeTokenUsage(c.configDir, now)
+	days, _, err := c.tokenScanner.scan(c.configDir, now)
 	c.mu.Lock()
 	if err == nil || len(c.tokenDays) == 0 {
 		c.tokenDays = days

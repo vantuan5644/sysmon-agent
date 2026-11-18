@@ -1,10 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"math"
 	"os"
@@ -92,79 +92,184 @@ type claudeTranscriptEvent struct {
 
 // scanClaudeTokenUsage sums one usage record per Claude API response. Claude's
 // transcript repeats the same response as successive thinking/tool/text blocks,
-// so requestId (then message id/uuid) is the deduplication boundary.
+// so requestId (then message id/uuid) is the deduplication boundary. It reads
+// every file from the start; the resident sampler keeps a claudeUsageScanner
+// instead, which reads only what each pass appended.
 func scanClaudeTokenUsage(configDir string, now time.Time) ([]TokenUsageDay, time.Time, error) {
+	var scanner claudeUsageScanner
+	return scanner.scan(configDir, now)
+}
+
+// claudeUsageRecord is one assistant usage line, kept so later passes can
+// re-aggregate without re-reading the transcript.
+type claudeUsageRecord struct {
+	key   string
+	at    time.Time
+	total int64
+}
+
+type claudeTranscriptState struct {
+	cursor  transcriptCursor
+	records []claudeUsageRecord
+	// firstSeen drops a repeat of a key on the same local day while reading.
+	// A repeat can never count: the earlier copy is in the same day bucket, so
+	// it either counted already or lies outside the window just the same.
+	firstSeen map[claudeRecordKey]struct{}
+}
+
+type claudeRecordKey struct{ key, date string }
+
+func (s *claudeTranscriptState) reset() {
+	s.records = nil
+	s.firstSeen = nil
+}
+
+// dropBefore forgets records the window has passed. A full scan never let
+// them count or mark a request seen, so the result does not change.
+func (s *claudeTranscriptState) dropBefore(start time.Time) {
+	kept := s.records[:0]
+	for _, record := range s.records {
+		if !record.at.Before(start) {
+			kept = append(kept, record)
+		}
+	}
+	if len(kept) == len(s.records) {
+		return
+	}
+	clear(s.records[len(kept):]) // release the dropped keys
+	s.records = kept
+	first := start.Format("2006-01-02")
+	for id := range s.firstSeen {
+		if id.date < first {
+			delete(s.firstSeen, id)
+		}
+	}
+}
+
+var claudeUsageMarker = []byte(`"usage"`)
+
+func (s *claudeTranscriptState) add(line []byte) {
+	if !bytes.Contains(line, claudeUsageMarker) {
+		return
+	}
+	var event claudeTranscriptEvent
+	if err := json.Unmarshal(line, &event); err != nil {
+		return
+	}
+	if event.Type != "assistant" || event.Message.Role != "assistant" || event.Message.Usage == nil {
+		return
+	}
+	at, err := time.Parse(time.RFC3339Nano, event.Timestamp)
+	if err != nil {
+		return
+	}
+	at = at.In(time.Local)
+	key := strings.TrimSpace(event.RequestID)
+	if key == "" {
+		key = strings.TrimSpace(event.Message.ID)
+	}
+	if key == "" {
+		key = strings.TrimSpace(event.UUID)
+	}
+	if key != "" {
+		id := claudeRecordKey{key: key, date: at.Format("2006-01-02")}
+		if _, dup := s.firstSeen[id]; dup {
+			return
+		}
+		if s.firstSeen == nil {
+			s.firstSeen = make(map[claudeRecordKey]struct{})
+		}
+		s.firstSeen[id] = struct{}{}
+	}
+	usage := event.Message.Usage
+	s.records = append(s.records, claudeUsageRecord{
+		key: key,
+		at:  at,
+		total: sumNonNegativeTokens(
+			usage.InputTokens,
+			usage.CacheCreationTokens,
+			usage.CacheReadTokens,
+			usage.OutputTokens,
+		),
+	})
+}
+
+// claudeUsageScanner keeps each transcript's records between passes, so a
+// pass reads only the lines appended since the last one. Aggregation runs over
+// the kept records every pass in path order, which is what makes the result
+// the same as a full rescan: the first copy of a request in that order counts.
+type claudeUsageScanner struct {
+	mu    sync.Mutex
+	files map[string]*claudeTranscriptState
+}
+
+func (s *claudeUsageScanner) scan(configDir string, now time.Time) ([]TokenUsageDay, time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	days, start, end := emptyTokenUsageDays(now)
-	root := filepath.Join(configDir, "projects")
-	paths, err := recentJSONLFiles(root, start)
+	paths, err := recentJSONLFiles(filepath.Join(configDir, "projects"), start)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			s.files = nil
 			return days, time.Time{}, nil
 		}
 		return days, time.Time{}, fmt.Errorf("Claude transcripts: %w", err)
+	}
+	if s.files == nil {
+		s.files = make(map[string]*claudeTranscriptState)
+	}
+	pruneTranscriptStates(s.files, paths)
+	for _, path := range paths {
+		state := s.files[path]
+		if state == nil {
+			state = &claudeTranscriptState{}
+			s.files[path] = state
+		}
+		if err := readNewTranscriptLines(path, &state.cursor, state.reset, state.add); err != nil {
+			return days, time.Time{}, fmt.Errorf("Claude transcript %s: %w", filepath.Base(path), err)
+		}
 	}
 	index := tokenDayIndex(days)
 	seen := make(map[string]struct{})
 	var newest time.Time
 	for _, path := range paths {
-		file, err := os.Open(path)
-		if err != nil {
-			return days, newest, fmt.Errorf("Claude transcript %s: %w", filepath.Base(path), err)
-		}
-		decoder := json.NewDecoder(file)
-		for {
-			var event claudeTranscriptEvent
-			if err := decoder.Decode(&event); err != nil {
-				if !errors.Is(err, io.EOF) {
-					// An actively written JSONL file can end in a partial record.
-					// Keep every complete response decoded before that tail.
-				}
-				break
-			}
-			if event.Type != "assistant" || event.Message.Role != "assistant" || event.Message.Usage == nil {
+		state := s.files[path]
+		state.dropBefore(start)
+		for _, record := range state.records {
+			if !record.at.Before(end) {
 				continue
 			}
-			at, err := time.Parse(time.RFC3339Nano, event.Timestamp)
-			if err != nil {
-				continue
-			}
-			at = at.In(time.Local)
-			if at.Before(start) || !at.Before(end) {
-				continue
-			}
-			key := strings.TrimSpace(event.RequestID)
-			if key == "" {
-				key = strings.TrimSpace(event.Message.ID)
-			}
-			if key == "" {
-				key = strings.TrimSpace(event.UUID)
-			}
-			if key != "" {
-				if _, ok := seen[key]; ok {
+			if record.key != "" {
+				if _, ok := seen[record.key]; ok {
 					continue
 				}
-				seen[key] = struct{}{}
+				seen[record.key] = struct{}{}
 			}
-			usage := event.Message.Usage
-			total := sumNonNegativeTokens(
-				usage.InputTokens,
-				usage.CacheCreationTokens,
-				usage.CacheReadTokens,
-				usage.OutputTokens,
-			)
-			if total == 0 {
+			if record.total == 0 {
 				continue
 			}
-			if i, ok := index[at.Format("2006-01-02")]; ok {
-				days[i].Tokens = saturatingTokenAdd(days[i].Tokens, total)
+			if i, ok := index[record.at.Format("2006-01-02")]; ok {
+				days[i].Tokens = saturatingTokenAdd(days[i].Tokens, record.total)
 			}
-			if at.After(newest) {
-				newest = at
+			if record.at.After(newest) {
+				newest = record.at
 			}
 		}
-		_ = file.Close()
 	}
 	return days, newest, nil
+}
+
+// pruneTranscriptStates forgets files that left the window or were deleted.
+func pruneTranscriptStates[T any](files map[string]T, current []string) {
+	keep := make(map[string]struct{}, len(current))
+	for _, path := range current {
+		keep[path] = struct{}{}
+	}
+	for path := range files {
+		if _, ok := keep[path]; !ok {
+			delete(files, path)
+		}
+	}
 }
 
 type codexRateWindow struct {
@@ -200,65 +305,134 @@ type codexScanResult struct {
 }
 
 // scanCodexUsage uses cumulative counter deltas, so repeated token_count events
-// add zero and every completed model interaction is counted exactly once.
+// add zero and every completed model interaction is counted exactly once. It
+// reads every file from the start; the resident sampler keeps a
+// codexUsageScanner instead, which reads only what each pass appended.
 func scanCodexUsage(configDir string, now time.Time) (codexScanResult, error) {
+	var scanner codexUsageScanner
+	return scanner.scan(configDir, now)
+}
+
+// codexUsageRecord is one positive counter step. The step is computed while
+// reading, from the session's previous token_count, so it stays correct when
+// later passes resume mid-file.
+type codexUsageRecord struct {
+	at    time.Time
+	delta int64
+}
+
+type codexTranscriptState struct {
+	cursor   transcriptCursor
+	previous int64 // the session's last cumulative total_tokens
+	records  []codexUsageRecord
+	limits   *codexRateLimits // the session's newest rate-limit snapshot
+	limitsAt time.Time
+}
+
+func (s *codexTranscriptState) reset() {
+	s.previous = 0
+	s.records = nil
+	s.limits = nil
+	s.limitsAt = time.Time{}
+}
+
+var codexTokenCountMarker = []byte(`"token_count"`)
+
+func (s *codexTranscriptState) add(line []byte) {
+	if !bytes.Contains(line, codexTokenCountMarker) {
+		return
+	}
+	var event codexTranscriptEvent
+	if err := json.Unmarshal(line, &event); err != nil {
+		return
+	}
+	if event.Type != "event_msg" || event.Payload.Type != "token_count" {
+		return
+	}
+	at, err := time.Parse(time.RFC3339Nano, event.Timestamp)
+	if err != nil {
+		return
+	}
+	at = at.In(time.Local)
+	if event.Payload.RateLimits != nil && at.After(s.limitsAt) {
+		s.limits = event.Payload.RateLimits
+		s.limitsAt = at
+	}
+	usage := event.Payload.Info.TotalTokenUsage
+	if usage == nil || usage.TotalTokens < 0 {
+		return
+	}
+	current := usage.TotalTokens
+	delta := current - s.previous
+	if current < s.previous {
+		delta = current
+	}
+	s.previous = current
+	if delta > 0 {
+		s.records = append(s.records, codexUsageRecord{at: at, delta: delta})
+	}
+}
+
+// codexUsageScanner is the Codex counterpart of claudeUsageScanner.
+type codexUsageScanner struct {
+	mu    sync.Mutex
+	files map[string]*codexTranscriptState
+}
+
+func (s *codexUsageScanner) scan(configDir string, now time.Time) (codexScanResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	days, start, end := emptyTokenUsageDays(now)
-	result := codexScanResult{Days: days}
+	result := codexScanResult{Days: days, Rows: codexQuotaRows(nil)}
 	paths, err := recentJSONLFiles(filepath.Join(configDir, "sessions"), start)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			s.files = nil
 			return result, nil
 		}
 		return result, fmt.Errorf("Codex sessions: %w", err)
 	}
+	if s.files == nil {
+		s.files = make(map[string]*codexTranscriptState)
+	}
+	pruneTranscriptStates(s.files, paths)
+	for _, path := range paths {
+		state := s.files[path]
+		if state == nil {
+			state = &codexTranscriptState{}
+			s.files[path] = state
+		}
+		if err := readNewTranscriptLines(path, &state.cursor, state.reset, state.add); err != nil {
+			return result, fmt.Errorf("Codex session %s: %w", filepath.Base(path), err)
+		}
+	}
 	index := tokenDayIndex(days)
 	var latestLimits *codexRateLimits
 	for _, path := range paths {
-		file, err := os.Open(path)
-		if err != nil {
-			return result, fmt.Errorf("Codex session %s: %w", filepath.Base(path), err)
+		state := s.files[path]
+		// Path order with a strict After keeps the first of equal timestamps,
+		// as the single pass over every file did.
+		if state.limits != nil && state.limitsAt.After(result.QuotaAt) {
+			latestLimits = state.limits
+			result.QuotaAt = state.limitsAt
 		}
-		decoder := json.NewDecoder(file)
-		var previous int64
-		for {
-			var event codexTranscriptEvent
-			if err := decoder.Decode(&event); err != nil {
-				break
+		kept := state.records[:0]
+		for _, record := range state.records {
+			if record.at.Before(start) {
+				continue // the window only moves forward
 			}
-			if event.Type != "event_msg" || event.Payload.Type != "token_count" {
+			kept = append(kept, record)
+			if !record.at.Before(end) {
 				continue
 			}
-			at, err := time.Parse(time.RFC3339Nano, event.Timestamp)
-			if err != nil {
-				continue
+			if i, ok := index[record.at.Format("2006-01-02")]; ok {
+				days[i].Tokens = saturatingTokenAdd(days[i].Tokens, record.delta)
 			}
-			at = at.In(time.Local)
-			if event.Payload.RateLimits != nil && at.After(result.QuotaAt) {
-				limits := *event.Payload.RateLimits
-				latestLimits = &limits
-				result.QuotaAt = at
-			}
-			usage := event.Payload.Info.TotalTokenUsage
-			if usage == nil || usage.TotalTokens < 0 {
-				continue
-			}
-			current := usage.TotalTokens
-			delta := current - previous
-			if current < previous {
-				delta = current
-			}
-			previous = current
-			if at.Before(start) || !at.Before(end) || delta <= 0 {
-				continue
-			}
-			if i, ok := index[at.Format("2006-01-02")]; ok {
-				days[i].Tokens = saturatingTokenAdd(days[i].Tokens, delta)
-			}
-			if at.After(result.Newest) {
-				result.Newest = at
+			if record.at.After(result.Newest) {
+				result.Newest = record.at
 			}
 		}
-		_ = file.Close()
+		state.records = kept
 	}
 	result.Rows = codexQuotaRows(latestLimits)
 	if result.QuotaAt.After(result.Newest) {
@@ -356,6 +530,9 @@ type CodexUsageChecker struct {
 	pollCancel  func()
 	pollDone    chan struct{}
 
+	// scanner keeps per-session read positions between sampler passes.
+	scanner codexUsageScanner
+
 	mu        sync.RWMutex
 	cached    CodexUsageStatus
 	liveRows  []QuotaRow
@@ -422,7 +599,7 @@ func (c *CodexUsageChecker) Refresh(now time.Time) {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	result, err := scanCodexUsage(c.configDir, now)
+	result, err := c.scanner.scan(c.configDir, now)
 	if err != nil {
 		c.mu.Lock()
 		c.cached.Error = err.Error()
