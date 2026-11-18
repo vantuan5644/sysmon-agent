@@ -4,6 +4,23 @@ Versions are plain numbers. What each one changes is written here, not in its na
 The full notes of a published release are on its
 [GitHub release page](https://github.com/vantuan5644/sysmon-agent/releases).
 
+## 0.2.8 (2026-11-18)
+
+The AI usage charts stop costing a CPU core every 30 seconds. The dashboard is
+unchanged (build v178).
+
+### Fixed
+
+- **The token charts read only what is new in each transcript.** Every 30 seconds the
+  agent used to read and decode every Claude Code and Codex transcript written in the
+  last seven days, from the start. With a few large Codex sessions that came to about
+  900 MB a pass: a full CPU core for several seconds, every 30 seconds, enough to make
+  the fans rise and fall on that rhythm. Each pass now resumes every file where the
+  last one stopped and parses only the lines added since, so a quiet pass takes
+  milliseconds and reads almost nothing. A transcript that was rewritten, not appended
+  to, is noticed and read again from the start. The charts show the same numbers as
+  before.
+
 ## 0.2.7 (2026-11-16)
 
 Checking for an update no longer waits a day. Dashboard build v177 to v178.
