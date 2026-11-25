@@ -399,9 +399,10 @@ func newHTTPHandlerWithController(collector MetricsCollector, static fs.FS, stat
 			writeJSON(w, http.StatusBadGateway, answer)
 		}
 	})
+	registerAlertRoutes(mux, state)
 	registerPairingRoutes(mux, state)
 	mux.Handle("GET /", staticAssetHandler(staticSub))
-	return securityHeaders(requirePairing(state, mux)), nil
+	return securityHeaders(requireAllowedHost(state, requirePairing(state, mux))), nil
 }
 
 // UpdateCheckAnswer is the body of POST /api/update/check. Update has the

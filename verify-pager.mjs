@@ -75,7 +75,7 @@ try {
 }
 
 // writeFixture builds a self-contained copy of the real dashboard shell:
-// index.html with app.js/manifest/service-worker removed (so nothing reaches the
+// index.html with boot.js/app.js/manifest/service-worker removed (so nothing reaches the
 // network and no SSE stream keeps the page alive), the stylesheet href made
 // relative, and a probe script appended that populates the pages and reports the
 // measured box tree through a #PROBE element.
@@ -88,7 +88,7 @@ function writeFixture(root) {
   writeFileSync(join(root, "fonts", "jetbrains-mono.woff2"), readFileSync(join(scriptDir, "static", "fonts", "jetbrains-mono.woff2")));
 
   let html = readFileSync(join(scriptDir, "static", "index.html"), "utf8");
-  html = html.replace(/<script[^>]*app\.js[^>]*>\s*<\/script>/g, "");
+  html = html.replace(/<script[^>]*(?:app|boot)\.js[^>]*>\s*<\/script>/g, "");
   html = html.replace(/<link[^>]*manifest[^>]*>/g, "");
   // index.html references the stylesheet absolutely; under file:// that resolves
   // to the filesystem root and loads nothing.

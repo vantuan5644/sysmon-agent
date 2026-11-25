@@ -31,9 +31,10 @@ import (
 // what it is labelled with.
 //
 // On Linux, NVIDIA's encoder and decoder utilization come from the nvidia-smi
-// query the slow lane already runs. Per-process utilization there would need
-// NVML (cgo) or a walk of every process's DRM file descriptors, so it is
-// reported as unavailable.
+// query the slow lane already runs; per-process utilization there would need
+// NVML (cgo) and is reported as unavailable. AMD and Intel engines and
+// per-process utilization come from DRM fdinfo (drm_fdinfo_linux.go), with
+// the same aggregation.
 
 // GPUEngine is one engine type's utilization on an adapter.
 type GPUEngine struct {

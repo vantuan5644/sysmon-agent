@@ -206,6 +206,7 @@ func windowsMicActivity() DeviceActivity {
 		return unknownDeviceActivity("capture endpoint count unavailable")
 	}
 	active, failed := false, false
+	var pids []uint32
 	for i := uint32(0); i < count; i++ {
 		func() {
 			var endpoint, manager, sessions uintptr
@@ -240,6 +241,9 @@ func windowsMicActivity() DeviceActivity {
 					failed = true
 				} else if state == 1 {
 					active = true
+					if pid := audioSessionProcessID(session); pid != 0 {
+						pids = append(pids, pid)
+					}
 				}
 				deviceCOMCall(session, 2)
 			}
@@ -248,7 +252,52 @@ func windowsMicActivity() DeviceActivity {
 	if !active && failed {
 		return unknownDeviceActivity("some Core Audio capture sessions could not be inspected")
 	}
-	return observedDeviceActivity(active, "Windows Core Audio capture sessions")
+	return withDeviceApps(observedDeviceActivity(active, "Windows Core Audio capture sessions"), windowsProcessApps(pids))
+}
+
+var audioSessionControl2IID = windowsGUID{Data1: 0xbfb7ff88, Data2: 0x7239, Data3: 0x4fc9, Data4: [8]byte{0x8f, 0xa2, 0x07, 0xc9, 0x50, 0xbe, 0x9c, 0x6d}}
+
+// audioSessionProcessID asks an IAudioSessionControl for its process through
+// IAudioSessionControl2::GetProcessId (vtable slot 14). A session shared by
+// several processes answers AUDCLNT_S_NO_SINGLE_PROCESS, a success code, and
+// is left unnamed like any failure: 0 means no process.
+func audioSessionProcessID(session uintptr) uint32 {
+	var control2 uintptr
+	if deviceCOMFailed(deviceCOMCall(session, 0, uintptr(unsafe.Pointer(&audioSessionControl2IID)), uintptr(unsafe.Pointer(&control2)))) || control2 == 0 {
+		return 0
+	}
+	defer deviceCOMCall(control2, 2)
+	var pid uint32
+	if hr := deviceCOMCall(control2, 14, uintptr(unsafe.Pointer(&pid))); hr != 0 {
+		return 0 // S_OK only; AUDCLNT_S_NO_SINGLE_PROCESS is 0x08890010
+	}
+	return pid
+}
+
+var procQueryFullProcessImageNameW = kernel32.NewProc("QueryFullProcessImageNameW")
+
+// windowsProcessApps names capture processes by image file name; the full
+// path is read but never reported. A process that cannot be opened is left
+// out rather than shown as a number.
+func windowsProcessApps(pids []uint32) []DeviceApp {
+	var apps []DeviceApp
+	for _, pid := range pids {
+		handle, _, _ := procOpenProcess.Call(processQueryLimitedInformation, 0, uintptr(pid))
+		if handle == 0 {
+			continue
+		}
+		var buffer [1024]uint16
+		size := uint32(len(buffer))
+		ok, _, _ := procQueryFullProcessImageNameW.Call(handle, 0, uintptr(unsafe.Pointer(&buffer[0])), uintptr(unsafe.Pointer(&size)))
+		syscall.CloseHandle(syscall.Handle(handle))
+		if ok == 0 || size == 0 || size > uint32(len(buffer)) {
+			continue
+		}
+		if name := windowsImageAppName(syscall.UTF16ToString(buffer[:size])); name != "" {
+			apps = append(apps, DeviceApp{PID: int(pid), Name: name})
+		}
+	}
+	return apps
 }
 
 var audioEndpointVolumeIID = windowsGUID{Data1: 0x5cdf2c82, Data2: 0x841e, Data3: 0x4546, Data4: [8]byte{0x97, 0x22, 0x0c, 0xf7, 0x40, 0x78, 0x22, 0x9a}}
@@ -454,19 +503,25 @@ func readPrivacyProcess(pid uint32, exe string) privacyProcess {
 // privacyCaptureRunning drops records whose capturing process is gone; see
 // privacyRecordRunning. When the processes cannot be listed the records stand.
 func privacyCaptureRunning(records []privacyRecord) bool {
+	return len(privacyRunningRecords(records)) > 0
+}
+
+// privacyRunningRecords is the records privacyCaptureRunning keeps.
+func privacyRunningRecords(records []privacyRecord) []privacyRecord {
 	if len(records) == 0 {
-		return false
+		return nil
 	}
 	processes, err := readPrivacyProcesses()
 	if err != nil {
-		return true
+		return records
 	}
+	var running []privacyRecord
 	for _, record := range records {
 		if privacyRecordRunning(record, processes) {
-			return true
+			running = append(running, record)
 		}
 	}
-	return false
+	return running
 }
 
 func windowsPrivacyActivity(capability string) DeviceActivity {
@@ -493,8 +548,14 @@ func windowsPrivacyActivity(capability string) DeviceActivity {
 		complete = registryOpenCaptures(key, nil, &records) && complete
 		syscall.RegCloseKey(key)
 	}
-	if privacyCaptureRunning(records) {
-		return observedDeviceActivity(true, "Windows privacy activity (best-effort; loaded user profiles)")
+	if running := privacyRunningRecords(records); len(running) > 0 {
+		var apps []DeviceApp
+		for _, record := range running {
+			if app, ok := privacyRecordApp(record.key); ok {
+				apps = append(apps, app)
+			}
+		}
+		return withDeviceApps(observedDeviceActivity(true, "Windows privacy activity (best-effort; loaded user profiles)"), apps)
 	}
 	if !checked || !complete {
 		return unknownDeviceActivity(capability + " privacy activity unavailable for some loaded users")
@@ -515,6 +576,11 @@ func (windowsDeviceBackend) Activity(ctx context.Context) (DeviceActivity, Devic
 // across loaded profiles. An active reading always wins over idle or unknown.
 func mergeWindowsMicActivity(core, privacy DeviceActivity) DeviceActivity {
 	if core.State == "active" {
+		// Name holders from both sources: a desktop app's session can be
+		// invisible to the service while its privacy record is not.
+		if privacy.State == "active" {
+			core.Apps = mergeDeviceApps(core.Apps, privacy.Apps)
+		}
 		return core
 	}
 	if privacy.State == "active" {

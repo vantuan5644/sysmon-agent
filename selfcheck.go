@@ -43,6 +43,9 @@ func runSelfCheck(handler http.Handler, pairing *pairingStore) error {
 	if err := checkSecurityHeaders(handler); err != nil {
 		return err
 	}
+	if err := checkHostAllowlist(handler); err != nil {
+		return err
+	}
 	if err := checkDashboard(handler); err != nil {
 		return err
 	}
@@ -120,9 +123,9 @@ func checkPairing(handler http.Handler, store *pairingStore) (http.Handler, stri
 	if rec := serveSelfCheckRequest(handler, http.MethodPost, "/api/pair", body); rec.Code != http.StatusForbidden {
 		return nil, "", fmt.Errorf("pairing: POST /api/pair over plain network HTTP returned %d, want 403", rec.Code)
 	}
-	pairReq := httptest.NewRequest(http.MethodPost, "/api/pair", strings.NewReader(body))
+	pairReq := httptest.NewRequest(http.MethodPost, "https://"+selfCheckHost+"/api/pair", strings.NewReader(body))
 	pairReq.Header.Set("Content-Type", "application/json")
-	pairReq.Header.Set("Origin", "https://example.com")
+	pairReq.Header.Set("Origin", "https://"+selfCheckHost)
 	pairReq.TLS = &tls.ConnectionState{}
 	pairRec := serveSelfCheckHTTPRequest(handler, pairReq)
 	if pairRec.Code != http.StatusOK {
@@ -690,7 +693,7 @@ func checkDashboard(handler http.Handler) error {
 }
 
 func checkStaticAssets(handler http.Handler) error {
-	for _, path := range []string{"/app.js", "/styles.css", "/sw.js", "/manifest.json", "/icon.svg", "/icon-180.png", "/icon-512.png", "/fonts/jetbrains-mono.woff2"} {
+	for _, path := range []string{"/app.js", "/boot.js", "/styles.css", "/sw.js", "/manifest.json", "/icon.svg", "/icon-180.png", "/icon-512.png", "/fonts/jetbrains-mono.woff2"} {
 		rec := serveSelfCheckRequest(handler, http.MethodGet, path, "")
 		if rec.Code != http.StatusOK {
 			return fmt.Errorf("GET %s returned %d", path, rec.Code)
@@ -758,7 +761,7 @@ func checkClientCheck(handler http.Handler) error {
 		return fmt.Errorf("GET /api/client-checks was not empty before dashboard POST")
 	}
 
-	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v178","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
+	post := serveSelfCheckRequestWithUserAgent(handler, http.MethodPost, "/api/client-check", `{"dashboard_build":"sysmon-static-v179","interaction":"status_strip_tap","viewport_width":390,"viewport_height":844,"screen_width":390,"screen_height":844,"device_pixel_ratio":3,"touch_points":5,"display_mode":"standalone","standalone":true,"visibility":"visible","orientation":"portrait-primary"}`, selfCheckDeviceUserAgent)
 	if post.Code != http.StatusOK {
 		return fmt.Errorf("POST /api/client-check returned %d: %s", post.Code, strings.TrimSpace(post.Body.String()))
 	}
@@ -826,19 +829,41 @@ func selfCheckClientMetadataMatches(check ClientCheck) bool {
 // so the self-check exercises the device_client_check promotion path.
 const selfCheckDeviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
+// selfCheckHost is the Host the self-check's requests name: a .local name,
+// which the host allowlist always accepts and which is not loopback, so the
+// pairing checks still see a network client.
+const selfCheckHost = "sysmon-self-check.local"
+
+// checkHostAllowlist checks the DNS-rebinding guard (host_guard.go): a name
+// the agent was not told about gets 421, before any route runs.
+func checkHostAllowlist(handler http.Handler) error {
+	for _, host := range []string{"rebind.invalid", "rebind.invalid:9099"} {
+		req := httptest.NewRequest(http.MethodGet, "http://"+selfCheckHost+"/api/status", nil)
+		req.Host = host
+		rec := serveSelfCheckHTTPRequest(handler, req)
+		if rec.Code != http.StatusMisdirectedRequest {
+			return fmt.Errorf("host allowlist: GET /api/status with Host %s returned %d, want 421", host, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), allowedHostsFlagName) {
+			return fmt.Errorf("host allowlist: 421 body does not name %s: %q", allowedHostsFlagName, rec.Body.String())
+		}
+	}
+	return nil
+}
+
 func serveSelfCheckRequest(handler http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	return serveSelfCheckRequestWithUserAgent(handler, method, path, body, "")
 }
 
 func serveSelfCheckRequestWithUserAgent(handler http.Handler, method, path, body, userAgent string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req := httptest.NewRequest(method, "http://"+selfCheckHost+path, strings.NewReader(body))
 	if userAgent != "" {
 		req.Header.Set("User-Agent", userAgent)
 	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Origin", "http://example.com")
+		req.Header.Set("Origin", "http://"+selfCheckHost)
 	}
 	handler.ServeHTTP(rec, req)
 	return rec

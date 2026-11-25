@@ -40,7 +40,7 @@ const updateCheckStartupDelay = 30 * time.Second
 
 // updateRequestTimeout bounds a single GitHub API call. The check runs in the
 // background, so this only caps how long a hung request can sit before the
-// checker gives up and tries again at the next interval.
+// checker gives up and retries (update_retry.go says when).
 const updateRequestTimeout = 15 * time.Second
 
 // updateDownloadTimeout bounds the download of the new binary + checksum during
@@ -455,23 +455,31 @@ func (c *UpdateChecker) loop() {
 		return
 	case <-time.After(c.startupDelay):
 	}
-	c.checkAndCache(context.Background())
-	ticker := time.NewTicker(c.interval)
-	defer ticker.Stop()
+	failures := 0
 	for {
+		if c.checkAndCache(context.Background()) {
+			failures = 0
+		} else {
+			failures++
+		}
+		// A failure is retried sooner than the interval (update_retry.go).
+		wait := time.NewTimer(nextUpdateCheckDelay(c.interval, failures))
 		select {
 		case <-c.stop:
+			wait.Stop()
 			return
-		case <-ticker.C:
-			c.checkAndCache(context.Background())
+		case <-wait.C:
 		}
 	}
 }
 
-func (c *UpdateChecker) checkAndCache(ctx context.Context) {
+// checkAndCache runs one background check and reports whether it succeeded.
+func (c *UpdateChecker) checkAndCache(ctx context.Context) bool {
 	if _, err := c.CheckNow(ctx); err != nil {
 		c.logf("update check failed: %v", err)
+		return false
 	}
+	return true
 }
 
 func (c *UpdateChecker) cacheStatus(status UpdateStatus) {

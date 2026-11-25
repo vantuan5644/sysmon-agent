@@ -60,6 +60,11 @@ type systemCollector struct {
 
 	// storageExclude is set once, before the sampler starts (ExcludeStorage).
 	storageExclude storageExclusions
+
+	// drmUsage meters AMD/Intel GPU clients from DRM fdinfo
+	// (drm_fdinfo_linux.go), created on first use. Carries its own lock.
+	drmUsageOnce sync.Once
+	drmUsage     *drmFdinfoSampler
 }
 
 type cpuTimes struct {
@@ -124,6 +129,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 	metrics.Platform = readFirstLine("/proc/sys/kernel/osrelease")
 	metrics.CPUName, metrics.MemoryName, metrics.MemorySpeed = c.resolveHardwareNames(ctx)
 
+	drmUsage := c.startDRMUsage()
 	var wg sync.WaitGroup
 	var cpu NumberMetric
 	var cpuPower NumberMetric
@@ -182,7 +188,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return TemperatureSet{Available: false, Error: fmt.Sprintf("Linux temperature collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &gpu, func() GPUSet {
-		return collectLinuxGPU(ctx)
+		return collectLinuxGPU(ctx, drmUsage.wait)
 	}, func(recovered any) GPUSet {
 		return GPUSet{Available: false, Error: fmt.Sprintf("Linux GPU collector panicked: %v", recovered)}
 	})
@@ -192,7 +198,7 @@ func (c *systemCollector) Collect(ctx context.Context) (Metrics, error) {
 		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Linux Tailscale collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &processes, func() ProcessSet {
-		return c.collectProcesses(ctx)
+		return c.collectProcesses(ctx, drmUsage)
 	}, func(recovered any) ProcessSet {
 		return unavailableProcessSet(fmt.Sprintf("Linux process collector panicked: %v", recovered))
 	})
@@ -268,6 +274,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	platform := readFirstLine("/proc/sys/kernel/osrelease")
 	cpuName, memoryName, memorySpeed := c.resolveHardwareNames(ctx)
 
+	drmUsage := c.startDRMUsage()
 	var wg sync.WaitGroup
 	var cpuPower NumberMetric
 	var cpuClocks cpuClockSet
@@ -310,7 +317,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		return TemperatureSet{Available: false, Error: fmt.Sprintf("Linux temperature collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &gpu, func() GPUSet {
-		return collectLinuxGPU(ctx)
+		return collectLinuxGPU(ctx, drmUsage.wait)
 	}, func(recovered any) GPUSet {
 		return GPUSet{Available: false, Error: fmt.Sprintf("Linux GPU collector panicked: %v", recovered)}
 	})
@@ -320,7 +327,7 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 		return TailscaleStatus{Available: false, Error: fmt.Sprintf("Linux Tailscale collector panicked: %v", recovered)}
 	})
 	collectMetricAsync(&wg, &processes, func() ProcessSet {
-		return c.collectProcesses(ctx)
+		return c.collectProcesses(ctx, drmUsage)
 	}, func(recovered any) ProcessSet {
 		return unavailableProcessSet(fmt.Sprintf("Linux process collector panicked: %v", recovered))
 	})
@@ -352,10 +359,15 @@ func (c *systemCollector) CollectSlow(ctx context.Context) (patch func(*Metrics)
 	}
 }
 
-// linuxNoProcessGPUMessage explains the per-process GPU column on Linux:
-// NVML needs cgo, and the DRM fdinfo route means reading every open file
-// descriptor of every process each pass (gpu_engines.go).
-const linuxNoProcessGPUMessage = "per-process GPU utilization is not collected on Linux"
+// linuxNoProcessGPUMessage explains the per-process GPU column on a Linux
+// host without an AMD/Intel GPU: AMD and Intel are metered from DRM fdinfo
+// (drm_fdinfo_linux.go), NVIDIA would need NVML, which needs cgo.
+const linuxNoProcessGPUMessage = "per-process GPU utilization is collected for AMD and Intel GPUs only"
+
+// linuxNVIDIAProcessGPUMessage is the per-process GPU note on a host with an
+// NVIDIA GPU, where an AMD/Intel figure alone would show CUDA work as 0% and
+// replace the dashboard's GPU memory column.
+const linuxNVIDIAProcessGPUMessage = "per-process GPU utilization is not collected on Linux hosts with an NVIDIA GPU"
 
 // linuxNoPowerRailsMessage explains the permanently-absent per-rail CPU power
 // breakdown on Linux. RAPL (/sys/class/powercap) exposes package and, on some
@@ -1866,12 +1878,13 @@ const linuxClockTicksPerSecond = 100.0
 // per-process CPU% (delta of utime+stime jiffies, whole-host normalized so it
 // is comparable to the aggregated CPU gauge), RSS from /proc/[pid]/status,
 // Disk I/O rates (delta of /proc/[pid]/io read_bytes/write_bytes), and joins
-// NVIDIA per-process GPU memory by PID. Each field degrades independently: a
+// NVIDIA per-process GPU memory by PID; AMD/Intel per-process GPU utilization
+// comes from the DRM fdinfo sample drmUsage (applyDRMProcessGPU). Each field degrades independently: a
 // PID the agent lacks privilege to read (another user's PID under a --user
 // service) degrades its disk/memory fields rather than the row. New PIDs with
 // no prior sample report CPU as unavailable for one cycle, then fill next pass.
 // Dead PIDs are pruned automatically because prevProc is rebuilt each pass.
-func (c *systemCollector) collectProcesses(ctx context.Context) ProcessSet {
+func (c *systemCollector) collectProcesses(ctx context.Context, drmUsage *drmUsageFuture) ProcessSet {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return unavailableProcessSet("read /proc: " + err.Error())
@@ -1948,6 +1961,7 @@ func (c *systemCollector) collectProcesses(ctx context.Context) ProcessSet {
 	c.mu.Lock()
 	c.prevProc = current
 	c.mu.Unlock()
+	applyDRMProcessGPU(raw, drmUsage)
 	set := buildProcessSet(raw, total)
 	agent := c.agentCost.measure(raw, os.Getpid(), now, numCPU)
 	set.Agent = &agent

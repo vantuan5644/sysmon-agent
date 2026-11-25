@@ -135,6 +135,12 @@ type RuntimeState struct {
 	// pairingLinkFallback is where a "Pair another device" QR code points
 	// when the dashboard runs on loopback (pairing_link.go).
 	pairingLinkFallback pairingLinkFallback
+	// hostAllowlist is the Host names the agent answers (host_guard.go);
+	// nil means defaultHostAllowlist.
+	hostAllowlist *hostAllowlist
+	// alerts is the host alert service, nil while host alerts are off
+	// (alerts_service.go).
+	alerts *alertService
 }
 
 func NewRuntimeState(settingsPath string) (*RuntimeState, error) {

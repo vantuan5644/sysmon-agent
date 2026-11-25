@@ -59,7 +59,10 @@ type NetworkSet struct {
 	Available  bool                     `json:"available"`
 	Interfaces []NetworkInterfaceMetric `json:"interfaces"`
 	Uplink     NetworkUplink            `json:"uplink"`
-	Error      string                   `json:"error,omitempty"`
+	// Latency is the internet latency prober's window (net_latency.go),
+	// absent when -latency-target is off.
+	Latency *NetworkLatency `json:"latency,omitempty"`
+	Error   string          `json:"error,omitempty"`
 }
 
 // NetworkUplink names the host's active default-route network so the NET card
@@ -100,6 +103,23 @@ type GPUMetric struct {
 	// Engines is each engine type's utilization, busiest first (gpu_engines.go).
 	// Absent when the platform reports none for this device.
 	Engines []GPUEngine `json:"engines,omitempty"`
+	// The fields below come from Linux DRM sysfs (gpu_drm_linux.go) and are
+	// absent where a platform or card does not report them.
+	// PowerLimit is the board's power cap (hwmon power1_cap).
+	PowerLimit *NumberMetric `json:"power_limit_watts,omitempty"`
+	// Clock is the current graphics (shader) clock.
+	Clock *NumberMetric `json:"clock_mhz,omitempty"`
+	// FanRPM is the card's fan speed.
+	FanRPM *NumberMetric `json:"fan_rpm,omitempty"`
+	// HotspotCritical and VRAMCritical are the driver's critical limits for
+	// the junction and memory sensors (hwmon temp*_crit).
+	HotspotCritical *NumberMetric `json:"hotspot_critical_celsius,omitempty"`
+	VRAMCritical    *NumberMetric `json:"vram_critical_celsius,omitempty"`
+	// MemoryKind is "shared" when Memory is an integrated GPU's VRAM
+	// carve-out plus GTT (system RAM the GPU maps), not dedicated VRAM.
+	MemoryKind string `json:"memory_kind,omitempty"`
+	// Integrated marks an integrated GPU (APU or Intel iGPU).
+	Integrated bool `json:"integrated,omitempty"`
 }
 
 type GPUSet struct {
@@ -161,7 +181,8 @@ type ProcessMetric struct {
 	Memory      NumberMetric `json:"memory_bytes"` // RSS/WorkingSet, unit "B"
 	GPUMemory   NumberMetric `json:"gpu_memory"`   // bytes; unavailable for non-CUDA processes
 	// GPU is the process's busiest GPU engine in percent, and GPUEngine names
-	// that engine (gpu_engines.go). Windows only.
+	// that engine (gpu_engines.go). Windows, and Linux with an AMD/Intel GPU
+	// and no NVIDIA one (drm_fdinfo_linux.go).
 	GPU       NumberMetric `json:"gpu_percent"`
 	GPUEngine string       `json:"gpu_engine,omitempty"`
 	DiskRead  NumberMetric `json:"disk_read"`  // bytes/sec
@@ -313,10 +334,16 @@ type Metrics struct {
 	GPU          GPUSet          `json:"gpu"`
 	// GPUGuard is the GPU overheat guard's state (gpu_guard.go), absent when
 	// no guard runs on this host.
-	GPUGuard             *gpuguard.State `json:"gpu_guard,omitempty"`
-	Processes            ProcessSet      `json:"processes"`
-	CollectionDurationMS int64           `json:"collection_duration_ms"`
-	CollectionErrors     []string        `json:"collection_errors,omitempty"`
+	GPUGuard *gpuguard.State `json:"gpu_guard,omitempty"`
+	// Docker is the opt-in container list (docker.go), absent unless the
+	// agent runs with -docker.
+	Docker *DockerSet `json:"docker,omitempty"`
+	// HostAlerts lists the host alert rules firing now (alerts.go), absent
+	// when host alerts are off.
+	HostAlerts           *HostAlertsSummary `json:"host_alerts,omitempty"`
+	Processes            ProcessSet         `json:"processes"`
+	CollectionDurationMS int64              `json:"collection_duration_ms"`
+	CollectionErrors     []string           `json:"collection_errors,omitempty"`
 	// CollectionNotes lists degraded fields whose cause is expected and
 	// permanent (see isExpectedStorageCondition): same "<field>: <reason>" shape
 	// as CollectionErrors, kept out of it so the issues panel only carries

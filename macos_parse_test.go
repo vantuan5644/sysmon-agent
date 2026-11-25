@@ -96,3 +96,92 @@ func TestMacNetworkLinkRowsOnly(t *testing.T) {
 		t.Fatal("missing byte columns accepted")
 	}
 }
+
+// A hand-written `ioreg -r -d 1 -w 0 -c IOAccelerator` reply in the shape an
+// Apple silicon Mac gives: one AGX accelerator, its PerformanceStatistics on
+// one line, and nested values that must not split the dictionary.
+const macIORegAGXFixture = `+-o AGXAcceleratorG13X  <class AGXAcceleratorG13X, id 0x1000004b2, registered, matched, active, busy 0 (0 ms), retain 49>
+    {
+      "IOClass" = "AGXAcceleratorG13X"
+      "CFBundleIdentifier" = "com.apple.AGXG13X"
+      "IOMatchedAtBoot" = Yes
+      "model" = "Apple M1 Pro"
+      "gpu-core-count" = 16
+      "AGXParameterBufferMaxSize" = 1073741824
+      "PerformanceStatistics" = {"In use system memory (driver)"=0,"Alloc system memory"=1610612736,"Tiler Utilization %"=31,"recoveryCount"=0,"lastRecoveryTime"=0,"Renderer Utilization %"=44,"TiledSceneBytes"=2359296,"SplitSceneCount"=0,"Allocated PB Size"=2621440,"In use system memory"=583925760,"Device Utilization %"=47}
+      "IOReportLegend" = ({"IOReportGroupName"="GPU Stats","IOReportChannels"=((5764607523034234880,1,"GPU Busy"),(5764607523034234881,1,"GPU Idle"))})
+      "AGXTraceCodeVersion" = "3.38.10"
+    }
+`
+
+func TestMacGPUReadsAppleAcceleratorStatistics(t *testing.T) {
+	const memsize = 16 << 30
+	set := parseMacGPU(macIORegAGXFixture, memsize)
+	if !set.Available || set.Error != "" || len(set.Devices) != 1 {
+		t.Fatalf("set = %+v", set)
+	}
+	gpu := set.Devices[0]
+	if gpu.Name != "Apple M1 Pro" {
+		t.Fatalf("name = %q", gpu.Name)
+	}
+	if !gpu.Usage.Available || gpu.Usage.Value != 47 || gpu.Usage.Unit != "%" {
+		t.Fatalf("usage = %+v", gpu.Usage)
+	}
+	if !gpu.Memory.Available || gpu.Memory.UsedBytes != 583925760 || gpu.Memory.TotalBytes != memsize {
+		t.Fatalf("memory = %+v", gpu.Memory)
+	}
+	if len(gpu.Engines) != 2 || gpu.Engines[0].Name != "Renderer" || gpu.Engines[0].Usage.Value != 44 ||
+		gpu.Engines[1].Name != "Tiler" || gpu.Engines[1].Usage.Value != 31 {
+		t.Fatalf("engines = %+v", gpu.Engines)
+	}
+	for name, metric := range map[string]NumberMetric{"power": gpu.Power, "temperature": gpu.Temperature, "hotspot": gpu.HotspotTemperature, "vram": gpu.VRAMTemperature} {
+		if metric.Available || metric.Error == "" {
+			t.Errorf("%s must stay unavailable with a reason: %+v", name, metric)
+		}
+	}
+}
+
+func TestMacGPUDegradesPerField(t *testing.T) {
+	// No model: an AGX class is still the Apple GPU. Only the allocation is
+	// reported, and the busy share is missing.
+	output := "+-o AGXAcceleratorG14G  <class AGXAcceleratorG14G, id 0x1, registered>\n" +
+		"  {\n    \"PerformanceStatistics\" = {\"Alloc system memory\"=2048,\"Tiler Utilization %\"=150}\n  }\n" +
+		"+-o IntelAccelerator  <class IntelAccelerator, id 0x2, registered>\n  {\n    \"IOClass\" = \"IntelAccelerator\"\n  }\n"
+	set := parseMacGPU(output, 0)
+	if !set.Available || len(set.Devices) != 2 {
+		t.Fatalf("set = %+v", set)
+	}
+	apple, other := set.Devices[0], set.Devices[1]
+	if apple.Name != "Apple GPU" || apple.Usage.Available || apple.Usage.Error == "" {
+		t.Fatalf("apple = %+v", apple)
+	}
+	if apple.Memory.Available || apple.Memory.Error == "" {
+		t.Fatalf("memory without hw.memsize must be unavailable: %+v", apple.Memory)
+	}
+	if len(apple.Engines) != 1 || apple.Engines[0].Usage.Value != 100 {
+		t.Fatalf("engine percent must clamp: %+v", apple.Engines)
+	}
+	if other.Name != "IntelAccelerator" || other.Usage.Available || other.Memory.Available {
+		t.Fatalf("accelerator without statistics = %+v", other)
+	}
+
+	if set := parseMacGPU("", 1); set.Available || set.Error == "" {
+		t.Fatalf("no accelerator must be an error: %+v", set)
+	}
+}
+
+func TestMacIORegDictKeepsNestedValuesWhole(t *testing.T) {
+	got := parseMacIORegDict(`{"a"=1,"b,c"="x=y,z","d"=({"e"=1,"f"=2}),"g"=<0a0b>}`)
+	want := map[string]string{"a": "1", "b,c": `"x=y,z"`, "d": `({"e"=1,"f"=2})`, "g": "<0a0b>"}
+	if len(got) != len(want) {
+		t.Fatalf("dict = %v", got)
+	}
+	for key, value := range want {
+		if got[key] != value {
+			t.Errorf("%q = %q, want %q", key, got[key], value)
+		}
+	}
+	if parseMacIORegDict("12") != nil {
+		t.Fatal("a scalar is not a dictionary")
+	}
+}

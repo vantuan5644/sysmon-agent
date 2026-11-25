@@ -19,6 +19,9 @@ type DeviceActivity struct {
 	ObservedAt time.Time `json:"observed_at"`
 	Coverage   string    `json:"coverage,omitempty"`
 	Error      string    `json:"error,omitempty"`
+	// Apps names the processes holding the device while it is active
+	// (device_activity_apps.go). Absent when idle, unknown, or unnamed.
+	Apps []DeviceApp `json:"apps,omitempty"`
 }
 
 type DeviceActivitySet struct {

@@ -543,7 +543,7 @@ function partialGPUFallbackMetrics() {
 function sampleStatus() {
   return {
     status: "ok",
-    dashboard_build: "sysmon-static-v178",
+    dashboard_build: "sysmon-static-v179",
     started_at: new Date(Date.now() - 3720 * 1000).toISOString(),
     uptime_seconds: 3720,
     os: "linux",
@@ -561,7 +561,7 @@ function sampleObservedStatus(clientCheck = {}) {
   const check = {
     seen: true,
     last_seen: new Date(fakeNow - 12_000).toISOString(),
-    dashboard_build: "sysmon-static-v178",
+    dashboard_build: "sysmon-static-v179",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1154,6 +1154,93 @@ assert(document.getElementById("netName").textContent === "BiBi-Pro-Max" && icon
   assert(document.getElementById("netName").textContent === "" && document.getElementById("netName").children.length === 0, "an absent uplink did not leave the NET identity line blank");
   context.render(sampleMetrics());
 }
+// Internet latency (net_latency.go) rides after the uplink name in its own
+// span, with the window in the tooltip, and leaves the plain line when absent.
+{
+  const netName = document.getElementById("netName");
+  const probed = sampleMetrics();
+  probed.network.latency = {
+    available: true, target: "1.1.1.1:443", method: "tcp-connect", interval_seconds: 5, window_seconds: 300,
+    last_ms: { available: true, value: 12.4, unit: "ms" },
+    avg_ms: { available: true, value: 13.6, unit: "ms" },
+    min_ms: { available: true, value: 4.25, unit: "ms" },
+    max_ms: { available: true, value: 31, unit: "ms" },
+    loss_percent: { available: true, value: 0, unit: "%" },
+    probes: 60, failures: 0, updated_at: new Date(fakeNow).toISOString(),
+  };
+  context.render(probed);
+  assert(netName.textContent === "BiBi-Pro-Max \u00b7 12 ms" && iconOf(netName) === "wifi", `NET line with latency = ${JSON.stringify(netName.textContent)}`);
+  assert(netName.classList.contains("has-latency"), "NET line with latency lost its flex class");
+  const latencySpan = netName.children[netName.children.length - 1];
+  assert(latencySpan.className === "net-latency", `latency span class = ${latencySpan.className}`);
+  assert(netName.title.includes("TCP connect to 1.1.1.1:443") && netName.title.includes("avg 14 ms, min 4.3, max 31") && netName.title.includes("Loss 0% of 60 probes"), `latency title = ${netName.title}`);
+  const firstSpan = latencySpan;
+  context.render(probed);
+  assert(netName.children[netName.children.length - 1] === firstSpan, "an unchanged latency rebuilt the aria-live NET line");
+
+  probed.network.latency.loss_percent = { available: true, value: 3.3, unit: "%" };
+  probed.network.latency.failures = 2;
+  context.render(probed);
+  assert(netName.textContent.endsWith("12 ms \u00b7 3.3% loss"), `NET line with loss = ${netName.textContent}`);
+  assert(netName.children[netName.children.length - 1].className === "net-latency warn", "loss did not colour the latency warn");
+
+  probed.network.latency.last_ms = { available: false, unit: "ms", error: "connection refused" };
+  context.render(probed);
+  assert(netName.textContent.endsWith("\u00b7 no reply") && netName.children[netName.children.length - 1].className === "net-latency crit", `NET line after a failed probe = ${netName.textContent}`);
+  assert(netName.title.includes("Last probe failed: connection refused"), `failed probe title = ${netName.title}`);
+
+  probed.network.uplink = { available: false };
+  context.render(probed);
+  assert(netName.textContent === "no reply", `latency without an uplink = ${JSON.stringify(netName.textContent)}`);
+
+  // Before the first probe, and with the prober off, the line is the uplink alone.
+  const waiting = sampleMetrics();
+  waiting.network.latency = { available: false, target: "1.1.1.1:443", method: "tcp-connect", interval_seconds: 5, window_seconds: 300, probes: 0, failures: 0, error: "waiting for the first probe" };
+  context.render(waiting);
+  assert(netName.textContent === "BiBi-Pro-Max" && !netName.classList.contains("has-latency") && netName.title === "", "a waiting prober changed the NET line");
+  context.render(sampleMetrics());
+  assert(netName.textContent === "BiBi-Pro-Max" && netName.dataset.latency === undefined, "no latency did not restore the plain NET line");
+}
+// Docker containers (docker.go): a "More status" panel only with -docker.
+{
+  const panel = document.getElementById("dockerPanel");
+  const list = document.getElementById("dockerList");
+  const summary = document.getElementById("dockerSummary");
+  assert(panel.hidden === true, "Docker panel showed without metrics.docker");
+  const withDocker = sampleMetrics();
+  withDocker.docker = {
+    available: true, endpoint: "unix:///var/run/docker.sock", total: 3, running: 2, updated_at: "2026-11-25T10:00:00Z",
+    containers: [
+      { id: "0123456789ab", name: "web", image: "nginx:latest", state: "running", status: "Up 6 days (healthy)", health: "healthy", uptime_seconds: 518400,
+        cpu_percent: { available: true, value: 92.4, unit: "%" },
+        memory: { available: true, used_bytes: 209715200, total_bytes: 1073741824, percent: 19.53 } },
+      { id: "123456789abc", name: "db", image: "postgres:17", state: "running", status: "Up 2 weeks", uptime_seconds: 1209600,
+        cpu_percent: { available: false, unit: "%", error: "CPU is warming up" },
+        memory: { available: true, used_bytes: 52428800, total_bytes: 2147483648, percent: 2.44 } },
+      { id: "23456789abcd", name: "old", image: "busybox", state: "exited", status: "Exited (0) 2 hours ago",
+        cpu_percent: { available: false, unit: "%", error: "container is exited" },
+        memory: { available: false, error: "container is exited" } },
+    ],
+  };
+  context.render(withDocker);
+  assert(panel.hidden === false && summary.textContent === "2/3 running", `Docker panel summary = ${summary.textContent}`);
+  assert(list.children.length === 3, `Docker rows = ${list.children.length}`);
+  const [web, db, old] = list.children;
+  assert(web.textContent.startsWith("web92%") && web.textContent.includes("healthy \u00b7 Up 6 days \u00b7 nginx:latest") && !web.textContent.includes("(healthy)"), `web row = ${web.textContent}`);
+  assert(web.textContent.endsWith("nginx:latest200 MB / 1.0 GB"), `web memory = ${web.textContent}`);
+  assert(web.children[0].children[1].style.color === "var(--bad)", `busy container CPU colour = ${web.children[0].children[1].style.color}`);
+  assert(db.textContent.startsWith("db--") && db.children[0].children[1].title === "CPU is warming up", `db row = ${db.textContent}`);
+  assert(old.className === "docker-row stopped" && old.textContent.includes("Exited (0) 2 hours ago \u00b7 busybox"), `exited row = ${old.className} ${old.textContent}`);
+  const firstRow = list.children[0];
+  context.render(withDocker);
+  assert(list.children[0] === firstRow, "an unchanged Docker pass rebuilt the rows");
+
+  withDocker.docker = { available: false, endpoint: "unix:///var/run/docker.sock", total: 0, running: 0, updated_at: "2026-11-25T10:00:15Z", error: "permission denied on /var/run/docker.sock: the agent's account needs read access" };
+  context.render(withDocker);
+  assert(panel.hidden === false && summary.textContent === "unavailable" && list.textContent.startsWith("permission denied"), `Docker error = ${summary.textContent} ${list.textContent}`);
+  context.render(sampleMetrics());
+  assert(panel.hidden === true && list.children.length === 0, "Docker panel stayed after metrics.docker went away");
+}
 assert(document.getElementById("storagePanel").hidden === false, "storage panel did not show for available devices");
 assert(document.getElementById("storageSummary").textContent === "3 drives", "storage panel summary did not render drive count");
 {
@@ -1316,7 +1403,7 @@ assert(document.getElementById("agentMeta").textContent === "up 0m / memory / ap
 context.renderStatus({ ...sampleStatus(), dashboard_build: "sysmon-static-v99" });
 assert(document.getElementById("issuesPanel").hidden === false, "stale dashboard build did not show issues panel");
 assert(document.getElementById("issuesSummary").textContent === "1 issue", "stale dashboard build issue count did not render");
-assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v178, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "dashboard build stale: app sysmon-static-v179, server sysmon-static-v99; tap status strip to refresh app or re-add Home Screen app", "stale dashboard build issue did not render");
 // A stale shell now self-heals: detecting the mismatch is enough, no tap
 // required. (The tap remains as a manual fallback.) The refresh is
 // fire-and-forget from a synchronous render, so drain more than one turn.
@@ -1364,7 +1451,7 @@ assert(document.getElementById("agentMeta").textContent === "up 1h 2m / saved / 
 assert(document.getElementById("issuesPanel").hidden === true, "matching dashboard build did not clear stale-build issue");
 context.renderStatus(sampleObservedStatus({ dashboard_build: "sysmon-static-v80" }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check build did not show issues panel");
-assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v178; reload or re-add Home Screen app", "stale client-check build issue did not render");
+assert(document.getElementById("issuesList").children[0].textContent === "latest client check stale: client sysmon-static-v80, app sysmon-static-v179; reload or re-add Home Screen app", "stale client-check build issue did not render");
 context.renderStatus(sampleStatus());
 context.renderStatus(sampleObservedStatus({ last_seen: new Date(fakeNow - 120_000).toISOString() }));
 assert(document.getElementById("issuesPanel").hidden === false, "stale client-check timestamp did not show issues panel");
@@ -1374,7 +1461,7 @@ context.renderStatus({
   client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 1_000).toISOString(),
-    dashboard_build: "sysmon-static-v178",
+    dashboard_build: "sysmon-static-v179",
     user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0",
     viewport_width: 1440,
     viewport_height: 900,
@@ -1384,7 +1471,7 @@ context.renderStatus({
   device_client_check: {
     seen: true,
     last_seen: new Date(fakeNow - 120_000).toISOString(),
-    dashboard_build: "sysmon-static-v178",
+    dashboard_build: "sysmon-static-v179",
     user_agent: "Mozilla/5.0 iPhone Mobile Safari",
     viewport_width: 390,
     viewport_height: 844,
@@ -1519,7 +1606,7 @@ assert(context.intervalCountForDelay(60000) === 1, "visible dashboard did not re
 assert(context.intervalCountForDelay(30000) === 1, "visible dashboard did not register the client-check timer");
 assert(context.intervalCountForDelay(5000) === 1, "visible dashboard did not register the stale-sample timer");
 assert(initialPassiveClientCheck.viewport_width === 390, "client check did not include viewport width");
-assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v178", "client check did not include current dashboard build");
+assert(initialPassiveClientCheck.dashboard_build === "sysmon-static-v179", "client check did not include current dashboard build");
 assert(initialPassiveClientCheck.viewport_height === 844, "client check did not include viewport height");
 assert(initialPassiveClientCheck.screen_width === 390, "client check did not include screen width");
 assert(initialPassiveClientCheck.screen_height === 844, "client check did not include screen height");
@@ -1593,6 +1680,64 @@ assert(!expiredCodexRow.children[1].children[0].style.values.has("--w"), "expire
 assert(expiredCodexRow.children[2].textContent.includes("window expired"), "expired quota did not explain its state");
 fakeNow = usageFreshnessClock;
 context.renderCodexUsage(sampleCodexUsageConfigured());
+// Pace forecast: quotaPace is pure, so every branch is pinned against a
+// fixed clock. A 5-hour window resetting in `left` ms has used `percent`.
+{
+  const paceNow = Date.parse("2026-08-19T12:00:00.000Z");
+  const hour = 3_600_000;
+  const session = (percent, left, extra = {}) => ({
+    id: "five_hour",
+    label: "Session (5h)",
+    percent,
+    resets_at: new Date(paceNow + left).toISOString(),
+    window_seconds: 18000,
+    ...extra,
+  });
+  const pace = (row) => context.quotaPace(row, paceNow);
+  // 50% used with 1h of 5h gone: at that rate the other 50% takes one more
+  // hour, well before the reset in 4h.
+  assert(pace(session(50, 4 * hour))?.text === "full in 1h00m", `fast session pace = ${JSON.stringify(pace(session(50, 4 * hour)))}`);
+  assert(pace(session(50, 4 * hour)).tone === "warn", "a window filling before its reset was not a warning");
+  assert(pace(session(100, 2 * hour))?.text === "limit reached" && pace(session(100, 2 * hour)).tone === "bad", "a full window did not read limit reached");
+  assert(pace(session(104, 2 * hour))?.text === "limit reached", "an over-full window did not read limit reached");
+  // 45% at 50% elapsed ends near 90%: on pace. 10% at 50% elapsed: plenty.
+  assert(pace(session(45, 2.5 * hour))?.text === "on pace", `on-pace session = ${JSON.stringify(pace(session(45, 2.5 * hour)))}`);
+  assert(pace(session(10, 2.5 * hour))?.text === "plenty left", "a light window did not read plenty left");
+  assert(pace(session(10, 2.5 * hour)).tone === "calm", "plenty left took a warning tone");
+  // Quiet early in the window, under 1% used, and with no usable timing.
+  assert(pace(session(30, 4.9 * hour)) === null, "pace spoke in the first 4% of the window");
+  assert(pace(session(0.5, 2 * hour)) === null, "pace spoke under 1% used");
+  assert(pace(session(50, -60_000)) === null, "pace spoke for an expired window");
+  assert(pace(session(50, 6 * hour)) === null, "pace trusted a reset further out than the window");
+  assert(pace(session(50, 2 * hour, { resets_at: "" })) === null, "pace spoke without a reset time");
+  assert(pace({ id: "credits", label: "Usage credits", percent: 90, resets_at: new Date(paceNow + hour).toISOString() }) === null, "credits got a pace forecast");
+  // Older agents send no window_seconds: infer it from the id or label.
+  assert(pace(session(50, 4 * hour, { window_seconds: undefined }))?.text === "full in 1h00m", "five_hour window length was not inferred");
+  const week = 7 * 24 * hour;
+  // 3.5 days into a week at 70%: the last 30% takes 36 hours (hours under 48).
+  assert(pace({ id: "weekly_fable", label: "Weekly (Fable)", percent: 70, resets_at: new Date(paceNow + week / 2).toISOString() })?.text === "full in 36h00m", "weekly pace was not inferred from a weekly_ id");
+  // 3.5 days in at 60%: the last 40% takes 56 hours, shown in days.
+  assert(pace({ id: "secondary", label: "Weekly", percent: 60, resets_at: new Date(paceNow + week / 2).toISOString() })?.text === "full in 2d", "Codex weekly label was not inferred");
+  assert(pace({ id: "primary", label: "Session (5h)", percent: 10, resets_at: new Date(paceNow + 4 * hour).toISOString() })?.text === "plenty left", "Codex session label was not inferred");
+  assert(context.quotaDurationLabel(42 * 60_000) === "42m" && context.quotaDurationLabel(30_000) === "1m", "short pace durations misformatted");
+  // Rendered beside the reset countdown, in its own toned span.
+  const pacedClock = fakeNow;
+  fakeNow = paceNow;
+  context.renderQuota({ ...sampleQuotaConfigured(), rows: [session(50, 4 * hour), session(10, 2.5 * hour, { id: "seven_day", label: "Weekly (all)", window_seconds: 5 * 3600 })] });
+  const pacedRow = document.getElementById("quotaList").children[0];
+  assert(pacedRow.children[2].textContent === "resets in 4h00m \u00b7 full in 1h00m", `paced row note = ${JSON.stringify(pacedRow.children[2].textContent)}`);
+  const paceSpan = pacedRow.children[2].children.find((child) => typeof child === "object");
+  assert(paceSpan?.classList.contains("quota-pace") && paceSpan.classList.contains("quota-pace-warn"), "pace forecast did not render in a warning span");
+  assert(document.getElementById("quotaList").children[1].children[2].textContent === "resets in 2h30m \u00b7 plenty left", "calm pace did not render beside the countdown");
+  // The 60 s tick re-renders it: as time passes the forecast moves on.
+  fakeNow = paceNow + hour;
+  context.refreshUsageFreshness();
+  assert(document.getElementById("quotaList").children[0].children[2].textContent.startsWith("resets in 3h00m \u00b7 full in"), "held rows did not refresh the pace forecast");
+  fakeNow = pacedClock;
+  context.renderQuota(sampleQuotaConfigured());
+  // The sample rows (resets in 2026, clock in 1970) carry no forecast.
+  assert(!document.getElementById("quotaList").children[0].children[2].textContent.includes("full in"), "sample row forecast with an inconsistent clock");
+}
 // Resuming the PWA refreshes the usage page immediately. It owns no timer, so
 // without this a backgrounded phone rendered its last-fetched quota until the
 // 60 s status tick came round.
@@ -2701,7 +2846,151 @@ const abortTimeout = context.fetchWithTimeout("/api/metrics", { cache: "no-store
 runTimeouts();
 assert(await abortTimeout === "Request timed out", "fetch timeout race did not reject when abort was ignored");
 assert(abortCalls === 1, "fetch timeout did not call AbortController.abort");
+
+// The deadline covers the body too: fetch resolves at the headers, and a body
+// that then stalls must not leave response.json() (and a caller's in-flight
+// flag) pending forever.
+abortCalls = 0;
+context.fetch = async () => ({ ok: true, status: 200, json: () => new Promise(() => {}) });
+const stalledResponse = await context.fetchWithTimeout("/api/metrics", { cache: "no-store" }, 25);
+assert(abortCalls === 0, "fetch timeout aborted a request whose headers arrived in time");
+const stalledBody = stalledResponse.json().then(
+  () => "resolved",
+  (error) => error.message,
+);
+runTimeouts();
+assert(await stalledBody === "Request timed out", "a stalled response body did not time out");
+assert(abortCalls === 1, "a stalled response body did not abort the request");
+
+abortCalls = 0;
+context.fetch = async () => response({ hostname: "labbox" });
+const timelyResponse = await context.fetchWithTimeout("/api/metrics", { cache: "no-store" }, 25);
+const timelyBody = await timelyResponse.json();
+assert(timelyBody.hostname === "labbox", "a timely response body was not passed through");
+runTimeouts();
+assert(abortCalls === 0, "a read body left its timeout armed");
+
+context.fetch = async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError("bad json"); } });
+const badBody = await (await context.fetchWithTimeout("/api/metrics", { cache: "no-store" }, 25)).json().then(
+  () => "resolved",
+  (error) => error.message,
+);
+assert(badBody === "bad json", `a body parse error was replaced by ${badBody}`);
+context.fetch = async () => new Promise(() => {});
 context.AbortController = originalAbortController;
+
+// Script error banner: app.js reports its own exceptions and unhandled
+// rejections in one #scriptError banner, the first message kept and later
+// ones counted, and leaves network failures and other origins' errors alone.
+{
+  const banner = document.getElementById("scriptError");
+  const text = document.getElementById("scriptErrorText");
+  const more = document.getElementById("scriptErrorMore");
+  assert(context.sysmonScriptErrors === true, "app.js did not take over script error reporting from boot.js");
+  assert(context.sysmonDashboardStarted === true, "app.js did not tell boot.js's watchdog it started");
+  // The DOM mock does not read the hidden attribute (static_test.go pins it
+  // on #scriptError); nothing on a healthy load showed it, so start hidden.
+  assert(text.textContent === "", "the script error banner was filled on a healthy load");
+  banner.hidden = true;
+  for (const ignorable of [
+    ["error", { target: { tagName: "IMG" }, message: "" }],
+    ["error", { message: "Script error." }],
+    ["error", { message: "ResizeObserver loop completed with undelivered notifications." }],
+    ["unhandledrejection", { reason: { name: "TypeError", message: "Failed to fetch" } }],
+    ["unhandledrejection", { reason: new Error("Request timed out") }],
+    ["unhandledrejection", { reason: { name: "AbortError", message: "The operation was aborted." } }],
+  ]) {
+    context.dispatchWindow(...ignorable);
+  }
+  assert(banner.hidden === true, "a network failure or another origin's error showed the script error banner");
+  context.dispatchWindow("error", { message: "Uncaught TypeError: x is undefined", error: new TypeError("x is undefined") });
+  assert(banner.hidden === false, "an uncaught exception did not show the script error banner");
+  assert(text.textContent === "Dashboard script error: Uncaught TypeError: x is undefined — ", `banner read ${text.textContent}`);
+  context.dispatchWindow("error", { message: "Uncaught TypeError: x is undefined", error: new TypeError("x is undefined") });
+  assert(more.textContent === "", "a repeated error was counted again");
+  context.dispatchWindow("unhandledrejection", { reason: new Error("render failed") });
+  context.dispatchWindow("unhandledrejection", { reason: "plain reason" });
+  assert(more.textContent === " (+2 more)", `later errors were not counted: ${more.textContent}`);
+  assert(text.textContent.includes("x is undefined"), "a later error replaced the first message");
+  const reloadsBefore = reloadCount;
+  await document.getElementById("scriptErrorReload").click();
+  assert(reloadCount === reloadsBefore + 1, "the banner's reload button did not reload");
+  banner.hidden = true;
+  banner.dataset = {};
+  more.textContent = "";
+}
+
+// boot.js runs before app.js in its own right: it reports app.js failing to
+// load, an error before app.js takes over, and a dashboard that never starts.
+{
+  const bootJS = readFileSync(new URL("./static/boot.js", import.meta.url), "utf8");
+  function runBoot() {
+    const bootDocument = new Document(html);
+    bootDocument.getElementById("scriptError").hidden = true;
+    const listeners = new Map();
+    const timeouts = [];
+    let reloads = 0;
+    const bootContext = {
+      document: bootDocument,
+      location: { reload: () => { reloads += 1; } },
+      addEventListener: (name, callback) => {
+        listeners.set(name, [...(listeners.get(name) || []), callback]);
+      },
+      setTimeout: (callback, delay) => {
+        timeouts.push({ callback, delay });
+        return timeouts.length;
+      },
+    };
+    bootContext.window = bootContext;
+    vm.runInNewContext(bootJS, bootContext, { filename: "static/boot.js" });
+    return {
+      context: bootContext,
+      fire: (name, event) => (listeners.get(name) || []).forEach((callback) => callback(event)),
+      runTimeouts: () => timeouts.splice(0).forEach((entry) => entry.callback()),
+      timeouts,
+      reloads: () => reloads,
+      banner: () => bootDocument.getElementById("scriptError"),
+      text: () => bootDocument.getElementById("scriptErrorText").textContent,
+      more: () => bootDocument.getElementById("scriptErrorMore").textContent,
+      ready: () => bootDocument.dispatch("DOMContentLoaded"),
+    };
+  }
+
+  const failedLoad = runBoot();
+  failedLoad.fire("error", { target: { tagName: "SCRIPT", getAttribute: (name) => (name === "src" ? "/app.js" : null) } });
+  assert(failedLoad.banner().hidden === false && failedLoad.text() === "Dashboard script error: could not load /app.js — ", `boot.js on a failed app.js load: ${failedLoad.text()}`);
+  failedLoad.fire("error", { target: { tagName: "LINK" }, message: "" });
+  assert(failedLoad.more() === "", "boot.js counted a stylesheet or image load failure as a script error");
+  await failedLoad.context.document.getElementById("scriptErrorReload").click();
+  assert(failedLoad.reloads() === 1, "boot.js's reload button did not reload");
+  failedLoad.ready();
+  assert(failedLoad.timeouts.length === 1 && failedLoad.timeouts[0].delay === 10000, "boot.js did not arm a 10 s watchdog at DOMContentLoaded");
+  failedLoad.runTimeouts();
+  assert(failedLoad.more() === " (+1 more)", "boot.js's watchdog did not add to the banner already up");
+
+  const foreign = runBoot();
+  foreign.fire("error", { message: "Script error." });
+  assert(foreign.banner().hidden === true, "boot.js reported another origin's opaque script error");
+
+  const parseError = runBoot();
+  parseError.fire("error", { message: "Uncaught SyntaxError: Unexpected token '}'" });
+  assert(parseError.text() === "Dashboard script error: Uncaught SyntaxError: Unexpected token '}' — ", `boot.js on an app.js parse error: ${parseError.text()}`);
+
+  const neverStarted = runBoot();
+  assert(neverStarted.timeouts.length === 0, "boot.js armed its watchdog before DOMContentLoaded");
+  neverStarted.ready();
+  neverStarted.runTimeouts();
+  assert(neverStarted.text() === "Dashboard script error: the dashboard did not start — ", `boot.js watchdog: ${neverStarted.text()}`);
+
+  const healthy = runBoot();
+  healthy.context.sysmonScriptErrors = true;
+  healthy.fire("error", { message: "Uncaught Error: app.js reports this one" });
+  healthy.fire("unhandledrejection", { reason: new Error("and this one") });
+  healthy.ready();
+  healthy.context.sysmonDashboardStarted = true;
+  healthy.runTimeouts();
+  assert(healthy.banner().hidden === true, "boot.js reported an error app.js owns, or its watchdog fired on a started dashboard");
+}
 
 // App details page: the third pager page renders the per-process table,
 // supports the Apps/Processes toggle, and re-sorts on a header tap. Drive the
@@ -3034,7 +3323,28 @@ for (const id of ["micCtl", "cameraCtl"]) {
   assert(!document.getElementById(id).classList.contains("activity-active"), `${id} animated stale or unknown data`);
   assert(!document.getElementById(id).classList.contains("activity-idle"), `${id} represented unknown data as idle`);
 }
+// The holder's name replaces "Busy"; extra holders show as a count, and a
+// sound server named alone says the app behind it is unknown.
+context.renderDeviceActivity({
+  ...liveDevices,
+  microphone: { state: "active", observed_at: activityNow, apps: [{ pid: 42, name: "Zoom" }, { name: "firefox" }, { name: "obs" }] },
+  camera: { state: "active", observed_at: activityNow, apps: [{ pid: 7, name: "pipewire", sound_server: true }] },
+}, activityNow);
+assert(document.getElementById("micCtlUsage").textContent === "Zoom +2", "microphone holder name missing");
+assert(document.getElementById("micCtlUsage").title === "in use by Zoom, firefox, obs", "microphone holder list missing from title");
+assert(document.getElementById("micCtl").getAttribute("aria-label").includes("in use by Zoom, firefox, obs"), "holders missing from accessible label");
+assert(document.getElementById("micCtl").title.startsWith("In use by Zoom"), "holders missing from button title");
+assert(document.getElementById("cameraCtlUsage").textContent === "pipewire", "sound-server holder missing");
+assert(document.getElementById("cameraCtlUsage").title.includes("not identified"), "sound-server holder claimed to be the app");
+assert(document.getElementById("deviceActivityStatus").textContent.startsWith("Microphone: in use by Zoom, firefox, obs. Camera: in use through pipewire"), "holders missing from announcement");
+context.renderDeviceActivity({
+  ...liveDevices,
+  microphone: { state: "idle", observed_at: activityNow, apps: [{ name: "Zoom" }] },
+}, activityNow);
+assert(document.getElementById("micCtlUsage").textContent === "Idle", "idle microphone named a holder");
 context.renderDeviceActivity(liveDevices, activityNow);
+assert(document.getElementById("micCtlUsage").textContent === "Busy", "holder name outlived its reading");
+assert(document.getElementById("cameraCtlUsage").textContent === "Busy", "camera holder name outlived its reading");
 // Host clocks ahead or behind the browser must keep fresh idle borders stable.
 for (const offset of [-3600000, 3600000]) {
   const hostTime = new Date(Date.now() + offset).toISOString();
@@ -3240,7 +3550,7 @@ assert(!document.getElementById("micCtl").classList.contains("activity-active"),
   };
   const hostsPayload = {
     hosts: [
-      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v178" },
+      { id: "local", name: "labbox", self: true, source: "local", online: true, os: "linux", dashboard_build: "sysmon-static-v179" },
       { id: "peer", name: "peer", source: "tailscale", online: true, os: "windows", dashboard_build: "sysmon-static-v99", address: "peer.tailnet.example:9443" },
       { id: "gone", name: "gone", source: "configured", online: false, error: "dial: connection refused" },
     ],

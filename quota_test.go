@@ -503,8 +503,13 @@ func TestQuotaPoller429BacksOff(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "rate limited") {
 		t.Fatalf("429 err = %v, want rate limited", err)
 	}
-	if backoff != quotaPollBackoffOn429 {
-		t.Fatalf("429 backoff = %v, want %v", backoff, quotaPollBackoffOn429)
+	// No Retry-After: the first failure waits the normal cadence (the 1-minute
+	// first step of the backoff is floored at the interval), never less.
+	if backoff != quotaPollInterval {
+		t.Fatalf("429 backoff = %v, want %v", backoff, quotaPollInterval)
+	}
+	if calls != 1 {
+		t.Fatalf("usage endpoint called %d times, want 1", calls)
 	}
 	// The failure is surfaced (the files keep serving) but no live rows exist.
 	status := checker.Status(time.Now())
@@ -536,8 +541,10 @@ func TestQuotaPoller401ReportsTokenRejected(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "token rejected") {
 		t.Fatalf("401 err = %v, want the token-rejected message", err)
 	}
-	if backoff != 0 {
-		t.Fatalf("401 backoff = %v, want 0 (retry at the normal cadence)", backoff)
+	// The credentials file is re-read every minute; the rejected token itself
+	// is held back (TestQuotaPollerHoldsBackRejectedToken).
+	if backoff != quotaTokenRecheck {
+		t.Fatalf("401 backoff = %v, want %v (re-read the credentials file)", backoff, quotaTokenRecheck)
 	}
 	status := checker.Status(time.Now())
 	if !strings.Contains(status.Error, "token rejected") || !strings.Contains(status.Error, "run any Claude Code session") {

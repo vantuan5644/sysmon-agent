@@ -563,6 +563,7 @@ report "build=pass"
 
 if command -v node >/dev/null 2>&1; then
     echo "Checking dashboard JavaScript..."
+    node --check static/boot.js
     node --check static/app.js
     node --check static/sw.js
     node verify-dashboard.mjs

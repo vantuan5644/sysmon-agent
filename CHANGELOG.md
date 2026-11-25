@@ -4,6 +4,84 @@ Versions are plain numbers. What each one changes is written here, not in its na
 The full notes of a published release are on its
 [GitHub release page](https://github.com/vantuan5644/sysmon-agent/releases).
 
+## 0.2.9 (2026-11-25)
+
+Host alerts that reach you with no dashboard open, Docker containers, internet
+latency, much richer AMD, Intel and Apple GPU readings, and a guard against DNS
+rebinding. Dashboard build v178 to v179.
+
+### New
+
+- **Host alerts and push notifications.** The agent can notify you when something
+  stays wrong while no dashboard is open: CPU or memory use, GPU or CPU temperature,
+  any temperature sensor, free space on a mount, or a new agent release. Each rule has
+  a hold time (15 s), a release time with hysteresis (4 s), a cooldown (10 min) and an
+  optional resolved notice. Notices go to ntfy (with an optional token), to a JSON
+  webhook, or to paired browsers through Web Push, implemented with the standard
+  library only (RFC 8291 and 8292). Configure it with `-alert-*`, `-ntfy-url`,
+  `-alert-webhook-url` and `-web-push` (or their `SYSMON_*` variables), or with
+  `alerts.json` beside the settings file. It is off by default. `GET /api/alerts`
+  shows rules, active alerts and delivery without secrets, and page 2 of the dashboard
+  gains "Notify this device" and "Send test".
+- **Docker containers.** `-docker` (`SYSMON_DOCKER`) adds a Containers panel with each
+  container's state, health, uptime, CPU and memory, read from the Docker Engine API
+  every 15 s while a dashboard is open. The agent only reads: it never starts, stops
+  or executes anything. The endpoint is `-docker-host` (`SYSMON_DOCKER_HOST`), else
+  `DOCKER_HOST`, else the platform's default socket; Windows needs a `tcp://`
+  endpoint. Reading the Docker socket needs the `docker` group, which is equivalent to
+  root on that host, so grant it knowingly.
+- **Internet latency.** The NET card shows the internet round trip beside the uplink
+  name: a TCP connect to `-latency-target` (`SYSMON_LATENCY_TARGET`, default
+  `1.1.1.1:443`, `off` disables) every 5 s while someone is watching.
+  `metrics.network.latency` reports the last, average, minimum and maximum round trip
+  and the loss over the last five minutes.
+- **Quota pace forecast.** The AI page forecasts each 5-hour and weekly window beside
+  its reset countdown: "full in 1h20m" when the pace so far would fill it before it
+  resets, "limit reached" at 100%, otherwise "on pace" or "plenty left". It stays quiet
+  for the first 4% of a window and under 1% used. Quota rows gain `window_seconds`.
+- **Linux AMD and Intel GPUs report much more.** A real model name (from
+  `product_name` or pci.ids), power with its limit, edge, hotspot and VRAM temperatures
+  with their critical values, the shader clock, fan speed, and shared VRAM plus GTT
+  memory on APUs. Discrete cards are listed before integrated ones, and a sleeping card
+  reads idle without being woken. A bounded DRM fdinfo sampler, with no subprocesses,
+  gives Intel GPUs a usage figure, shows per-engine load, and fills the process table's
+  GPU column on Linux. New optional fields: `power_limit_watts`, `clock_mhz`, `fan_rpm`,
+  `hotspot_critical_celsius`, `vram_critical_celsius`, `memory_kind`, `integrated`.
+- **Apple silicon GPU on macOS.** Usage, Renderer and Tiler load, and in-use memory
+  (out of physical memory, which the GPU shares), read from the IORegistry without
+  privileges. GPU power and temperature remain unavailable.
+- **The mic and camera indicators name the app using them.** `device_activity.*.apps`
+  lists the holding processes by name (never command lines), up to five. On Linux they
+  come from PipeWire or PulseAudio capture clients, ALSA capture owners and
+  `/dev/video*` holders; when only the sound server is found it is reported as such
+  instead of a guessed client. On Windows they come from Core Audio capture sessions
+  and the privacy records. The dashboard shows the first name in place of "Busy".
+
+### Fixed
+
+- **The agent answers only host names it knows**, a guard against DNS rebinding.
+  Allowed without configuration: IP addresses, `localhost`, `*.local`, `*.ts.net`, the
+  machine's hostname, a `-bind` name and the `-mdns-name` label. Any other name gets
+  421 Misdirected Request naming the new `-allowed-hosts` flag (`SYSMON_ALLOWED_HOSTS`;
+  comma-separated, `*.example.org` allows every name below it). **If you reach an agent
+  through another DNS name, add it with `-allowed-hosts` before upgrading.**
+- **A stalled response body no longer freezes the dashboard.** Requests now time out on
+  the body as well as the headers, so a body that stops arriving no longer stops
+  metrics polling until a reload.
+- **A failed update check is retried within minutes**: 15 minutes, backing off to at
+  most 4 hours, instead of waiting a full day.
+- **The dashboard says when its own script fails.** A "Dashboard script error … —
+  reload" banner appears when the script fails to load, fails to parse, throws, or does
+  not start within 10 seconds.
+- **The live quota pollers are gentler and survive restarts.** The Claude poller backs
+  off 1, 2, 4, 8, then 15 minutes after failures, never faster than its 5-minute
+  cadence, and honours a 429's `Retry-After` up to an hour. After a 401 or 403 it does
+  not re-send the rejected token: it re-reads the credentials every minute, sends a new
+  token at once, and retries the same one only after 30 minutes. The Codex poller backs
+  off 2, 4, 8, 16, then 30 minutes. Both keep their schedule and last good reading
+  (never a token) in a private `quota-state.json`, so a restart neither polls straight
+  away nor shows an empty page.
+
 ## 0.2.8 (2026-11-18)
 
 The AI usage charts stop costing a CPU core every 30 seconds. The dashboard is

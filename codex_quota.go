@@ -21,12 +21,30 @@ type CodexQuotaPollOptions struct {
 	// Fetch is supplied by tests; production uses the installed Codex CLI.
 	Fetch    func(context.Context) ([]QuotaRow, error)
 	Interval time.Duration
+	// State persists the poll schedule and the last good reading across
+	// restarts. nil keeps both in memory.
+	State *quotaStateStore
 }
 
 func newCodexUsageCheckerWithOptions(configDir string, options CodexQuotaPollOptions) *CodexUsageChecker {
 	c := newCodexUsageChecker(configDir)
 	c.pollOptions = options
+	if configDir != "" && options.Enabled && options.State != nil {
+		saved := options.State.Codex()
+		c.pollFailures = saved.Failures
+		c.pollNextAt = saved.NextAt
+		if len(saved.Rows) > 0 && !saved.FetchedAt.IsZero() {
+			c.liveRows, c.liveAt = saved.Rows, saved.FetchedAt.UTC()
+		}
+	}
 	return c
+}
+
+func (c *CodexUsageChecker) pollInterval() time.Duration {
+	if c.pollOptions.Interval > 0 {
+		return c.pollOptions.Interval
+	}
+	return quotaPollInterval
 }
 
 // Start owns a separate slow lane, so a quota lookup cannot block transcript
@@ -44,23 +62,72 @@ func (c *CodexUsageChecker) Start() {
 	c.pollCancel = cancel
 	c.pollDone = make(chan struct{})
 	done := c.pollDone
-	interval := c.pollOptions.Interval
-	if interval <= 0 {
-		interval = quotaPollInterval
-	}
+	c.mu.RLock()
+	// A persisted next attempt (a backoff, or simply the last poll's cadence)
+	// survives a restart, so restarting the agent does not re-poll at once.
+	first := quotaInitialWait(0, c.pollNextAt, time.Now())
+	c.mu.RUnlock()
 	go func() {
 		defer close(done)
+		wait := first
 		for {
-			c.pollQuota(ctx)
-			timer := time.NewTimer(interval)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
+			if wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+			wait = c.pollQuota(ctx)
+			if ctx.Err() != nil {
 				return
-			case <-timer.C:
 			}
 		}
 	}()
+}
+
+// pollQuota runs one lookup and returns the wait before the next: the normal
+// interval after a success, and 2, 4, 8, 16, then 30 minutes (never less than
+// the interval) after consecutive failures.
+func (c *CodexUsageChecker) pollQuota(parent context.Context) time.Duration {
+	interval := c.pollInterval()
+	ctx, cancel := context.WithTimeout(parent, codexQuotaRequestTimeout)
+	defer cancel()
+	fetch := c.pollOptions.Fetch
+	if fetch == nil {
+		fetch = func(ctx context.Context) ([]QuotaRow, error) {
+			return readCodexQuota(ctx, c.pollOptions.Binary, c.configDir)
+		}
+	}
+	rows, err := fetch(ctx)
+	if parent.Err() != nil {
+		return interval
+	}
+	now := time.Now().UTC()
+	c.mu.Lock()
+	var wait time.Duration
+	if err != nil {
+		c.pollError = "Codex quota poll: " + err.Error()
+		c.pollFailures++
+		wait = codexFailureBackoff(c.pollFailures, interval)
+	} else {
+		c.liveRows = rows
+		c.liveAt = now
+		c.pollError = ""
+		c.pollFailures = 0
+		wait = interval
+	}
+	c.pollNextAt = now.Add(wait)
+	state := quotaProviderState{NextAt: c.pollNextAt, Failures: c.pollFailures, Rows: c.liveRows, FetchedAt: c.liveAt}
+	c.mu.Unlock()
+	if store := c.pollOptions.State; store != nil {
+		// A failed save is not surfaced: the poller keeps working from
+		// memory, and the state file only matters at the next start.
+		_ = store.SetCodex(state)
+	}
+	return wait
 }
 
 func (c *CodexUsageChecker) Stop() {
@@ -75,30 +142,6 @@ func (c *CodexUsageChecker) Stop() {
 	c.pollCancel()
 	<-c.pollDone
 	c.pollCancel = nil
-}
-
-func (c *CodexUsageChecker) pollQuota(parent context.Context) {
-	ctx, cancel := context.WithTimeout(parent, codexQuotaRequestTimeout)
-	defer cancel()
-	fetch := c.pollOptions.Fetch
-	if fetch == nil {
-		fetch = func(ctx context.Context) ([]QuotaRow, error) {
-			return readCodexQuota(ctx, c.pollOptions.Binary, c.configDir)
-		}
-	}
-	rows, err := fetch(ctx)
-	if parent.Err() != nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err != nil {
-		c.pollError = "Codex quota poll: " + err.Error()
-		return
-	}
-	c.liveRows = rows
-	c.liveAt = time.Now().UTC()
-	c.pollError = ""
 }
 
 type codexAppWindow struct {
