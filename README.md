@@ -35,6 +35,12 @@ all of them.
 - 📋 **Apps, drives and alerts** — a page of the busiest apps or processes (CPU, RAM, GPU
   memory, disk I/O; tap a column to sort), and a status page with each drive's capacity and
   temperature, threshold alerts, and any sensor that could not be read.
+- 🔔 **Alerts with no dashboard open** — optional host-side rules for CPU, memory,
+  temperatures, free space and new releases, sent to ntfy, a JSON webhook, or paired
+  browsers as push notifications. Off until you set a rule (the `-alert-*` flags under
+  Configuration, below).
+- 🐳 **Containers and latency** — an optional, read-only Docker panel (`-docker`), and the
+  internet round trip beside the uplink on the NET card.
 - 🌙 **Made for always-on** — dim mode, a slow screen shift against burn-in, keep-awake, and
   pause, one tap each.
 - 🔘 **Quick controls** — mute the mic, turn local cameras off, play/pause media, mute the
@@ -412,10 +418,18 @@ SYSMON_BIND=127.0.0.1 SYSMON_PORT=9099 ./sysmon-agent
 | `/api/pair/window` | POST to show a PIN for another device |
 | `/api/pair/logout` | POST to unpair this device |
 | `/api/hosts/{id}/pair` | POST another host's PIN to pair this agent with it |
+| `/api/alerts` | alert rules, active alerts and delivery counts (never a token or push key) |
+| `/api/alerts/test` | POST to send a test notification to every target |
+| `/api/alerts/push/subscribe` | POST (or `/unsubscribe`) to turn browser notifications on or off for this device |
 
 With pairing required, every route except `/`, the dashboard's static files,
 `/healthz` and `/api/pair/state` answers `401` to a device that is not paired. Requests from
 the host itself to `127.0.0.1` may read without pairing.
+
+The agent answers only host names it knows: IP addresses, `localhost`, `.local` and
+`.ts.net` names, the machine's own hostname and the `-mdns-name` label. Any other name gets
+`421`, a guard against DNS rebinding. If you reach the agent through another name (a LAN
+DNS name, or a domain on a reverse proxy), add it with `-allowed-hosts`.
 
 When bound to a wildcard like `0.0.0.0`, startup logs print likely dashboard URLs
 (Tailscale addresses first), skipping virtual/container interfaces.
@@ -441,7 +455,19 @@ value keeps the saved default.
 | `-pairing` / `SYSMON_PAIRING` | `required` (default), `off` | only paired devices reach data and controls, or every device does |
 | `-network-tls` / `SYSMON_NETWORK_TLS` | `auto` (default), `on`, `off` | HTTPS for other devices on the same port; `auto` is on when pairing is required and the bind is not loopback |
 | `-mdns-name` / `SYSMON_MDNS_NAME` | label | a `.local` name other than the hostname's, which the agent then answers for itself and adds to its certificate; for a machine that boots two systems, give both the same name |
+| `-allowed-hosts` / `SYSMON_ALLOWED_HOSTS` | `name,*.example.org` | extra host names the agent answers to (`*.x` allows every name below `x`); any name not allowed gets `421` |
 | `-pair` / `-pair-list` / `-pair-revoke ID` / `-pair-token NAME` | | show a PIN, list or remove paired devices, or make a script token, for the agent using the same `-settings`, then exit |
+| `-latency-target` / `SYSMON_LATENCY_TARGET` | `1.1.1.1:443` | host[:port] whose TCP connect time is the internet latency, measured every 5 s while a dashboard is open; `off` disables it |
+| `-docker` / `SYSMON_DOCKER` | bool, off | list Docker containers with state, health, CPU and memory (read-only). Reading the socket needs the `docker` group, which is root-equivalent |
+| `-docker-host` / `SYSMON_DOCKER_HOST` | socket or URL | the Engine API (default `/var/run/docker.sock`; Windows needs `tcp://`) |
+| `-alert-cpu` / `-alert-memory` / `-alert-cpu-temp` / `-alert-gpu-temp` / `-alert-disk-free` (`SYSMON_ALERT_CPU`, …) | `0` = off | host alert lines: CPU and memory use (%), temperatures (°C), a mount's free space (%) |
+| `-alert-update` / `SYSMON_ALERT_UPDATE` | bool, off | alert once when a newer release is available |
+| `-alert-hold` / `-alert-release` / `-alert-cooldown` | 15s / 4s / 10m | how long a reading must stay past its line, then back under it, and the least time between two notifications for one alert |
+| `-alert-sample-every` / `SYSMON_ALERT_SAMPLE_EVERY` | 5s–5m, default 15s | with nobody watching, how often temperatures, disks and GPUs are sampled for alerts |
+| `-ntfy-url` / `-ntfy-token-file` (`SYSMON_NTFY_URL`, `SYSMON_NTFY_TOKEN`) | URL | send alerts to an ntfy topic |
+| `-alert-webhook-url` / `-alert-webhook-token-file` (`SYSMON_ALERT_WEBHOOK_URL`, `SYSMON_ALERT_WEBHOOK_TOKEN`) | URL | POST alerts as JSON, with an optional bearer token |
+| `-web-push` / `-web-push-subject` (`SYSMON_WEB_PUSH`, `SYSMON_WEB_PUSH_SUBJECT`) | bool, off | let paired dashboards turn on browser notifications ("Notify this device" on the status page) |
+| `-alerts-config` / `SYSMON_ALERTS_CONFIG` | path | rules and targets as JSON (default: `alerts.json` beside `-settings`, read when present); flags override the file |
 | `-claude-config-dir` / `SYSMON_CLAUDE_CONFIG_DIR` | path | Claude Code config dir for the AI usage page (default `$CLAUDE_CONFIG_DIR`, then `$HOME/.claude`; missing = Claude section hidden) |
 | `-claude-quota-poll` / `SYSMON_CLAUDE_QUOTA_POLL` | bool, off | also poll `api.anthropic.com` for quota instead of only reading local files |
 | `-codex-config-dir` / `SYSMON_CODEX_CONFIG_DIR` | path | Codex config dir for the AI usage page (default `$CODEX_HOME`, then `$HOME/.codex`; missing = Codex section hidden) |
