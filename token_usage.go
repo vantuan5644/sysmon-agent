@@ -462,6 +462,9 @@ func codexQuotaRows(limits *codexRateLimits) []QuotaRow {
 			Label:   codexWindowLabel(window.WindowMinute),
 			Percent: math.Max(0, math.Min(100, *window.UsedPercent)),
 		}
+		if window.WindowMinute > 0 {
+			row.WindowSeconds = window.WindowMinute * 60
+		}
 		if window.ResetsAt > 0 {
 			row.ResetsAt = time.Unix(window.ResetsAt, 0).UTC().Format(time.RFC3339)
 		}
@@ -538,6 +541,10 @@ type CodexUsageChecker struct {
 	liveRows  []QuotaRow
 	liveAt    time.Time
 	pollError string
+	// pollFailures/pollNextAt are the quota poller's backoff schedule
+	// (codex_quota.go), persisted with the last good rows.
+	pollFailures int
+	pollNextAt   time.Time
 }
 
 func newCodexUsageChecker(configDir string) *CodexUsageChecker {

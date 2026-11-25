@@ -1,4 +1,9 @@
 const state = {
+  alertsStatus: null,
+  alertsStatusInFlight: false,
+  notifySubscribed: false,
+  notifyBusy: false,
+  notifyMessage: "",
   interval: 1000,
   timer: null,
   statusTimer: null,
@@ -170,7 +175,7 @@ const state = {
 
 const refreshOptionsMS = [250, 500, 1000, 2000];
 const panelOptions = ["all", "performance", "storage", "network", "sensors", "gpu"];
-const dashboardBuild = "sysmon-static-v178";
+const dashboardBuild = "sysmon-static-v179";
 const netRingReferenceBytesPerSecond = 125000000;
 const netRingWarnPercent = 90;
 // clockRingReferenceMHz is the fallback ceiling for the CPU inner ring when the
@@ -316,12 +321,90 @@ let appsView = "apps";
 // or "pid:<pid>". Survives re-renders, which happen on every frame.
 let expandedProcessKey = "";
 // Whether the App details GPU column shows engine utilization (a host that
-// reports gpu_percent, i.e. Windows) or GPU memory. Decided per render from
+// reports gpu_percent: Windows, and Linux with an AMD/Intel GPU) or GPU memory. Decided per render from
 // the rows, so one column never mixes the two units.
 let gpuColumnPercent = false;
 let procSort = { col: "cpu", dir: "desc" };
 
 const $ = (id) => document.getElementById(id);
+
+// Script errors: an exception or unhandled rejection anywhere in the dashboard
+// shows the #scriptError banner ("Dashboard script error: ... — reload")
+// instead of leaving a half-drawn page with no hint. Registered here, before
+// the page is wired, so a failure while wiring it is caught too. boot.js
+// covers the time before this runs (app.js failing to load or parse) and
+// steps back once sysmonScriptErrors is set. One banner: the first message
+// stays and later, different ones only add to a count, so an error repeating
+// every frame does not flicker or grow the page.
+window.sysmonScriptErrors = true;
+window.addEventListener("error", (event) => {
+  if (!event || (event.target && event.target !== window && event.target.tagName)) {
+    // A resource (image, font) that failed to load, not a script error.
+    return;
+  }
+  if (isIgnorableScriptError(event.message, event.error)) {
+    return;
+  }
+  showScriptError(event.message || scriptErrorDetail(event.error));
+});
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event?.reason;
+  if (isIgnorableScriptError("", reason)) {
+    return;
+  }
+  showScriptError(scriptErrorDetail(reason));
+});
+
+function scriptErrorDetail(error) {
+  if (error && typeof error.message === "string" && error.message) {
+    return error.message;
+  }
+  return String(error || "unknown error").slice(0, 200);
+}
+
+// isIgnorableScriptError filters what is not the dashboard's own failure:
+// "Script error." is the browser's opaque report of another origin's script
+// (an extension), the ResizeObserver note is benign, and a request that failed
+// or timed out is the network, which the connection pill already reports.
+function isIgnorableScriptError(message, error) {
+  const text = String(message || error?.message || "");
+  if (text === "Script error." && !error) {
+    return true;
+  }
+  if (text.startsWith("ResizeObserver loop")) {
+    return true;
+  }
+  const name = error?.name || "";
+  if (name === "AbortError" || text === "Request timed out") {
+    return true;
+  }
+  return name === "TypeError" && /failed to fetch|networkerror|load failed/i.test(text);
+}
+
+function showScriptError(detail) {
+  const banner = document.getElementById("scriptError");
+  const text = document.getElementById("scriptErrorText");
+  if (!banner || !text) {
+    return;
+  }
+  const message = `Dashboard script error: ${detail}`;
+  if (!banner.hidden) {
+    if (banner.dataset.message !== message) {
+      const more = Number(banner.dataset.more || 0) + 1;
+      banner.dataset.more = String(more);
+      $("scriptErrorMore").textContent = ` (+${more} more)`;
+    }
+    return;
+  }
+  banner.dataset.message = message;
+  text.textContent = `${message} — `;
+  const reload = $("scriptErrorReload");
+  if (!reload.dataset.wired) {
+    reload.dataset.wired = "1";
+    reload.addEventListener("click", () => window.location.reload());
+  }
+  banner.hidden = false;
+}
 
 document.addEventListener("DOMContentLoaded", () => {
   state.pairingLinkPIN = takePairingLinkPIN();
@@ -360,6 +443,8 @@ document.addEventListener("DOMContentLoaded", () => {
   $("pairInstallBrowser").addEventListener("click", pairThisBrowser);
   $("pairBack").addEventListener("click", leaveViewOnlyPairing);
   $("pairAnotherBtn").addEventListener("click", openPairingWindow);
+  $("notifyPushBtn").addEventListener("click", toggleNotifyDevice);
+  $("notifyTestBtn").addEventListener("click", sendAlertTest);
   $("hostPairForm").addEventListener("submit", submitHostPair);
   $("hostPairCancel").addEventListener("click", cancelHostPair);
   document.addEventListener("keydown", handleHostPairKeydown);
@@ -404,6 +489,9 @@ document.addEventListener("DOMContentLoaded", () => {
   // The first client check waits for the pairing state: a browser on the
   // host that turns out view only must not send this write.
   pairingKnown.finally(() => sendClientCheck());
+  // The page is wired and its first requests are out: boot.js's watchdog
+  // stands down.
+  window.sysmonDashboardStarted = true;
 });
 
 // setupPager wires the iOS StandBy-style horizontal pager: native CSS scroll-snap
@@ -1107,6 +1195,7 @@ async function fetchWithTimeout(path, options, timeoutMS) {
 
   let timeout;
   let response;
+  const deadlineMS = Date.now() + timeoutMS;
   try {
     response = await Promise.race([
       fetch(path, requestOptions),
@@ -1122,6 +1211,7 @@ async function fetchWithTimeout(path, options, timeoutMS) {
   } finally {
     clearTimeout(timeout);
   }
+  timeBoundResponseBody(response, controller, deadlineMS, timeoutMS);
   if (response?.status === 401) {
     // An agent that requires pairing refuses an unpaired device with 401;
     // the caller still handles the response as a failure.
@@ -1132,6 +1222,59 @@ async function fetchWithTimeout(path, options, timeoutMS) {
     noteHostLocked();
   }
   return response;
+}
+
+// timeBoundResponseBody keeps fetchWithTimeout's deadline on the body as well
+// as the headers. fetch resolves once the headers arrive; a body that then
+// stalls would leave response.json() pending forever, and with it a caller's
+// in-flight flag (metricsInFlight stops every later poll). So json() and text()
+// race what is left of the same deadline: past it they abort the request and
+// reject with the same "Request timed out" the header phase uses. The timer is
+// armed only when a caller reads the body, so a response nobody reads leaves
+// no timer behind.
+function timeBoundResponseBody(response, controller, deadlineMS, timeoutMS) {
+  if (!response || typeof response !== "object") {
+    return;
+  }
+  for (const method of ["json", "text"]) {
+    // A response object handed out twice (a cache, a test double) is
+    // re-bound to the newest deadline rather than wrapped again.
+    const read = response[method]?.timeBoundRead || response[method];
+    if (typeof read !== "function") {
+      continue;
+    }
+    const timeBound = (...args) => {
+      let reading;
+      try {
+        reading = read.apply(response, args);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      const remainingMS = Math.min(timeoutMS, Math.max(0, deadlineMS - Date.now()));
+      // One promise rather than a Promise.race: settling it costs the caller's
+      // await a single extra tick over awaiting the read directly.
+      return new Promise((resolve, reject) => {
+        const bodyTimeout = setTimeout(() => {
+          if (controller && typeof controller.abort === "function") {
+            controller.abort();
+          }
+          reject(new Error("Request timed out"));
+        }, remainingMS);
+        (typeof reading?.then === "function" ? reading : Promise.resolve(reading)).then(
+          (value) => {
+            clearTimeout(bodyTimeout);
+            resolve(value);
+          },
+          (error) => {
+            clearTimeout(bodyTimeout);
+            reject(error);
+          },
+        );
+      });
+    };
+    timeBound.timeBoundRead = read;
+    response[method] = timeBound;
+  }
 }
 
 function sendClientCheck(options = {}) {
@@ -1650,6 +1793,7 @@ function selectHost(id, options = {}) {
   // "Paired devices" lists this agent's devices, so it shows only while this
   // agent is the one viewed.
   renderPairingPanel();
+  renderNotifyPanel();
   if (!next && pairingRequired()) {
     fetchPairedDevices();
   }
@@ -2648,6 +2792,12 @@ function render(metrics) {
   setGaugeSub("gpuSub", gpuVram.available
     ? (formatGibPair(gpuVram.usedBytes, gpuVram.totalBytes) || "--")
     : "--");
+  const gpuSubEl = $("gpuSub");
+  if (gpuSubEl) {
+    gpuSubEl.title = primaryGPU?.memory_kind === "shared"
+      ? "Shared GPU memory: the VRAM carve-out plus GTT (system RAM the GPU maps)"
+      : "";
+  }
 
   // RAM: outer ring = utilization, inner ring = running speed against the
   // rated EXPO/XMP profile, center = util %, sub = used/total bytes.
@@ -2666,6 +2816,7 @@ function render(metrics) {
   renderApps(metrics.processes);
   renderStorage(metrics.storage);
   renderGPUEngines(primaryGPU);
+  renderDocker(metrics.docker);
 }
 
 // renderGPUEngines lists the primary GPU's engines on the "More status" page
@@ -2718,6 +2869,120 @@ function renderGPUEngines(gpu) {
   if (wasHidden) {
     syncPagerAfterRender();
   }
+}
+
+// renderDocker lists the host's Docker containers on the "More status" page
+// (docker.go, the agent's -docker). Hidden when the agent does not read
+// Docker. The list changes once per agent pass (every 15 s), so the rows are
+// rebuilt only when the pass or the CPU threshold changes, not every frame.
+function renderDocker(docker) {
+  const panel = $("dockerPanel");
+  const list = $("dockerList");
+  const summary = $("dockerSummary");
+  if (!panel || !list || !summary) {
+    return;
+  }
+  const wasHidden = panel.hidden;
+  if (!docker || typeof docker !== "object") {
+    panel.hidden = true;
+    if (panel.dataset.docker) {
+      delete panel.dataset.docker;
+      list.textContent = "";
+      summary.textContent = "--";
+    }
+    if (!wasHidden) {
+      syncPagerAfterRender();
+    }
+    return;
+  }
+  const warn = thresholdValue("cpu_warn");
+  const key = [docker.available, docker.endpoint, docker.updated_at, docker.error, docker.note, docker.total, docker.running, warn].join("|");
+  panel.hidden = false;
+  if (panel.dataset.docker === key) {
+    return;
+  }
+  panel.dataset.docker = key;
+  list.textContent = "";
+  if (!docker.available) {
+    summary.textContent = docker.updated_at ? "unavailable" : "waiting";
+    const note = document.createElement("div");
+    note.className = "storage-note";
+    note.textContent = nonEmptyText(docker.error) || "Docker is unavailable";
+    list.append(note);
+    syncPagerAfterRender();
+    return;
+  }
+  const total = Number(docker.total) || 0;
+  const running = Number(docker.running) || 0;
+  summary.textContent = `${running}/${total} running`;
+  const rows = Array.isArray(docker.containers) ? docker.containers : [];
+  for (const container of rows) {
+    list.append(dockerRow(container, warn));
+  }
+  if (rows.length < total) {
+    const more = document.createElement("div");
+    more.className = "storage-note";
+    more.textContent = `${total - rows.length} more not shown`;
+    list.append(more);
+  }
+  if (nonEmptyText(docker.note)) {
+    const note = document.createElement("div");
+    note.className = "storage-note";
+    note.textContent = docker.note;
+    list.append(note);
+  }
+  if (total === 0) {
+    const none = document.createElement("div");
+    none.className = "storage-note";
+    none.textContent = "No containers";
+    list.append(none);
+  }
+  syncPagerAfterRender();
+}
+
+function dockerRow(container, warn) {
+  const running = container?.state === "running";
+  const row = document.createElement("div");
+  row.className = running ? "docker-row" : "docker-row stopped";
+
+  const head = document.createElement("div");
+  head.className = "docker-row-head";
+  const name = document.createElement("span");
+  name.className = "docker-name";
+  name.textContent = nonEmptyText(container?.name) || nonEmptyText(container?.id) || "container";
+  const cpu = numberMetric(container?.cpu_percent);
+  const cpuEl = document.createElement("span");
+  cpuEl.className = "docker-cpu";
+  cpuEl.textContent = cpu.available ? formatProcPercent(cpu.value) : "--";
+  if (cpu.available) {
+    cpuEl.style.color = colorFor(cpu.value, warn);
+  } else if (running && cpu.error) {
+    cpuEl.title = cpu.error;
+  }
+  head.append(name, cpuEl);
+
+  const foot = document.createElement("div");
+  foot.className = "docker-row-foot";
+  const meta = document.createElement("span");
+  meta.className = "docker-meta";
+  const health = nonEmptyText(container?.health);
+  if (health) {
+    const healthEl = document.createElement("span");
+    healthEl.className = `docker-health ${health}`;
+    healthEl.textContent = health;
+    meta.append(healthEl, " \u00b7 ");
+  }
+  // Docker's own status phrase ("Up 6 days", "Exited (0) 2 hours ago"),
+  // less the health it repeats.
+  const status = nonEmptyText(container?.status).replace(/\s*\((healthy|unhealthy|health: starting)\)/i, "");
+  meta.append([status || nonEmptyText(container?.state), nonEmptyText(container?.image)].filter(Boolean).join(" \u00b7 "));
+  const mem = capacityPercent(container?.memory);
+  const memEl = document.createElement("span");
+  memEl.className = "docker-mem";
+  memEl.textContent = mem.available ? `${formatBytes(mem.usedBytes)} / ${formatBytes(mem.totalBytes)}` : (running ? "--" : "");
+  foot.append(meta, memEl);
+  row.append(head, foot);
+  return row;
 }
 
 // networkTotals sums RX/TX byte rates across every interface into one aggregate
@@ -3079,7 +3344,22 @@ function metricAlertMessages(metrics) {
   addPercentAlert(messages, "RAM commit", capacityPercent(metrics?.memory_commit), commitAlertPercent);
   addPercentAlert(messages, "Memory stall", numberMetric(metrics?.pressure?.memory_full), memoryStallAlertPercent);
   addGPUGuardAlerts(messages, gpuGuardState(metrics));
+  addHostAlerts(messages, metrics?.host_alerts);
   return messages;
+}
+
+// Host alerts (alerts.go). The agent judges its own rules every 2 s, with or
+// without a dashboard open, and sends the notifications itself. Each frame
+// carries what is firing as host_alerts; the page lists it like any other
+// alert and never re-judges it.
+function addHostAlerts(messages, summary) {
+  const active = Array.isArray(summary?.active) ? summary.active : [];
+  for (const alert of active) {
+    const message = nonEmptyText(alert?.message);
+    if (message && !messages.includes(message)) {
+      messages.push(message);
+    }
+  }
 }
 
 // GPU guard (gpu_guard.go, internal/gpuguard). The agent judges its NVIDIA
@@ -3138,25 +3418,50 @@ function addGPUGuardAlerts(messages, guard) {
 }
 
 // gpuGuardLines are the hotspot's warn and critical lines for colouring.
-function gpuGuardLines(guard) {
+// Without a guard, a card that publishes its junction's critical limit (AMD,
+// hotspot_critical_celsius) is coloured by that: warning 10 degrees under it.
+function gpuGuardLines(guard, device) {
   const warn = finiteNumber(guard?.thresholds?.warn_c);
   const crit = finiteNumber(guard?.thresholds?.critical_c);
+  const deviceCrit = gpuDeviceCritical(device?.hotspot_critical_celsius);
   return {
-    warn_c: warn ?? gpuGuardDefaultLines.warn_c,
-    critical_c: crit ?? gpuGuardDefaultLines.critical_c,
+    warn_c: warn ?? (deviceCrit !== null ? deviceCrit - 10 : gpuGuardDefaultLines.warn_c),
+    critical_c: crit ?? deviceCrit ?? gpuGuardDefaultLines.critical_c,
   };
+}
+
+// gpuDetailTitle is the GPU detail line's tooltip: the readings a Linux
+// AMD/Intel card adds (clock, fan, power limit), left off the line itself.
+function gpuDetailTitle(device) {
+  if (!device) { return ""; }
+  const parts = [];
+  const clock = numberMetric(device.clock_mhz);
+  if (clock.available) { parts.push(`Clock ${Math.round(clock.value)} MHz`); }
+  const fan = numberMetric(device.fan_rpm);
+  if (fan.available) { parts.push(`Fan ${Math.round(fan.value)} RPM`); }
+  const limit = numberMetric(device.power_limit_watts);
+  if (limit.available) { parts.push(`Power limit ${formatPower(limit.value)}`); }
+  if (device.integrated) { parts.push("Integrated GPU"); }
+  return parts.join(" · ");
+}
+
+// gpuDeviceCritical is a device's published critical temperature, or null.
+function gpuDeviceCritical(metric) {
+  const critical = numberMetric(metric);
+  return critical.available && critical.value > 0 ? critical.value : null;
 }
 
 // gpuGuardVRAMLines are the memory junction's lines (gpuguard
 // DefaultVRAMWarnC / DefaultVRAMCritC when the guard publishes none).
 const gpuGuardDefaultVRAMLines = { warn_c: 100, critical_c: 106 };
 
-function gpuGuardVRAMLines(guard) {
+function gpuGuardVRAMLines(guard, device) {
   const warn = finiteNumber(guard?.thresholds?.vram_warn_c);
   const crit = finiteNumber(guard?.thresholds?.vram_critical_c);
+  const deviceCrit = gpuDeviceCritical(device?.vram_critical_celsius);
   return {
-    warn_c: warn ?? gpuGuardDefaultVRAMLines.warn_c,
-    critical_c: crit ?? gpuGuardDefaultVRAMLines.critical_c,
+    warn_c: warn ?? (deviceCrit !== null ? deviceCrit - 10 : gpuGuardDefaultVRAMLines.warn_c),
+    critical_c: crit ?? deviceCrit ?? gpuGuardDefaultVRAMLines.critical_c,
   };
 }
 
@@ -3794,12 +4099,13 @@ function renderPrimaryCardDetails(metrics, primaryGPU) {
   let gpuDetailHasText = gpuTemp.available || gpuPower.available;
   if (!gpuDetailHasText && (gpuHotspot.available || gpuVRAM.available)) $("gpuDetail").textContent = "";
   if (gpuHotspot.available) {
-    $("gpuDetail").append(gpuTempSpan("gpu-hotspot-detail", "Hotspot", gpuHotspot.value, gpuGuardLines(gpuGuardState(metrics)), gpuDetailHasText));
+    $("gpuDetail").append(gpuTempSpan("gpu-hotspot-detail", "Hotspot", gpuHotspot.value, gpuGuardLines(gpuGuardState(metrics), primaryGPU), gpuDetailHasText));
     gpuDetailHasText = true;
   }
   if (gpuVRAM.available) {
-    $("gpuDetail").append(gpuTempSpan("gpu-vram-detail", "VRAM", gpuVRAM.value, gpuGuardVRAMLines(gpuGuardState(metrics)), gpuDetailHasText));
+    $("gpuDetail").append(gpuTempSpan("gpu-vram-detail", "VRAM", gpuVRAM.value, gpuGuardVRAMLines(gpuGuardState(metrics), primaryGPU), gpuDetailHasText));
   }
+  $("gpuDetail").title = gpuDetailTitle(primaryGPU);
 
   const swap = capacityPercent(metrics.memory_swap);
   setCardDetail("memDetail", joinDetail([
@@ -4347,13 +4653,27 @@ function quotaRowElement(row) {
   bar.append(fill);
   el.append(bar);
 
-  const noteText = [quotaResetLabel(row?.resets_at), nonEmptyText(row?.note)]
-    .filter(Boolean)
-    .join(" \u00b7 ");
-  if (noteText) {
+  // Reset countdown, then the pace forecast beside it, then any note.
+  const pace = quotaPace(row);
+  const parts = [quotaResetLabel(row?.resets_at)];
+  if (pace) {
+    const paceEl = document.createElement("span");
+    paceEl.className = `quota-pace quota-pace-${pace.tone}`;
+    paceEl.textContent = pace.text;
+    paceEl.setAttribute("title", pace.title);
+    parts.push(paceEl);
+  }
+  parts.push(nonEmptyText(row?.note));
+  const shown = parts.filter(Boolean);
+  if (shown.length) {
     const note = document.createElement("div");
     note.className = "quota-note";
-    note.textContent = noteText;
+    shown.forEach((part, index) => {
+      if (index > 0) {
+        note.append(" \u00b7 ");
+      }
+      note.append(part);
+    });
     el.append(note);
   }
   return el;
@@ -4409,6 +4729,90 @@ function quotaResetLabel(resetsAt) {
     return `resets in ${hours}h${String(mins % 60).padStart(2, "0")}m`;
   }
   return `resets in ${Math.round(hours / 24)}d`;
+}
+
+// quotaWindowSeconds is the length of the window a row's percentage counts
+// against. Current agents send window_seconds; for older ones (a peer reached
+// through the host picker) it is inferred from the id or label, and a row
+// that is not a time window (credits) has none.
+function quotaWindowSeconds(row) {
+  const explicit = finiteNumber(row?.window_seconds);
+  if (explicit !== null && explicit > 0) {
+    return explicit;
+  }
+  const id = String(row?.id || "");
+  const label = String(row?.label || "");
+  if (id === "five_hour" || label.includes("(5h)")) {
+    return 5 * 3600;
+  }
+  if (id.startsWith("seven_day") || id.startsWith("weekly_") || /^Weekly\b/.test(label)) {
+    return 7 * 86400;
+  }
+  return null;
+}
+
+// quotaDurationLabel formats a span the way quotaResetLabel does: "42m",
+// "3h07m" under two days, then "2d".
+function quotaDurationLabel(ms) {
+  const mins = Math.max(1, Math.round(ms / 60000));
+  if (mins < 60) {
+    return `${mins}m`;
+  }
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) {
+    return `${hours}h${String(mins % 60).padStart(2, "0")}m`;
+  }
+  return `${Math.round(hours / 24)}d`;
+}
+
+// quotaPace forecasts a window linearly from how much of it has been used in
+// how much of it has passed. It returns null (say nothing) when the row has
+// no percentage, reset time or window length, when the window has expired or
+// its reset is further out than the window is long, and early on -- the first
+// 4% of the window or under 1% used -- where a projection would only be
+// noise. Otherwise:
+//   - 100% or more: "limit reached";
+//   - on course to reach 100% before the reset: "full in 1h20m" (warn). Being
+//     ahead of an even pace and filling up before the reset are the same
+//     thing under a linear projection, so this IS the "ahead of pace" case,
+//     with the useful number attached;
+//   - projected to end at 80-100%: "on pace";
+//   - below that: "plenty left".
+// Pure (now is a parameter) so verify-dashboard.mjs can pin every branch.
+function quotaPace(row, now = nowMS()) {
+  const percent = finiteNumber(row?.percent);
+  const resetAt = Date.parse(String(row?.resets_at || ""));
+  const windowSeconds = quotaWindowSeconds(row);
+  if (percent === null || !Number.isFinite(resetAt) || windowSeconds === null) {
+    return null;
+  }
+  const windowMS = windowSeconds * 1000;
+  const leftMS = resetAt - now;
+  if (leftMS <= 0 || leftMS > windowMS * 1.02) {
+    return null;
+  }
+  if (percent >= 100) {
+    return { tone: "bad", text: "limit reached", title: "This window is used up until it resets." };
+  }
+  const elapsed = clamp(1 - leftMS / windowMS, 0, 1);
+  if (elapsed < 0.04 || percent < 1) {
+    return null;
+  }
+  const projected = percent / elapsed;
+  if (projected >= 100) {
+    // At the average rate so far, (100 - percent) more takes this long.
+    const fullInMS = ((100 - percent) / percent) * elapsed * windowMS;
+    return {
+      tone: "warn",
+      text: `full in ${quotaDurationLabel(fullInMS)}`,
+      title: "At the rate used so far, this window fills up before it resets.",
+    };
+  }
+  const ending = `At the rate used so far, about ${Math.round(projected)}% by the reset.`;
+  if (projected >= 80) {
+    return { tone: "ok", text: "on pace", title: ending };
+  }
+  return { tone: "calm", text: "plenty left", title: ending };
 }
 
 // quotaFooterLabel composes the page footer: source + successful-check age
@@ -4785,7 +5189,7 @@ function renderCardIdentities(metrics, primaryGPU) {
   const memGauge = $("memGauge");
   if (memGauge) { memGauge.title = memorySpeedTitle(metrics.memory_speed); }
 
-  renderNetName(metrics.network && metrics.network.uplink);
+  renderNetName(metrics.network && metrics.network.uplink, metrics.network && metrics.network.latency);
 }
 
 // uplinkDisplay describes the active network identity: an icon for the link kind
@@ -4808,15 +5212,88 @@ function uplinkDisplay(uplink) {
 
 // renderNetName paints the NET card's identity line. It runs on every frame, and
 // the line is an aria-live region, so an unchanged uplink leaves the DOM alone.
-function renderNetName(uplink) {
+// With the agent's internet latency prober on (net_latency.go) the line also
+// carries the newest connect time after the uplink name, in its own span so a
+// long SSID ellipsizes and the latency stays visible; its tooltip holds the
+// 5-minute window. Without a latency reading the line is exactly the uplink.
+function renderNetName(uplink, latency) {
   const el = $("netName");
   if (!el) { return; }
   const { icon, text } = uplinkDisplay(uplink);
-  if (shownIcon(el) === icon && el.textContent === text) { return; }
+  const lat = latencyDisplay(latency);
+  if (!lat) {
+    if (el.dataset.latency) {
+      delete el.dataset.latency;
+      el.classList.remove("has-latency");
+      el.title = "";
+      el.textContent = "";
+    }
+    if (shownIcon(el) === icon && el.textContent === text) { return; }
+    el.textContent = "";
+    if (!text) { return; }
+    if (icon) { el.append(iconElement(icon)); }
+    el.append(text);
+    return;
+  }
+  const key = `${icon}|${text}|${lat.text}|${lat.level}|${lat.title}`;
+  if (el.dataset.latency === key) { return; }
+  el.dataset.latency = key;
+  el.classList.add("has-latency");
+  el.title = lat.title;
   el.textContent = "";
-  if (!text) { return; }
   if (icon) { el.append(iconElement(icon)); }
-  el.append(text);
+  if (text) {
+    const name = document.createElement("span");
+    name.className = "net-uplink";
+    name.textContent = text;
+    el.append(name);
+  }
+  const value = document.createElement("span");
+  value.className = lat.level ? `net-latency ${lat.level}` : "net-latency";
+  value.textContent = text ? ` \u00b7 ${lat.text}` : lat.text;
+  el.append(value);
+}
+
+// latencyDisplay turns metrics.network.latency into the NET line's short label
+// ("12 ms", "12 ms · 5% loss", "no reply"), a warn/crit level and a tooltip
+// with the window. null when the prober is off or has not probed yet.
+function latencyDisplay(latency) {
+  if (!latency || !latency.available) {
+    return null;
+  }
+  const last = numberMetric(latency.last_ms);
+  const avg = numberMetric(latency.avg_ms);
+  const min = numberMetric(latency.min_ms);
+  const max = numberMetric(latency.max_ms);
+  const loss = numberMetric(latency.loss_percent);
+  const lossValue = loss.available ? loss.value : 0;
+  let text = last.available ? `${formatLatencyMS(last.value)} ms` : "no reply";
+  if (last.available && lossValue > 0) {
+    text += ` \u00b7 ${formatLossPercent(lossValue)}% loss`;
+  }
+  let level = "";
+  if (!last.available || lossValue >= 20) {
+    level = "crit";
+  } else if (lossValue > 0 || last.value >= 150) {
+    level = "warn";
+  }
+  const minutes = Math.round((Number(latency.window_seconds) || 300) / 60);
+  const lines = [`Internet latency: TCP connect to ${nonEmptyText(latency.target) || "the target"}`];
+  lines.push(last.available ? `Last ${formatLatencyMS(last.value)} ms` : `Last probe failed: ${last.error || "no reply"}`);
+  if (avg.available && min.available && max.available) {
+    lines.push(`Last ${minutes} min: avg ${formatLatencyMS(avg.value)} ms, min ${formatLatencyMS(min.value)}, max ${formatLatencyMS(max.value)}`);
+  }
+  const probes = Number(latency.probes) || 0;
+  lines.push(`Loss ${formatLossPercent(lossValue)}% of ${probes} probe${probes === 1 ? "" : "s"}`);
+  return { text, level, title: lines.join("\n") };
+}
+
+function formatLatencyMS(value) {
+  return value < 10 ? value.toFixed(1) : String(Math.round(value));
+}
+
+function formatLossPercent(value) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
 }
 
 function setCardId(id, text) {
@@ -5405,6 +5882,22 @@ function setCameraControlState(control) {
   updateDeviceControlLabel("camera");
 }
 
+// deviceAppsSummary names who holds an active device from the reading's
+// apps list (names only; the agent never sends command lines). short fits the
+// control ("Zoom", "Zoom +2"); long reads in titles and announcements. A
+// sound server listed alone means the client behind it is not known.
+function deviceAppsSummary(kind) {
+  const apps = Array.isArray(lastDeviceActivity?.[kind]?.apps) ?
+    lastDeviceActivity[kind].apps.filter((app) => typeof app?.name === "string" && app.name.trim()) : [];
+  if (!apps.length) return null;
+  const names = apps.map((app) => app.name.trim());
+  const short = names.length > 1 ? `${names[0]} +${names.length - 1}` : names[0];
+  if (apps.every((app) => app.sound_server === true)) {
+    return { short, long: `in use through ${names.join(", ")}; the app behind it is not identified` };
+  }
+  return { short, long: `in use by ${names.join(", ")}` };
+}
+
 function updateDeviceControlLabel(kind) {
   const mic = kind === "microphone";
   const button = $(mic ? "micCtl" : "cameraCtl");
@@ -5420,14 +5913,15 @@ function updateDeviceControlLabel(kind) {
     cameraControlState === "disabled" ? "Off" : cameraControlState === "enabled" ? "On" :
     cameraControlState === "mixed" ? "Mix" : "—";
   const idle = button.classList.contains("activity-idle");
-  const activity = active ? "Busy" : idle ? "Idle" : "—";
+  const apps = active ? deviceAppsSummary(kind) : null;
+  const activity = active ? (apps ? apps.short : "Busy") : idle ? "Idle" : "—";
   const stateDescription = busy ? (mic ? "mute state changing" : "camera state changing") : mic ?
     (muted ? "muted" : microphoneMuteState === "unmuted" ? "unmuted" :
       microphoneMuteState === "mixed" ? "some microphones muted" : "mute state unknown") :
     cameraControlState === "disabled" ? "supported cameras disabled" :
     cameraControlState === "enabled" ? "supported cameras enabled" :
     cameraControlState === "mixed" ? "supported cameras partly enabled" : "camera state unknown";
-  const activityDescription = active ? "in use" : idle ? "no use detected" : "usage unknown";
+  const activityDescription = active ? (apps ? apps.long : "in use") : idle ? "no use detected" : "usage unknown";
   const stateLabel = $(mic ? "micCtlState" : "cameraCtlState");
   const usageLabel = $(mic ? "micCtlUsage" : "cameraCtlUsage");
   if (stateLabel) {
@@ -5477,14 +5971,16 @@ function renderDeviceActivity(activity, metricsTimestamp) {
     const fresh = !state.paused && Number.isFinite(age) && age >= -2000 && age <= 10000;
     button.classList.toggle("activity-active", fresh && reading?.state === "active");
     button.classList.toggle("activity-idle", fresh && reading?.state === "idle");
-    if (reading) button.title = [reading.coverage, reading.error, kind === "camera" ? activity?.camera_control?.error : ""].filter(Boolean).join("; ");
+    const holders = button.classList.contains("activity-active") ? deviceAppsSummary(kind) : null;
+    if (reading) button.title = [holders ? holders.long.replace(/^in use/, "In use") : "", reading.coverage, reading.error, kind === "camera" ? activity?.camera_control?.error : ""].filter(Boolean).join("; ");
     updateDeviceControlLabel(kind);
   }
   const status = $("deviceActivityStatus");
   if (status) {
     const text = ["microphone", "camera"].map((kind) => {
       const button = $(kind === "microphone" ? "micCtl" : "cameraCtl");
-      const activity = button?.classList.contains("activity-active") ? "in use" : button?.classList.contains("activity-idle") ? "no use detected" : "usage unknown";
+      const active = button?.classList.contains("activity-active");
+      const activity = active ? (deviceAppsSummary(kind)?.long || "in use") : button?.classList.contains("activity-idle") ? "no use detected" : "usage unknown";
       return `${kind === "microphone" ? "Microphone" : "Camera"}: ${activity}`;
     }).join(". ");
     if (status.textContent !== text) status.textContent = text;
@@ -5948,6 +6444,7 @@ function applyPairingState(pairing) {
   if (pairingRequired() && !state.hostID) {
     fetchPairedDevices();
   }
+  fetchAlertsStatus();
 }
 
 // takePairingLinkPIN reads the PIN a pairing link carries, from the QR code
@@ -6542,4 +7039,185 @@ function formatCalendarDate(timestampMS) {
   const date = new Date(timestampMS);
   const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   return `${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
+}
+
+// ---- Host alerts panel ----
+//
+// "Host alerts" on the More status page belongs to the agent that served this
+// app, like "Paired devices": it hides while a peer is viewed and for a view
+// only browser. It is fetched when the pairing state lands and after each
+// action here, never on a timer.
+
+async function fetchAlertsStatus() {
+  if (state.hostID || state.alertsStatusInFlight) {
+    return;
+  }
+  state.alertsStatusInFlight = true;
+  try {
+    const response = await fetchWithTimeout("/api/alerts", { cache: "no-store" }, auxiliaryTimeoutMS);
+    if (!response.ok) {
+      // 404: an agent older than host alerts. 401: not paired yet.
+      return;
+    }
+    const body = await response.json();
+    state.alertsStatus = body && typeof body === "object" ? body : null;
+    if (state.alertsStatus?.targets?.web_push && webPushSupported()) {
+      state.notifySubscribed = Boolean(await currentPushSubscription());
+    }
+  } catch {
+  } finally {
+    state.alertsStatusInFlight = false;
+    renderNotifyPanel();
+  }
+}
+
+function webPushSupported() {
+  return (
+    window.isSecureContext === true &&
+    Boolean(window.navigator?.serviceWorker) &&
+    typeof window.PushManager === "function" &&
+    typeof window.Notification === "function"
+  );
+}
+
+async function currentPushSubscription() {
+  try {
+    const registration = await window.navigator.serviceWorker.getRegistration();
+    return registration ? await registration.pushManager.getSubscription() : null;
+  } catch {
+    return null;
+  }
+}
+
+function renderNotifyPanel() {
+  const panel = $("notifyPanel");
+  const status = state.alertsStatus;
+  const show = status?.enabled === true && !state.hostID && !state.pairingViewOnly;
+  panel.hidden = !show;
+  if (!show) {
+    return;
+  }
+  const rules = Array.isArray(status.rules) ? status.rules : [];
+  const alerts = Array.isArray(status.alerts) ? status.alerts : [];
+  const firing = alerts.filter((alert) => alert?.state === "firing" || alert?.state === "releasing").length;
+  $("notifySummary").textContent = firing > 0 ? `${firing} firing` : rules.length === 1 ? "1 rule" : `${rules.length} rules`;
+  const targets = [];
+  const push = status.targets?.web_push;
+  for (const [name, target] of [["ntfy", status.targets?.ntfy], ["webhook", status.targets?.webhook]]) {
+    if (target) {
+      targets.push(target.host ? `${name} (${target.host})` : name);
+    }
+  }
+  if (push) {
+    const count = Number(push.subscriptions) || 0;
+    targets.push(count === 1 ? "1 device" : `${count} devices`);
+  }
+  $("notifyTargets").textContent = targets.length > 0 ? `Notifies ${targets.join(", ")}.` : "No notification target: alerts show on this page only.";
+  const pushBtn = $("notifyPushBtn");
+  pushBtn.hidden = !(push && push.public_key && webPushSupported());
+  pushBtn.textContent = state.notifySubscribed ? "Stop notifying this device" : "Notify this device";
+  pushBtn.disabled = state.notifyBusy;
+  const testBtn = $("notifyTestBtn");
+  testBtn.hidden = targets.length === 0;
+  testBtn.disabled = state.notifyBusy;
+  const note = $("notifyMessage");
+  note.hidden = !state.notifyMessage;
+  note.textContent = state.notifyMessage;
+}
+
+function base64URLBytes(text) {
+  const base64 = String(text || "").replace(/-/g, "+").replace(/_/g, "/");
+  const binary = window.atob(base64 + "=".repeat((4 - (base64.length % 4)) % 4));
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+function postAlertsJSON(path, body) {
+  return fetchWithTimeout(
+    path,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: body === undefined ? "" : JSON.stringify(body) },
+    auxiliaryTimeoutMS,
+  );
+}
+
+async function alertsResponseError(response) {
+  const body = await response.json().catch(() => ({}));
+  return nonEmptyText(body?.error) || `HTTP ${response.status}`;
+}
+
+// toggleNotifyDevice subscribes this browser to the agent's Web Push, or
+// stops it. The permission prompt comes first, inside the tap, because
+// Safari shows it only in direct answer to one.
+async function toggleNotifyDevice() {
+  if (openViewOnlyPairing() || state.notifyBusy || !webPushSupported()) {
+    return;
+  }
+  const subscribing = !state.notifySubscribed;
+  const permission = subscribing ? window.Notification.requestPermission() : null;
+  state.notifyBusy = true;
+  state.notifyMessage = "";
+  renderNotifyPanel();
+  try {
+    const registration = await window.navigator.serviceWorker.getRegistration();
+    if (!registration) {
+      throw new Error("the service worker is not running; reload the app");
+    }
+    if (!subscribing) {
+      const existing = await registration.pushManager.getSubscription();
+      if (existing) {
+        const endpoint = existing.endpoint;
+        await existing.unsubscribe().catch(() => false);
+        const response = await postAlertsJSON("/api/alerts/push/unsubscribe", { endpoint });
+        if (!response.ok) {
+          throw new Error(await alertsResponseError(response));
+        }
+      }
+      state.notifySubscribed = false;
+      state.notifyMessage = "This device no longer gets alert notifications.";
+      return;
+    }
+    if ((await permission) !== "granted") {
+      state.notifyMessage = "Notifications are blocked for this dashboard in the browser's settings.";
+      return;
+    }
+    const key = state.alertsStatus?.targets?.web_push?.public_key;
+    const subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64URLBytes(key) });
+    const json = subscription.toJSON();
+    const response = await postAlertsJSON("/api/alerts/push/subscribe", {
+      endpoint: json.endpoint,
+      expirationTime: json.expirationTime ?? null,
+      keys: { p256dh: json.keys?.p256dh || "", auth: json.keys?.auth || "" },
+    });
+    if (!response.ok) {
+      const message = await alertsResponseError(response);
+      await subscription.unsubscribe().catch(() => false);
+      throw new Error(message);
+    }
+    state.notifySubscribed = true;
+    state.notifyMessage = "This device gets alert notifications now.";
+  } catch (error) {
+    state.notifyMessage = `Notifications: ${error?.message || "request failed"}`;
+  } finally {
+    state.notifyBusy = false;
+    renderNotifyPanel();
+    fetchAlertsStatus();
+  }
+}
+
+async function sendAlertTest() {
+  if (openViewOnlyPairing() || state.notifyBusy) {
+    return;
+  }
+  state.notifyBusy = true;
+  state.notifyMessage = "";
+  renderNotifyPanel();
+  try {
+    const response = await postAlertsJSON("/api/alerts/test");
+    state.notifyMessage = response.status === 202 ? "Test notification sent." : `Test not sent: ${await alertsResponseError(response)}`;
+  } catch (error) {
+    state.notifyMessage = `Test not sent: ${error?.message || "request failed"}`;
+  } finally {
+    state.notifyBusy = false;
+    renderNotifyPanel();
+    fetchAlertsStatus();
+  }
 }

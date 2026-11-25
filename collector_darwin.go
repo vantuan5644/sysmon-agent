@@ -36,7 +36,7 @@ func macRead(ctx context.Context, executable string, args ...string) (string, er
 	defer cancel()
 	cmd := exec.CommandContext(ctx, executable, args...)
 	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
-	data, err := cmd.Output()
+	data, err := trackedOutput(cmd)
 	return string(data), err
 }
 
@@ -56,7 +56,6 @@ func (c *macSystemCollector) Collect(ctx context.Context) (Metrics, error) {
 	m.Storage = unavailableStorage(unavailable)
 	m.Tailscale = TailscaleStatus{Error: unavailable}
 	m.Temperatures = TemperatureSet{Error: unavailable}
-	m.GPU = GPUSet{Error: unavailable}
 	m.Processes = unavailableProcessSet(unavailable)
 	if output, err := macRead(ctx, "/usr/bin/top", "-l", "2", "-s", "1", "-n", "0"); err == nil {
 		m.CPU = parseMacCPU(output)
@@ -69,6 +68,16 @@ func (c *macSystemCollector) Collect(ctx context.Context) (Metrics, error) {
 		m.Memory = parseMacMemory(output, total)
 	} else {
 		m.Memory = unavailableCapacity("macOS memory counters unavailable")
+	}
+	// GPU load is public on each IOAccelerator (macos_parse.go). Apple silicon
+	// shares physical memory, so GPU memory is read against hw.memsize.
+	if totalErr != nil || parseErr != nil {
+		total = 0
+	}
+	if output, err := macRead(ctx, "/usr/sbin/ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"); err == nil {
+		m.GPU = parseMacGPU(output, total)
+	} else {
+		m.GPU = GPUSet{Error: "macOS ioreg failed: " + err.Error()}
 	}
 	// APFS Data holds user data on modern macOS. Older systems use the root.
 	var stat syscall.Statfs_t

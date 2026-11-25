@@ -12,6 +12,9 @@
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
   <link rel="stylesheet" href="/styles.css">
+  <!-- Before app.js, and not deferred: it reports app.js failing to load,
+       parse or start (the #scriptError banner below). -->
+  <script src="/boot.js"></script>
 </head>
 <body>
   <!-- Every icon on the page is drawn from here. Text glyphs outside the bundled
@@ -35,6 +38,9 @@
     <symbol id="icon-warning" viewBox="0 0 24 24"><path d="M12 4 2.8 20h18.4z"/><path d="M12 10v4.5"/><circle cx="12" cy="17.2" r="1" fill="currentColor" stroke="none"/></symbol>
     <symbol id="icon-check" viewBox="0 0 24 24"><path d="M5 12.5 9.5 17 19 7.5"/></symbol>
   </svg>
+  <div id="scriptError" class="script-error" role="alert" hidden>
+    <span id="scriptErrorText" class="script-error-text"></span><button id="scriptErrorReload" class="script-error-reload" type="button">reload</button><span id="scriptErrorMore" class="script-error-more"></span>
+  </div>
   <main id="shell" class="shell">
     <header class="topbar">
       <div class="topbar-id">
@@ -205,6 +211,13 @@
           </div>
           <div id="storageList" class="rows"></div>
         </section>
+        <section id="dockerPanel" class="panel docker-panel" role="region" aria-label="Docker containers" hidden>
+          <div class="section-head">
+            <h2>Containers</h2>
+            <span id="dockerSummary" class="muted">--</span>
+          </div>
+          <div id="dockerList" class="rows"></div>
+        </section>
         <section id="issuesPanel" class="panel issues-panel" role="button" tabindex="0" aria-label="Issue details" aria-expanded="false" aria-live="polite" hidden>
           <div class="section-head">
             <h2>Issues</h2>
@@ -232,6 +245,18 @@
           <p id="pairingPanelError" class="pairing-panel-error" role="alert" hidden></p>
           <p id="pairingAppHint" class="pairing-app-hint" hidden>--</p>
           <button id="pairAnotherBtn" class="pair-another" type="button">Pair another device</button>
+        </section>
+        <section id="notifyPanel" class="panel notify-panel" role="region" aria-labelledby="notifyTitle" hidden>
+          <div class="section-head">
+            <h2 id="notifyTitle">Host alerts</h2>
+            <span id="notifySummary" class="muted">--</span>
+          </div>
+          <p id="notifyTargets" class="notify-note">--</p>
+          <p id="notifyMessage" class="notify-note notify-message" role="status" hidden></p>
+          <div class="notify-actions">
+            <button id="notifyPushBtn" class="notify-button" type="button" hidden>Notify this device</button>
+            <button id="notifyTestBtn" class="notify-button" type="button" hidden>Send test</button>
+          </div>
         </section>
       </section>
       <section class="page" aria-label="App details">

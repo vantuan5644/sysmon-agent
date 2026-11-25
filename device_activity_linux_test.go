@@ -99,3 +99,36 @@ func TestProcOwnedByMatchesOnlyTheGivenUser(t *testing.T) {
 		t.Fatal("unstat-able process must count against completeness")
 	}
 }
+
+func TestScanV4L2HoldersNamesCameraHoldersFromAFixtureProc(t *testing.T) {
+	root := t.TempDir()
+	link := func(pid, fd, target string) {
+		t.Helper()
+		dir := filepath.Join(root, pid, "fd")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(dir, fd)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFixture(t, filepath.Join(root, "200/comm"), "obs\n")
+	link("200", "0", "/dev/null")
+	link("200", "31", "/dev/video0")
+	link("200", "32", "/dev/video1")
+	writeFixture(t, filepath.Join(root, "201/comm"), "pipewire\n") // the session server keeps cameras open idle
+	link("201", "40", "/dev/video0")
+	writeFixture(t, filepath.Join(root, "202/comm"), "bash\n")
+	link("202", "1", "/dev/pts/0")
+	writeFixture(t, filepath.Join(root, "self/comm"), "ignored\n") // not a PID
+	holders, complete := scanV4L2Holders(context.Background(), root, uint32(os.Geteuid()))
+	if !complete {
+		t.Fatal("readable fixture reported incomplete")
+	}
+	if len(holders) != 1 || holders[0] != (DeviceApp{PID: 200, Name: "obs"}) {
+		t.Fatalf("holders = %+v", holders)
+	}
+	if got := withDeviceApps(observedDeviceActivity(true, "x"), holders); len(got.Apps) != 1 || got.Apps[0].Name != "obs" {
+		t.Fatalf("activity apps = %+v", got.Apps)
+	}
+}

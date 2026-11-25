@@ -88,6 +88,19 @@ type sampler struct {
 	// reaches the stream within one fast pass whether or not the slow lane
 	// is parked.
 	gpuGuard gpuGuardService
+	// services are side collectors with their own demand-gated loops
+	// (sampler_services.go); each folds its newest state into every
+	// published snapshot.
+	services []snapshotService
+	// hostAlerts, when set, adds the firing host alerts to every published
+	// snapshot as host_alerts (alerts_service.go).
+	hostAlerts hostAlertsSource
+	// backgroundEvery, when non-zero, keeps a slow pass running that often
+	// with nobody watching, so host alert rules on slow-lane metrics
+	// (temperatures, disks, GPU) still see current readings. Zero, the
+	// default, parks the slow lane as before.
+	backgroundEvery  time.Duration
+	lastBackgroundAt time.Time
 
 	started bool
 	cancel  context.CancelFunc
@@ -195,6 +208,7 @@ func (s *sampler) Start() {
 		s.wg.Add(1)
 		go s.runDeviceLoop(ctx)
 	}
+	s.startServices(ctx)
 
 	if s.lanes == nil {
 		s.wg.Add(1)
@@ -222,6 +236,59 @@ func (s *sampler) GPUGuardState() *gpuguard.State {
 		return nil
 	}
 	return guard.State()
+}
+
+// SetHostAlerts makes every published snapshot carry the firing host alerts.
+func (s *sampler) SetHostAlerts(source hostAlertsSource) {
+	s.mu.Lock()
+	s.hostAlerts = source
+	s.mu.Unlock()
+}
+
+// SetBackgroundSampling keeps the slow lane (or, without lanes, the whole
+// collection) running every `every` while nobody watches. Zero turns it off.
+func (s *sampler) SetBackgroundSampling(every time.Duration) {
+	s.mu.Lock()
+	s.backgroundEvery = every
+	s.mu.Unlock()
+}
+
+// HasLanes reports whether the collector samples in fast and slow lanes.
+func (s *sampler) HasLanes() bool {
+	return s.lanes != nil
+}
+
+// slowWanted is hasDemand, or a background pass that is due. The device loop
+// keeps using hasDemand: alerts read no device activity.
+func (s *sampler) slowWanted(now time.Time) bool {
+	if s.hasDemand() {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.backgroundEvery > 0 && (s.lastBackgroundAt.IsZero() || now.Sub(s.lastBackgroundAt) >= s.backgroundEvery)
+}
+
+// AlertSnapshot is the warm snapshot for the host alert loop, with whether
+// its fast-lane and slow-lane readings are current. Unlike Collect it is not
+// demand: reading it must not wake the dashboard's sampling rates.
+func (s *sampler) AlertSnapshot(now time.Time) alertSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snap := alertSnapshot{Metrics: s.snapshot, Have: s.haveSnapshot}
+	if !snap.Have {
+		return snap
+	}
+	window := s.slowFreshWindow() + s.backgroundEvery
+	age := now.Sub(s.snapshot.Timestamp)
+	if s.lanes == nil {
+		snap.FastFresh = age >= -time.Second && age <= window
+		snap.SlowFresh = snap.FastFresh
+		return snap
+	}
+	snap.FastFresh = age >= -time.Second && age <= alertFastFreshFor
+	snap.SlowFresh = !s.lastSlowAt.IsZero() && now.Sub(s.lastSlowAt) <= window
+	return snap
 }
 
 // Stop cancels the loops and waits for them to exit.
@@ -265,7 +332,7 @@ func (s *sampler) runSlowLoop(ctx context.Context) {
 		if sleepCanceled(ctx, s.slowEvery) {
 			return
 		}
-		if !s.hasDemand() {
+		if !s.slowWanted(time.Now()) {
 			continue
 		}
 		started := time.Now()
@@ -292,7 +359,7 @@ func (s *sampler) runWholeLoop(ctx context.Context) {
 		if sleepCanceled(ctx, s.slowEvery) {
 			return
 		}
-		if !s.hasDemand() {
+		if !s.slowWanted(time.Now()) {
 			// Park until demand returns so an idle host is not collected forever.
 			if waitForDemand(ctx, s, s.slowEvery) {
 				return
@@ -345,7 +412,7 @@ func sleepCanceled(ctx context.Context, d time.Duration) bool {
 // if the context was canceled.
 func waitForDemand(ctx context.Context, s *sampler, poll time.Duration) bool {
 	for {
-		if s.hasDemand() {
+		if s.slowWanted(time.Now()) {
 			return false
 		}
 		if sleepCanceled(ctx, poll) {
@@ -381,14 +448,19 @@ func (s *sampler) applyLaneAndPublish(patch func(*Metrics), started time.Time, s
 	s.working.Timestamp = now.UTC()
 	if slow {
 		s.lastSlowAt = now
+		s.lastBackgroundAt = now
 	}
 	slowFresh := !s.lastSlowAt.IsZero() && now.Sub(s.lastSlowAt) <= s.slowFreshWindow()
 	working := s.working
 	guard := s.gpuGuard
+	services := s.services
+	alerts := s.hostAlerts
 	s.mu.Unlock()
 
 	final := finishMetrics(working, started)
 	attachGPUGuard(&final, guard)
+	attachServices(&final, services)
+	attachHostAlerts(&final, alerts)
 	s.history.observe(final, slowFresh)
 	data, err := json.Marshal(final)
 	if err != nil {
@@ -409,8 +481,13 @@ func (s *sampler) applyLaneAndPublish(patch func(*Metrics), started time.Time, s
 func (s *sampler) publishWhole(metrics Metrics) {
 	s.mu.Lock()
 	guard := s.gpuGuard
+	services := s.services
+	alerts := s.hostAlerts
+	s.lastBackgroundAt = time.Now()
 	s.mu.Unlock()
 	attachGPUGuard(&metrics, guard)
+	attachServices(&metrics, services)
+	attachHostAlerts(&metrics, alerts)
 	s.history.observe(metrics, true)
 	data, err := json.Marshal(metrics)
 	if err != nil {

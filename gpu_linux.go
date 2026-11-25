@@ -6,15 +6,17 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-func collectLinuxGPU(ctx context.Context) GPUSet {
+// collectLinuxGPU merges NVIDIA (nvidia-smi) with AMD/Intel DRM sysfs. usage
+// returns the DRM fdinfo sample the pass started alongside (drm_fdinfo_linux.go);
+// it is only waited for after the sysfs reads.
+func collectLinuxGPU(ctx context.Context, usage func() drmUsageSummary) GPUSet {
 	nvidia := mergeLinuxGPUHotspots(collectNVIDIAGPU(ctx), "/run/sysmon-gpu-hotspot/readings.json", time.Now())
-	drm := collectLinuxDRMGPU("/sys")
+	drm := collectLinuxDRMGPUWithUsage("/sys", usage)
 
 	var devices []GPUMetric
 	var errors []string
@@ -39,12 +41,19 @@ func collectLinuxGPU(ctx context.Context) GPUSet {
 }
 
 func collectLinuxDRMGPU(sysRoot string) GPUSet {
+	return collectLinuxDRMGPUWithUsage(sysRoot, nil)
+}
+
+// collectLinuxDRMGPUWithUsage reads every AMD/Intel card under sysRoot and
+// fills in what DRM fdinfo measured: the engines of each card, and the load
+// of a card without gpu_busy_percent (every Intel GPU).
+func collectLinuxDRMGPUWithUsage(sysRoot string, usage func() drmUsageSummary) GPUSet {
 	matches, err := filepath.Glob(filepath.Join(sysRoot, "class", "drm", "card*", "device"))
 	if err != nil {
 		return GPUSet{Available: false, Error: err.Error()}
 	}
 
-	devices := make([]GPUMetric, 0, len(matches))
+	cards := make([]linuxDRMDevice, 0, len(matches))
 	for _, devicePath := range matches {
 		cardName := filepath.Base(filepath.Dir(devicePath))
 		if !isDRMCardName(cardName) {
@@ -54,25 +63,107 @@ func collectLinuxDRMGPU(sysRoot string) GPUSet {
 		if vendorID == "" || vendorID == "0x10de" {
 			continue
 		}
-		devices = append(devices, collectLinuxDRMDevice(cardName, vendorID, devicePath))
+		cards = append(cards, collectLinuxDRMCard(filepath.Dir(devicePath), cardName, vendorID))
+	}
+	if len(cards) == 0 {
+		return GPUSet{Available: false, Error: "no AMD/Intel DRM GPU telemetry found"}
 	}
 
-	sort.Slice(devices, func(i, j int) bool { return devices[i].Name < devices[j].Name })
-	if len(devices) == 0 {
-		return GPUSet{Available: false, Error: "no AMD/Intel DRM GPU telemetry found"}
+	if usage != nil {
+		summary := usage()
+		for i := range cards {
+			applyDRMDeviceUsage(&cards[i], summary)
+		}
+	}
+	sortLinuxDRMDevices(cards)
+	devices := make([]GPUMetric, 0, len(cards))
+	for _, card := range cards {
+		devices = append(devices, card.metric)
 	}
 	return GPUSet{Available: true, Devices: devices}
 }
 
-func collectLinuxDRMDevice(cardName, vendorID, devicePath string) GPUMetric {
-	return GPUMetric{
-		HotspotTemperature: unavailableNumber("C", "hotspot collection supports NVIDIA RTX 3090/4090"),
-		Name:               linuxDRMGPUName(cardName, vendorID),
-		Usage:              linuxDRMGPUUsage(devicePath),
-		Power:              linuxDRMGPUPower(devicePath),
-		Memory:             linuxDRMGPUVRAM(devicePath),
-		Temperature:        linuxDRMGPUTemperature(devicePath),
+// applyDRMDeviceUsage attaches a card's fdinfo engines, and takes its load
+// as the card's usage when sysfs has no gpu_busy_percent.
+func applyDRMDeviceUsage(card *linuxDRMDevice, summary drmUsageSummary) {
+	if card.suspended || card.pdev == "" {
+		return
 	}
+	device, ok := summary.Devices[card.pdev]
+	if !summary.Available || !ok {
+		if !card.metric.Usage.Available && summary.Error != "" {
+			card.metric.Usage = unavailableNumber("%", "DRM GPU usage not exposed; "+summary.Error)
+		}
+		return
+	}
+	if len(device.Engines) > 0 {
+		card.metric.Engines = device.Engines
+	}
+	if !card.metric.Usage.Available {
+		card.metric.Usage = device.Load
+	}
+}
+
+// collectLinuxDRMCard reads one AMD/Intel card. A runtime-suspended card is
+// idle and is otherwise left alone.
+func collectLinuxDRMCard(cardPath, cardName, vendorID string) linuxDRMDevice {
+	devicePath := filepath.Join(cardPath, "device")
+	name := linuxDRMGPUNameFor(cardName, vendorID, devicePath)
+	card := linuxDRMDevice{card: cardName, pdev: linuxDRMPCISlot(devicePath)}
+	metric := GPUMetric{Name: name}
+
+	if linuxDRMRuntimeSuspended(devicePath) {
+		const asleep = "GPU is runtime-suspended"
+		card.suspended = true
+		metric.Integrated = strings.EqualFold(vendorID, "0x8086") && !intelDiscretePattern.MatchString(name)
+		metric.Usage = availableNumber(0, "%")
+		metric.Memory = unavailableCapacity(asleep)
+		metric.Power = unavailableNumber("W", asleep)
+		metric.Temperature = unavailableNumber("C", asleep)
+		metric.HotspotTemperature = unavailableNumber("C", asleep)
+		metric.VRAMTemperature = unavailableNumber("C", asleep)
+		card.metric = metric
+		return card
+	}
+
+	hwmon := readLinuxGPUHwmon(devicePath)
+	metric.Integrated = linuxDRMGPUIntegrated(vendorID, devicePath, name, hwmon)
+	metric.Usage = linuxDRMGPUUsage(devicePath)
+	metric.Memory, metric.MemoryKind = linuxDRMGPUMemory(devicePath, metric.Integrated)
+
+	switch {
+	case hwmon.edge.Available:
+		metric.Temperature = hwmon.edge
+	case hwmon.firstTemp.Available:
+		metric.Temperature = hwmon.firstTemp
+	default:
+		metric.Temperature = unavailableNumber("C", "DRM GPU temperature not exposed")
+	}
+	metric.HotspotTemperature = hwmon.junction
+	if !metric.HotspotTemperature.Available {
+		metric.HotspotTemperature = unavailableNumber("C", "no junction (hotspot) sensor exposed")
+	}
+	metric.VRAMTemperature = hwmon.memory
+	if !metric.VRAMTemperature.Available {
+		metric.VRAMTemperature = unavailableNumber("C", "no memory temperature sensor exposed")
+	}
+	switch {
+	case hwmon.powerAverage.Available:
+		metric.Power = hwmon.powerAverage
+	case hwmon.powerInput.Available:
+		metric.Power = hwmon.powerInput
+	default:
+		metric.Power = unavailableNumber("W", "DRM GPU power not exposed")
+	}
+	metric.PowerLimit = numberPtr(hwmon.powerCap)
+	if clock, ok := linuxDRMGPUClock(cardPath, devicePath, vendorID, hwmon); ok {
+		metric.Clock = &clock
+	}
+	metric.FanRPM = numberPtr(hwmon.fanRPM)
+	metric.HotspotCritical = numberPtr(hwmon.junctionCrit)
+	metric.VRAMCritical = numberPtr(hwmon.memoryCrit)
+	card.metric = metric
+	return card
 }
 
 func linuxDRMGPUName(cardName, vendorID string) string {
@@ -101,34 +192,6 @@ func linuxDRMGPUVRAM(devicePath string) CapacityMetric {
 		return unavailableCapacity("DRM VRAM usage not exposed")
 	}
 	return availableCapacity(used, total)
-}
-
-func linuxDRMGPUTemperature(devicePath string) NumberMetric {
-	paths, _ := filepath.Glob(filepath.Join(devicePath, "hwmon", "hwmon*", "temp*_input"))
-	sort.Strings(paths)
-	for _, path := range paths {
-		value, ok := readTemperatureMilliC(path)
-		if ok {
-			return availableNumber(value, "C")
-		}
-	}
-	return unavailableNumber("C", "DRM GPU temperature not exposed")
-}
-
-// linuxDRMGPUPower reads AMD GPU power from the hwmon power1_average counter
-// (microwatts). Intel integrated graphics generally do not expose this counter,
-// so power is reported as unavailable there instead of failing the device.
-func linuxDRMGPUPower(devicePath string) NumberMetric {
-	paths, _ := filepath.Glob(filepath.Join(devicePath, "hwmon", "hwmon*", "power1_average"))
-	sort.Strings(paths)
-	for _, path := range paths {
-		microwatts, ok := readUint64File(path)
-		if !ok || microwatts == 0 {
-			continue
-		}
-		return availableNumber(float64(microwatts)/1e6, "W")
-	}
-	return unavailableNumber("W", "DRM GPU power not exposed")
 }
 
 func isDRMCardName(name string) bool {

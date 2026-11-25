@@ -50,10 +50,10 @@ const (
 	// polling the usage endpoint more often than 5 minutes earns 429s.
 	quotaPollInterval = 5 * time.Minute
 
-	// quotaPollBackoffOn429 pushes the next attempt out after the server asked
-	// us to slow down. The endpoint is stingy; a 429 must not trigger an
-	// immediate retry.
-	quotaPollBackoffOn429 = 15 * time.Minute
+	// Failure backoff, Retry-After and the rejected-token rules live in
+	// quota_schedule.go: a 429 or any other failed request waits 1, 2, 4, 8,
+	// then 15 minutes (never less than quotaPollInterval), or the server's
+	// Retry-After when that is longer, capped at an hour.
 
 	// quotaPollRetryOnCredential is the retry delay after a credential-stage
 	// failure — an unreadable .credentials.json, no OAuth token, or an expired
@@ -65,9 +65,9 @@ const (
 	// omarchy: the poll failed at 18:02:30, Claude Code refreshed the token at
 	// 18:03:00, and the page went on telling the user to "run any Claude Code
 	// session" until the next interval poll at 18:07:30 — while they were
-	// running one. A 401 keeps the normal cadence on purpose: that one did
-	// reach the network, so retrying it hard would hammer the endpoint with a
-	// credential the server has already rejected.
+	// running one. A 401/403 is different: it did reach the network, so the
+	// rejected token is remembered by fingerprint and not sent again until the
+	// file holds a new one or quotaRejectedTokenRetry has passed.
 	quotaPollRetryOnCredential = 30 * time.Second
 
 	// quotaPollStartupDelay spaces the first poll away from agent start so a
@@ -157,6 +157,13 @@ type QuotaRow struct {
 	// cache, their own sample age ("as of 4m ago") so a stale Fable row is
 	// shown as stale rather than dropped.
 	Note string `json:"note,omitempty"`
+	// WindowSeconds is the length of the rolling window the percentage counts
+	// against (18000 for a 5-hour session, 604800 for a weekly), 0 when it is
+	// not a time window (credits) or unknown. The dashboard needs it, with
+	// ResetsAt, to work out how far into the window "now" is for its pace
+	// forecast. Additive: older dashboards ignore it, and the dashboard falls
+	// back to inferring it from the row id for agents that do not send it.
+	WindowSeconds int64 `json:"window_seconds,omitempty"`
 }
 
 // QuotaStatus is the /api/quota body. It is always well-formed, even on a host
@@ -227,6 +234,9 @@ type quotaLiveLimitScope struct {
 }
 
 type quotaLiveLimit struct {
+	// Kind is "session", "weekly_all" or "weekly_scoped". The first two
+	// back-fill five_hour / seven_day when a payload carries only limits[].
+	Kind     string               `json:"kind"`
 	Percent  *float64             `json:"percent"`
 	ResetsAt string               `json:"resets_at"`
 	Scope    *quotaLiveLimitScope `json:"scope"`
@@ -296,6 +306,7 @@ var quotaNamedWindows = []struct {
 // appears on the dashboard with no code change here.
 func quotaRowsFromLivePayload(payload quotaLivePayload) []QuotaRow {
 	var rows []QuotaRow
+	byKind := quotaLimitWindowsByKind(payload.Limits)
 	for _, named := range quotaNamedWindows {
 		var window *quotaLiveWindow
 		switch named.id {
@@ -311,13 +322,17 @@ func quotaRowsFromLivePayload(payload quotaLivePayload) []QuotaRow {
 			window = payload.CinderCove
 		}
 		if window == nil || window.Utilization == nil {
+			window = byKind[named.id]
+		}
+		if window == nil || window.Utilization == nil {
 			continue
 		}
 		rows = append(rows, QuotaRow{
-			ID:       named.id,
-			Label:    named.label,
-			Percent:  *window.Utilization,
-			ResetsAt: window.ResetsAt,
+			ID:            named.id,
+			Label:         named.label,
+			Percent:       *window.Utilization,
+			ResetsAt:      window.ResetsAt,
+			WindowSeconds: quotaWindowSecondsFor(named.id),
 		})
 	}
 	for _, limit := range payload.Limits {
@@ -325,11 +340,13 @@ func quotaRowsFromLivePayload(payload quotaLivePayload) []QuotaRow {
 		if name == "" || limit.Percent == nil {
 			continue
 		}
+		id := quotaWeeklyRowID(name)
 		rows = append(rows, QuotaRow{
-			ID:       quotaWeeklyRowID(name),
-			Label:    "Weekly (" + name + ")",
-			Percent:  *limit.Percent,
-			ResetsAt: limit.ResetsAt,
+			ID:            id,
+			Label:         "Weekly (" + name + ")",
+			Percent:       *limit.Percent,
+			ResetsAt:      limit.ResetsAt,
+			WindowSeconds: quotaWindowSecondsFor(id),
 		})
 	}
 	if row, ok := quotaCreditsRow(payload.Spend, payload.ExtraUsage); ok {
@@ -468,10 +485,11 @@ func quotaRowsFromSnapshot(file quotaSnapshotFile) []QuotaRow {
 			continue
 		}
 		rows = append(rows, QuotaRow{
-			ID:       named.id,
-			Label:    named.label,
-			Percent:  *window.UsedPercentage,
-			ResetsAt: quotaResetFromEpochSeconds(window.ResetsAtSecs),
+			ID:            named.id,
+			Label:         named.label,
+			Percent:       *window.UsedPercentage,
+			ResetsAt:      quotaResetFromEpochSeconds(window.ResetsAtSecs),
+			WindowSeconds: quotaWindowSecondsFor(named.id),
 		})
 	}
 	for _, scoped := range file.ModelScoped {
@@ -479,11 +497,13 @@ func quotaRowsFromSnapshot(file quotaSnapshotFile) []QuotaRow {
 		if name == "" || scoped.Utilization == nil {
 			continue
 		}
+		id := quotaWeeklyRowID(name)
 		rows = append(rows, QuotaRow{
-			ID:       quotaWeeklyRowID(name),
-			Label:    "Weekly (" + name + ")",
-			Percent:  *scoped.Utilization,
-			ResetsAt: quotaResetFromEpochSeconds(scoped.ResetsAtSecs),
+			ID:            id,
+			Label:         "Weekly (" + name + ")",
+			Percent:       *scoped.Utilization,
+			ResetsAt:      quotaResetFromEpochSeconds(scoped.ResetsAtSecs),
+			WindowSeconds: quotaWindowSecondsFor(id),
 		})
 	}
 	return rows
@@ -605,6 +625,15 @@ type QuotaChecker struct {
 	stop    chan struct{}
 	stopped chan struct{}
 	started bool
+
+	// sched is the live poller's schedule: failures, next attempt and the
+	// fingerprint of a token the server rejected. Only pollOnce (on the loop
+	// goroutine) changes it after construction. state persists it, with the
+	// last good rows, so a restart neither re-polls at once nor shows a
+	// blank page. It never holds the token itself.
+	sched        quotaProviderState
+	state        *quotaStateStore
+	lastStateErr string
 }
 
 // QuotaCheckerOptions captures the inputs main.go resolves once.
@@ -621,6 +650,9 @@ type QuotaCheckerOptions struct {
 	StartupDelay time.Duration
 	HTTPClient   *http.Client
 	Logf         func(format string, args ...any)
+	// State persists the live poll's schedule and last good reading. nil
+	// keeps both in memory.
+	State *quotaStateStore
 }
 
 func newQuotaChecker(opts QuotaCheckerOptions) *QuotaChecker {
@@ -647,9 +679,13 @@ func newQuotaChecker(opts QuotaCheckerOptions) *QuotaChecker {
 		usageURL:     opts.UsageURL,
 		httpClient:   opts.HTTPClient,
 		logf:         opts.Logf,
+		state:        opts.State,
 	}
 	if opts.ConfigDir != "" {
 		checker.tokenDays, _, _ = emptyTokenUsageDays(time.Now())
+	}
+	if opts.ConfigDir != "" && opts.Poll {
+		checker.restoreState()
 	}
 	return checker
 }
@@ -898,7 +934,7 @@ func (c *QuotaChecker) loop() {
 	select {
 	case <-c.stop:
 		return
-	case <-time.After(c.startupDelay):
+	case <-time.After(quotaInitialWait(c.startupDelay, c.sched.NextAt, time.Now())):
 	}
 	var lastFailure string
 	for {
@@ -945,25 +981,46 @@ func quotaPollLogLine(previousFailure string, err error) (line string, nextFailu
 	return "", ""
 }
 
-// pollOnce performs one usage-endpoint poll. It returns a backoff duration to
-// honour — quotaPollBackoffOn429 after a 429, quotaPollRetryOnCredential after
-// a pre-network credential failure, 0 to keep the normal cadence — and the
-// failure, if any. The access token
-// is read per-poll, sent only to the usage host, and never logged, persisted,
-// or included in any HTTP response the agent itself serves.
+// errQuotaTokenRejected is the 401/403 outcome, and also what a poll reports
+// while it holds back a token the server already rejected, so the journal
+// dedupe in quotaPollLogLine sees one unchanged failure.
+var errQuotaTokenRejected = errors.New("token rejected — run any Claude Code session")
+
+// pollOnce performs one usage-endpoint poll. It returns how long to wait
+// before the next one — 0 for the normal cadence, quotaPollRetryOnCredential
+// after a pre-network credential failure, quotaTokenRecheck while the token on
+// disk is one the server rejected, and the failure backoff (or a longer
+// Retry-After) after any other failure — and the failure, if any. The access
+// token is read per-poll, sent only to the usage host, and never logged,
+// persisted, or included in any HTTP response the agent itself serves; only
+// its fingerprint is kept, to recognise it after a rejection.
 func (c *QuotaChecker) pollOnce() (time.Duration, error) {
+	now := time.Now()
 	token, err := readQuotaAccessToken(c.configDir)
 	if err != nil {
 		c.cacheLiveError(err.Error())
 		return quotaPollRetryOnCredential, err
+	}
+	fingerprint := quotaTokenFingerprint(token)
+	if c.sched.RejectedFP != "" && fingerprint == c.sched.RejectedFP {
+		retryAt := c.sched.RejectedAt.Add(quotaRejectedTokenRetry)
+		if now.Before(retryAt) {
+			// The same token the server refused: re-read the file soon, but
+			// do not send it again until it changes or retryAt passes.
+			wait := quotaTokenRecheck
+			if until := retryAt.Sub(now); until < wait {
+				wait = until
+			}
+			c.cacheLiveError(errQuotaTokenRejected.Error())
+			return wait, errQuotaTokenRejected
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), quotaRequestTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.usageURL, nil)
 	if err != nil {
-		c.cacheLiveError(err.Error())
-		return 0, err
+		return c.pollFailed(now, err, 0)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
@@ -971,41 +1028,97 @@ func (c *QuotaChecker) pollOnce() (time.Duration, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		c.cacheLiveError(err.Error())
-		return 0, err
+		return c.pollFailed(now, err, 0)
 	}
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests:
-		err := errors.New("rate limited")
-		c.cacheLiveError(err.Error())
-		return quotaPollBackoffOn429, err
-	case resp.StatusCode == http.StatusUnauthorized:
-		err := errors.New("token rejected — run any Claude Code session")
-		c.cacheLiveError(err.Error())
-		return 0, err
+		retryAfter, _ := parseRetryAfter(resp.Header.Get("Retry-After"), now)
+		return c.pollFailed(now, errors.New("rate limited"), retryAfter)
+	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden:
+		c.sched.RejectedFP = fingerprint
+		c.sched.RejectedAt = now.UTC()
+		c.sched.Failures++
+		c.sched.NextAt = now.Add(quotaTokenRecheck).UTC()
+		c.cacheLiveError(errQuotaTokenRejected.Error())
+		c.saveState()
+		return quotaTokenRecheck, errQuotaTokenRejected
 	case resp.StatusCode != http.StatusOK:
-		err := fmt.Errorf("usage endpoint returned HTTP %d", resp.StatusCode)
-		c.cacheLiveError(err.Error())
-		return 0, err
+		return c.pollFailed(now, fmt.Errorf("usage endpoint returned HTTP %d", resp.StatusCode), 0)
 	}
 
 	var payload quotaLivePayload
 	if err := json.NewDecoder(io.LimitReader(resp.Body, quotaMaxPayloadBytes)).Decode(&payload); err != nil {
-		err = fmt.Errorf("decode usage payload: %w", err)
-		c.cacheLiveError(err.Error())
-		return 0, err
+		return c.pollFailed(now, fmt.Errorf("decode usage payload: %w", err), 0)
 	}
 	rows := quotaRowsFromLivePayload(payload)
 	if len(rows) == 0 {
-		err := errors.New("usage payload carried no windows")
-		c.cacheLiveError(err.Error())
-		return 0, err
+		return c.pollFailed(now, errors.New("usage payload carried no windows"), 0)
 	}
 	c.mu.Lock()
 	c.liveRows, c.liveAt, c.liveErr = rows, time.Now().UTC(), ""
 	c.mu.Unlock()
+	c.sched.Failures = 0
+	c.sched.RejectedFP = ""
+	c.sched.RejectedAt = time.Time{}
+	c.sched.NextAt = now.Add(c.interval).UTC()
+	c.saveState()
 	return 0, nil
+}
+
+// pollFailed records a failure that reached (or tried to reach) the network
+// and returns the exponential backoff, or retryAfter when that is longer.
+func (c *QuotaChecker) pollFailed(now time.Time, err error, retryAfter time.Duration) (time.Duration, error) {
+	c.sched.Failures++
+	wait := quotaFailureBackoff(c.sched.Failures, c.interval)
+	if retryAfter > wait {
+		wait = retryAfter
+	}
+	c.sched.NextAt = now.Add(wait).UTC()
+	c.cacheLiveError(err.Error())
+	c.saveState()
+	return wait, err
+}
+
+// restoreState loads the persisted schedule and last good reading. The rows
+// come back as the live source with their original fetch time, so they age
+// into "stale" exactly as if the agent had never restarted.
+func (c *QuotaChecker) restoreState() {
+	saved := c.state.Claude()
+	c.sched = quotaProviderState{
+		NextAt:     saved.NextAt,
+		Failures:   saved.Failures,
+		RejectedFP: saved.RejectedFP,
+		RejectedAt: saved.RejectedAt,
+	}
+	if len(saved.Rows) > 0 && !saved.FetchedAt.IsZero() {
+		c.liveRows, c.liveAt = saved.Rows, saved.FetchedAt.UTC()
+	}
+	if saved.RejectedFP != "" {
+		c.liveErr = errQuotaTokenRejected.Error()
+	}
+}
+
+// saveState writes the schedule and the last good rows. A write failure is
+// logged once per distinct reason and otherwise ignored: the poller keeps
+// working from memory.
+func (c *QuotaChecker) saveState() {
+	if c.state == nil {
+		return
+	}
+	c.mu.RLock()
+	snapshot := c.sched
+	snapshot.Rows, snapshot.FetchedAt = c.liveRows, c.liveAt
+	c.mu.RUnlock()
+	err := c.state.SetClaude(snapshot)
+	reason := ""
+	if err != nil {
+		reason = err.Error()
+	}
+	if reason != "" && reason != c.lastStateErr {
+		c.logf("claude quota state not saved: %s", reason)
+	}
+	c.lastStateErr = reason
 }
 
 func (c *QuotaChecker) cacheLiveError(reason string) {

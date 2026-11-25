@@ -19,7 +19,7 @@ const timeoutMS = 5000;
 // `sysmon-agent -pair-token <name>`, is sent as a bearer token when set.
 const pairingToken = String(process.env.SYSMON_TOKEN || "").trim();
 const authHeaders = pairingToken ? { Authorization: `Bearer ${pairingToken}` } : {};
-const dashboardBuild = "sysmon-static-v178";
+const dashboardBuild = "sysmon-static-v179";
 const deviceUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const roundTripSettings = {
   dim: true,
@@ -428,6 +428,100 @@ function validateMetrics(metrics) {
   if (metrics.gpu_guard !== undefined) {
     validateGPUGuard(metrics.gpu_guard);
   }
+  if (metrics.network?.latency !== undefined) {
+    validateNetworkLatency(metrics.network.latency);
+  }
+  if (metrics.docker !== undefined) {
+    validateDocker(metrics.docker);
+  }
+  if (metrics.host_alerts !== undefined) {
+    validateHostAlerts(metrics.host_alerts);
+  }
+}
+
+// validateNetworkLatency checks the internet latency window (net_latency.go),
+// present unless the agent runs with -latency-target off. It is unavailable
+// only before the first probe; a failed probe is loss, not unavailability.
+function validateNetworkLatency(latency) {
+  const path = "metrics.network.latency";
+  assertObject(latency, path);
+  assert(typeof latency.available === "boolean", `${path}.available must be boolean`);
+  assertNonEmptyString(latency.target, `${path}.target`);
+  assert(latency.method === "tcp-connect", `${path}.method = ${latency.method}, want tcp-connect`);
+  assertInteger(latency.interval_seconds, `${path}.interval_seconds`, { min: 1 });
+  assertInteger(latency.window_seconds, `${path}.window_seconds`, { min: 1 });
+  assertInteger(latency.probes, `${path}.probes`, { min: 0 });
+  assertInteger(latency.failures, `${path}.failures`, { min: 0, max: latency.probes });
+  for (const key of ["last_ms", "avg_ms", "min_ms", "max_ms"]) {
+    validateNumberMetric(latency[key], `${path}.${key}`, { unit: "ms", allowUnavailable: true, min: 0 });
+  }
+  validateNumberMetric(latency.loss_percent, `${path}.loss_percent`, { unit: "%", allowUnavailable: true, min: 0, max: 100 });
+  if (!latency.available) {
+    assertNonEmptyString(latency.error, `${path}.error`);
+    assert(latency.probes === 0, `${path} is unavailable with ${latency.probes} probes`);
+    return;
+  }
+  assert(latency.probes > 0, `${path} is available with no probes`);
+  assert(latency.loss_percent.available, `${path}.loss_percent must be available once probed`);
+  assertTimestamp(latency.updated_at, `${path}.updated_at`, { allowStale: true });
+  if (latency.min_ms.available && latency.max_ms.available) {
+    assert(latency.min_ms.value <= latency.max_ms.value, `${path}.min_ms exceeds max_ms`);
+  }
+}
+
+// validateDocker checks the container list (docker.go), present only when the
+// agent runs with -docker. A set that cannot read Docker says why.
+function validateDocker(docker) {
+  const path = "metrics.docker";
+  assertObject(docker, path);
+  assert(typeof docker.available === "boolean", `${path}.available must be boolean`);
+  assertInteger(docker.total, `${path}.total`, { min: 0 });
+  assertInteger(docker.running, `${path}.running`, { min: 0, max: docker.total });
+  if (!docker.available) {
+    assertNonEmptyString(docker.error, `${path}.error`);
+    return;
+  }
+  assertTimestamp(docker.updated_at, `${path}.updated_at`, { allowStale: true });
+  const containers = docker.containers ?? [];
+  assert(Array.isArray(containers), `${path}.containers must be an array`);
+  assert(containers.length <= docker.total, `${path}.containers lists more than total`);
+  containers.forEach((container, index) => {
+    const row = `${path}.containers[${index}]`;
+    assertObject(container, row);
+    assertNonEmptyString(container.id, `${row}.id`);
+    assertNonEmptyString(container.name, `${row}.name`);
+    assertNonEmptyString(container.state, `${row}.state`);
+    assert(typeof container.image === "string" && typeof container.status === "string", `${row}.image and .status must be strings`);
+    if (container.health !== undefined) {
+      assert(["healthy", "unhealthy", "starting"].includes(container.health), `${row}.health = ${container.health}`);
+    }
+    if (container.uptime_seconds !== undefined) {
+      assertInteger(container.uptime_seconds, `${row}.uptime_seconds`, { min: 0 });
+    }
+    validateNumberMetric(container.cpu_percent, `${row}.cpu_percent`, { unit: "%", allowUnavailable: true, min: 0, max: 100 });
+    validateCapacityMetric(container.memory, `${row}.memory`, { allowUnavailable: true });
+  });
+}
+
+// validateHostAlerts checks what is firing on the agent's own alert rules
+// (alerts.go HostAlertsSummary), present while host alerts are on.
+function validateHostAlerts(summary) {
+  const path = "metrics.host_alerts";
+  assertObject(summary, path);
+  assert(Array.isArray(summary.active), `${path}.active must be an array`);
+  summary.active.forEach((alert, index) => {
+    const at = `${path}.active[${index}]`;
+    assertObject(alert, at);
+    assertNonEmptyString(alert.rule, `${at}.rule`);
+    assertNonEmptyString(alert.metric, `${at}.metric`);
+    assert(["firing", "releasing"].includes(alert.state), `${at}.state = ${alert.state}, want firing or releasing`);
+    assert(["above", "below"].includes(alert.direction), `${at}.direction = ${alert.direction}`);
+    assert(typeof alert.known === "boolean", `${at}.known must be boolean`);
+    assertFiniteNumber(alert.value, `${at}.value`);
+    assertFiniteNumber(alert.threshold, `${at}.threshold`);
+    assertNonEmptyString(alert.message, `${at}.message`);
+  });
+  assert(typeof summary.updated_at === "string", `${path}.updated_at must be a string`);
 }
 
 // validateGPUGuard checks the GPU guard's state (internal/gpuguard State),
@@ -793,6 +887,24 @@ function validateGPU(gpu) {
         previous = value;
       });
     }
+    // Linux AMD/Intel extras (gpu_drm_linux.go), absent where not reported.
+    for (const [key, unit, max] of [
+      ["power_limit_watts", "W", 5000],
+      ["clock_mhz", "MHz", 10000],
+      ["fan_rpm", "RPM", 20000],
+      ["hotspot_critical_celsius", "C", 200],
+      ["vram_critical_celsius", "C", 200],
+    ]) {
+      if (device[key] !== undefined) {
+        validateNumberMetric(device[key], `metrics.gpu.devices[${index}].${key}`, { unit, allowUnavailable: false, min: 0, max });
+      }
+    }
+    if (device.memory_kind !== undefined) {
+      assert(device.memory_kind === "shared", `metrics.gpu.devices[${index}].memory_kind = ${device.memory_kind}, want shared`);
+    }
+    if (device.integrated !== undefined) {
+      assert(typeof device.integrated === "boolean", `metrics.gpu.devices[${index}].integrated must be boolean`);
+    }
   });
 }
 
@@ -1128,6 +1240,21 @@ function sampleMetrics() {
     network: {
       available: true,
       uplink: { available: true, kind: "wifi", name: "BiBi-Pro-Max" },
+      latency: {
+        available: true,
+        target: "1.1.1.1:443",
+        method: "tcp-connect",
+        interval_seconds: 5,
+        window_seconds: 300,
+        last_ms: { available: true, value: 12.11, unit: "ms" },
+        avg_ms: { available: true, value: 13.4, unit: "ms" },
+        min_ms: { available: true, value: 11.02, unit: "ms" },
+        max_ms: { available: true, value: 21.7, unit: "ms" },
+        loss_percent: { available: true, value: 1.7, unit: "%" },
+        probes: 60,
+        failures: 1,
+        updated_at: new Date().toISOString(),
+      },
       interfaces: [{
         name: "tailscale0",
         rx_bytes_total: 1000,
@@ -1153,6 +1280,21 @@ function sampleMetrics() {
           { name: "Video Encode", usage_percent: { available: true, value: 12, unit: "%" } },
           { name: "Video Decode", usage_percent: { available: true, value: 0, unit: "%" } },
         ],
+        clock_mhz: { available: true, value: 1300, unit: "MHz" },
+        integrated: true,
+      }, {
+        name: "AMD Radeon RX 7900 XTX",
+        usage_percent: { available: true, value: 42, unit: "%" },
+        power_watts: { available: true, value: 251, unit: "W" },
+        memory: { available: true, used_bytes: 2_147_483_648, total_bytes: 25_769_803_776, percent: 8.33 },
+        temperature_celsius: { available: true, value: 51, unit: "C" },
+        hotspot_temperature_celsius: { available: true, value: 73, unit: "C" },
+        vram_temperature_celsius: { available: true, value: 82, unit: "C" },
+        power_limit_watts: { available: true, value: 303, unit: "W" },
+        clock_mhz: { available: true, value: 2482, unit: "MHz" },
+        fan_rpm: { available: true, value: 1250, unit: "RPM" },
+        hotspot_critical_celsius: { available: true, value: 110, unit: "C" },
+        vram_critical_celsius: { available: true, value: 105, unit: "C" },
       }],
       error: "nvidia-smi not found",
     },
@@ -1221,6 +1363,32 @@ function sampleMetrics() {
       thresholds: { warn_c: 90, critical_c: 95, delta_warn_c: 25 },
       action: "none",
       updated_at: new Date().toISOString(),
+    },
+    docker: {
+      available: true,
+      endpoint: "unix:///var/run/docker.sock",
+      total: 3,
+      running: 2,
+      updated_at: new Date().toISOString(),
+      containers: [
+        {
+          id: "0123456789ab", name: "db", image: "postgres:17", state: "running", status: "Up About a minute (health: starting)",
+          health: "starting", uptime_seconds: 60,
+          cpu_percent: { available: false, unit: "%", error: "CPU is warming up" },
+          memory: { available: true, used_bytes: 52428800, total_bytes: 2147483648, percent: 2.44 },
+        },
+        {
+          id: "123456789abc", name: "web", image: "nginx:latest", state: "running", status: "Up 6 days (healthy)",
+          health: "healthy", uptime_seconds: 518400,
+          cpu_percent: { available: true, value: 2.5, unit: "%" },
+          memory: { available: true, used_bytes: 209715200, total_bytes: 1073741824, percent: 19.53 },
+        },
+        {
+          id: "23456789abcd", name: "old", image: "busybox", state: "exited", status: "Exited (0) 2 hours ago",
+          cpu_percent: { available: false, unit: "%", error: "container is exited" },
+          memory: { available: false, error: "container is exited" },
+        },
+      ],
     },
   };
 }

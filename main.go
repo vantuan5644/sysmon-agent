@@ -65,6 +65,11 @@ func main() {
 	peerList := flag.String("peers", envString("SYSMON_PEERS", ""), "other agents the dashboard can switch to, comma-separated [name=]URL entries (e.g. minipc=https://minipc.example.ts.net:9443)")
 	peerDiscovery := flag.Bool("peer-discovery", envBool("SYSMON_PEER_DISCOVERY", true), "find other agents on the tailnet (tailscale status, then one request each to :9443 and :9099) when a dashboard opens the host list")
 	storageExclude := flag.String("storage-exclude", envString("SYSMON_STORAGE_EXCLUDE", ""), "drives to leave out of the storage panel and send nothing to, comma-separated parts of their model as the panel shows it (e.g. \"ZEPHYR USB DISK\")")
+	// Docker containers (docker.go): opt-in, GET-only reads of the Engine API.
+	dockerEnabled := flag.Bool("docker", envBool("SYSMON_DOCKER", false), "list Docker containers with their CPU, memory and health (read-only: GET requests to the Engine API only; the socket itself is root-equivalent, see docker.go)")
+	dockerHost := flag.String("docker-host", envString("SYSMON_DOCKER_HOST", ""), "with -docker: the Engine API, unix:///path, an absolute socket path or tcp://host:port (default /var/run/docker.sock; Docker Desktop's ~/.docker/run/docker.sock on macOS; Windows needs tcp://)")
+	// Internet latency (net_latency.go): a timed TCP connect, no ICMP, no exec.
+	latencyTarget := flag.String("latency-target", envString("SYSMON_LATENCY_TARGET", DefaultLatencyTarget), "host[:port] whose TCP connect time is the internet latency, probed every 5s while a dashboard is open (port 443 if none); off disables it")
 	// GPU overheat guard (gpu_guard.go). warn raises the alarms and logs what
 	// act would do; act also lowers the power limit and then ends GPU apps.
 	gpuGuardMode := flag.String("gpu-guard", envString("SYSMON_GPU_GUARD", "warn"), "GPU overheat guard: off, warn (alarms only) or act (alarms, then lower the power limit, then end GPU apps)")
@@ -73,10 +78,30 @@ func main() {
 	gpuDeltaWarn := flag.Int("gpu-delta-warn", envInt("SYSMON_GPU_DELTA_WARN", 0), "warn when the hotspot runs this many Celsius above the GPU core under load (10-40); 0 uses 20")
 	gpuGuardSpare := flag.String("gpu-guard-spare", envString("SYSMON_GPU_GUARD_SPARE", ""), "process names the guard never ends, comma-separated, besides the desktop, terminals, sysmon and streaming hosts")
 	gpuGuardTestFile := flag.String("gpu-guard-test-file", envString("SYSMON_GPU_GUARD_TEST_FILE", ""), "testing: a JSON file such as {\"hotspot\":96} whose values replace the GPU guard's readings while it exists")
+	// Host alerts with push notifications (alerts*.go). Off until a rule or a
+	// target is set here or in alerts.json beside -settings.
+	alertsConfigFlag := flag.String("alerts-config", envString("SYSMON_ALERTS_CONFIG", ""), "host alert rules and notification targets as JSON (default: alerts.json beside -settings, read when present)")
+	alertCPU := flag.Int("alert-cpu", envInt("SYSMON_ALERT_CPU", 0), "alert when CPU use stays at or above this percent (1-100); 0 is off")
+	alertMemory := flag.Int("alert-memory", envInt("SYSMON_ALERT_MEMORY", 0), "alert when memory use stays at or above this percent (1-100); 0 is off")
+	alertGPUTemp := flag.Int("alert-gpu-temp", envInt("SYSMON_ALERT_GPU_TEMP", 0), "alert when a GPU's hotspot or core temperature stays at or above this Celsius (20-150); 0 is off")
+	alertCPUTemp := flag.Int("alert-cpu-temp", envInt("SYSMON_ALERT_CPU_TEMP", 0), "alert when the CPU temperature stays at or above this Celsius (20-150); 0 is off")
+	alertDiskFree := flag.Int("alert-disk-free", envInt("SYSMON_ALERT_DISK_FREE", 0), "alert when a mount's free space stays at or below this percent (1-99); 0 is off")
+	alertUpdate := flag.Bool("alert-update", envBool("SYSMON_ALERT_UPDATE", false), "alert once when a newer agent release is available (needs the update check)")
+	alertHold := flag.Duration("alert-hold", envDuration("SYSMON_ALERT_HOLD", 0), "how long a reading must stay past its line before an alert fires; 0 uses 15s")
+	alertRelease := flag.Duration("alert-release", envDuration("SYSMON_ALERT_RELEASE", 0), "how long a reading must stay back under its line before an alert resolves; 0 uses 4s")
+	alertCooldown := flag.Duration("alert-cooldown", envDuration("SYSMON_ALERT_COOLDOWN", 0), "the least time between two notifications for the same alert; 0 uses 10m")
+	alertSampleEvery := flag.Duration("alert-sample-every", envDuration("SYSMON_ALERT_SAMPLE_EVERY", 0), "with nobody watching, how often temperatures, disks and GPUs are sampled for alerts (5s-5m); 0 uses 15s")
+	ntfyURL := flag.String("ntfy-url", envString("SYSMON_NTFY_URL", ""), "send alerts to this ntfy topic URL, such as https://ntfy.sh/<topic>")
+	ntfyTokenFile := flag.String("ntfy-token-file", envString("SYSMON_NTFY_TOKEN_FILE", ""), "a file holding the ntfy access token (or set SYSMON_NTFY_TOKEN)")
+	alertWebhookURL := flag.String("alert-webhook-url", envString("SYSMON_ALERT_WEBHOOK_URL", ""), "POST alerts as JSON to this URL")
+	alertWebhookTokenFile := flag.String("alert-webhook-token-file", envString("SYSMON_ALERT_WEBHOOK_TOKEN_FILE", ""), "a file holding a bearer token for the webhook (or set SYSMON_ALERT_WEBHOOK_TOKEN)")
+	webPushFlag := flag.Bool("web-push", envBool("SYSMON_WEB_PUSH", false), "let paired dashboards subscribe to alerts as browser notifications (Web Push)")
+	webPushSubject := flag.String("web-push-subject", envString("SYSMON_WEB_PUSH_SUBJECT", ""), "the contact Web Push services see for this agent, a mailto: or https: URL")
 	// Device pairing (pairing.go) and HTTPS for network clients (tls_auto.go).
 	pairingFlag := flag.String("pairing", envString("SYSMON_PAIRING", pairingModeRequired), "device pairing: required (only paired devices reach data and controls) or off (anyone who reaches the port, as before)")
 	networkTLSFlag := flag.String("network-tls", envString("SYSMON_NETWORK_TLS", networkTLSAuto), "HTTPS for network clients on the same port, plain HTTP kept for this machine: auto (on when pairing is required and the bind is not loopback), on, or off")
 	mdnsNameFlag := flag.String("mdns-name", envString("SYSMON_MDNS_NAME", ""), "a .local name for this agent other than its hostname's, such as bblwin for bblwin.local: the agent answers mDNS for it, its certificate names it and pairing QR codes open it, so a dual-boot machine can go by one name under both systems")
+	allowedHostsFlag := flag.String("allowed-hosts", envString("SYSMON_ALLOWED_HOSTS", ""), "extra host names the agent answers to, comma-separated, \"*.example.org\" for every name below one; IP addresses, localhost, .local and .ts.net names, this machine's hostname and -mdns-name are always allowed, anything else gets 421 (a DNS-rebinding guard)")
 	pairOpen := flag.Bool("pair", false, "open a 10-minute pairing window, print its PIN and exit (needs the agent's -settings path)")
 	pairURL := flag.String("pair-url", "", "with -pair: the dashboard address its QR code opens, such as https://host.example.ts.net:9443 (default: a private network address of this host)")
 	pairQR := flag.Bool("pair-qr", false, "with -pair: draw the QR code even when the output is not a terminal")
@@ -160,6 +185,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	allowedHosts, err := parseAllowedHosts(*allowedHostsFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
 	listen := listenConfig{
 		bind:       *bind,
 		port:       *port,
@@ -194,6 +223,42 @@ func main() {
 	if err != nil {
 		log.Fatalf("gpu guard: %v", err)
 	}
+	alertsCfg, err := loadAlertsConfig(alertFlags{
+		ConfigFile:       *alertsConfigFlag,
+		SettingsPath:     *settingsPath,
+		CPU:              *alertCPU,
+		Memory:           *alertMemory,
+		GPUTemp:          *alertGPUTemp,
+		CPUTemp:          *alertCPUTemp,
+		DiskFree:         *alertDiskFree,
+		Update:           *alertUpdate,
+		Hold:             *alertHold,
+		Release:          *alertRelease,
+		Cooldown:         *alertCooldown,
+		NtfyURL:          *ntfyURL,
+		NtfyTokenFile:    *ntfyTokenFile,
+		NtfyToken:        os.Getenv("SYSMON_NTFY_TOKEN"),
+		WebhookURL:       *alertWebhookURL,
+		WebhookTokenFile: *alertWebhookTokenFile,
+		WebhookToken:     os.Getenv("SYSMON_ALERT_WEBHOOK_TOKEN"),
+		WebPush:          *webPushFlag,
+		WebPushSubject:   *webPushSubject,
+		SampleEvery:      *alertSampleEvery,
+	}, nil)
+	if err != nil {
+		log.Fatalf("alerts: %v", err)
+	}
+
+	latencyProber, err := newLatencyProber(*latencyTarget)
+	if err != nil {
+		log.Fatalf("latency: %v", err)
+	}
+	var dockerMon *dockerMonitor
+	if *dockerEnabled {
+		if dockerMon, err = newDockerMonitor(*dockerHost); err != nil {
+			log.Fatalf("docker: %v", err)
+		}
+	}
 
 	collector := NewSystemCollector()
 	if exclude := parseStorageExclusions(*storageExclude); len(exclude) > 0 {
@@ -212,6 +277,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("settings: %v", err)
 	}
+	hostAllowlist := newHostAllowlist(osHostnames(), *bind, mdnsName, allowedHosts)
+	state.SetHostAllowlist(hostAllowlist)
 	peers, err := parsePeerList(*peerList)
 	if err != nil {
 		log.Fatalf("peers: %v", err)
@@ -254,12 +321,24 @@ func main() {
 		Logf:           log.Printf,
 	})
 	state.SetUpdateChecker(updateChecker)
+	// The two quota pollers share one state file in the private pairing
+	// folder: their schedule and last good reading, never a token. Without
+	// -settings, and always under -self-check, it stays in memory.
+	quotaStateDir := pairingDirFor(*settingsPath)
+	if *selfCheck {
+		quotaStateDir = ""
+	}
+	quotaState, err := newQuotaStateStore(quotaStateDir)
+	if err != nil {
+		log.Printf("quota state: %v; starting with no saved schedule", err)
+	}
 	// The quota checker always exists (files-only when polling is off); it
 	// resolves the config dir once and serves /api/quota from the local files.
 	quotaChecker := newQuotaChecker(QuotaCheckerOptions{
 		ConfigDir: resolveClaudeConfigDir(*claudeConfigDir),
 		Poll:      *claudeQuotaPoll,
 		Logf:      log.Printf,
+		State:     quotaState,
 	})
 	state.SetQuotaChecker(quotaChecker)
 	// Token history and default quota come from local transcripts. Optional
@@ -267,6 +346,7 @@ func main() {
 	codexChecker := newCodexUsageCheckerWithOptions(resolveCodexConfigDir(*codexConfigDir), CodexQuotaPollOptions{
 		Enabled: *codexQuotaPoll,
 		Binary:  *codexBinary,
+		State:   quotaState,
 	})
 	state.SetCodexUsageChecker(codexChecker)
 	usageSampler := newTokenUsageSampler(quotaChecker, codexChecker)
@@ -331,6 +411,17 @@ func main() {
 	}
 	state.SetPeerRegistry(newPeerRegistry(peerRegistryOptions{Configured: peers, Discover: *peerDiscovery, Tokens: peerTokens}))
 
+	// Side services start with the sampler and stop with it. Never under
+	// -self-check, which returned above, so a check sends no probe and opens
+	// no Docker socket.
+	if latencyProber != nil {
+		metricsSampler.AddService(latencyProber)
+		log.Printf("latency: TCP connect to %s while a dashboard is open", latencyProber.target)
+	}
+	if dockerMon != nil {
+		metricsSampler.AddService(dockerMon)
+		log.Printf("docker: reading containers from %s (GET only)", firstNonEmpty(dockerMon.configErr, dockerMon.endpoint.String()))
+	}
 	metricsSampler.Start()
 	defer metricsSampler.Stop()
 
@@ -351,6 +442,40 @@ func main() {
 		}()
 	}
 
+	// Host alerts judge on their own two-second loop, like the guard, and
+	// only on the serve path (never under -self-check, which returned above).
+	if alertsCfg.enabled() {
+		alerts, err := newAlertService(alertServiceOptions{
+			Config:       alertsCfg,
+			Host:         metricsSampler.hostname,
+			Version:      version,
+			Source:       metricsSampler,
+			Updates:      updateChecker.AlertStatus,
+			PushDir:      alertPushDir(*settingsPath),
+			DeviceExists: state.pairedDeviceExists,
+			Logf:         log.Printf,
+		})
+		if err != nil {
+			log.Fatalf("alerts: %v", err)
+		}
+		if alertsCfg.needsSlowSampling(metricsSampler.HasLanes()) {
+			metricsSampler.SetBackgroundSampling(alertsCfg.SampleEvery)
+		}
+		metricsSampler.SetHostAlerts(alerts)
+		state.SetAlerts(alerts)
+		alertsCtx, stopAlerts := context.WithCancel(context.Background())
+		alertsDone := make(chan struct{})
+		go func() {
+			defer close(alertsDone)
+			alerts.Run(alertsCtx)
+		}()
+		defer func() {
+			stopAlerts()
+			<-alertsDone
+		}()
+		log.Printf("alerts: %d rule(s), notifying %s", len(alertsCfg.Rules), alertTargetNames(alertsCfg))
+	}
+
 	// Start the update checker only on the serve path. It performs one outbound
 	// call at startup (after a short delay) and then once per
 	// updateCheckInterval; -self-check above returns before reaching here. The
@@ -360,6 +485,10 @@ func main() {
 	// goroutines).
 	updateChecker.Start()
 	defer updateChecker.Stop()
+
+	// The hostname's fully qualified form joins the host allowlist once the
+	// resolver answers; a DNS lookup, so on the serve path only.
+	go hostAllowlist.ResolveFQDN(5 * time.Second)
 
 	// The -mdns-name responder joins the LAN's mDNS group, so it too starts
 	// only on the serve path.

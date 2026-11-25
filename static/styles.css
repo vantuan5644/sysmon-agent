@@ -1508,6 +1508,113 @@ body.host-remote .host-controls {
   opacity: 0.8;
 }
 
+/* Docker containers panel ("More status" page, docker.go): one compact row per
+   container, name and CPU share up top, health, status and image beneath with
+   memory used/limit on the right. Only present with the agent's -docker. */
+.docker-row {
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.docker-row:last-child {
+  border-bottom: 0;
+}
+
+.docker-row.stopped {
+  opacity: 0.6;
+}
+
+.docker-row-head,
+.docker-row-foot {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.docker-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+  font-size: 0.86rem;
+}
+
+.docker-cpu,
+.docker-mem {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.docker-cpu {
+  font-weight: 700;
+}
+
+.docker-row-foot {
+  margin-top: 2px;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.docker-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.docker-mem {
+  color: var(--text);
+}
+
+.docker-health {
+  color: var(--good);
+  font-weight: 700;
+}
+
+.docker-health.unhealthy {
+  color: var(--bad);
+}
+
+.docker-health.starting {
+  color: var(--warn);
+}
+
+/* The NET card's identity line with internet latency (net_latency.go): the
+   uplink name gives way (ellipsis) so the latency stays readable. */
+.card-id.has-latency {
+  display: flex;
+  align-items: baseline;
+}
+
+.card-id.has-latency .icon {
+  flex: 0 0 auto;
+  align-self: center;
+}
+
+.net-uplink {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.net-latency {
+  flex: 0 0 auto;
+  /* pre keeps the leading space before the separator, which a flex item
+     would otherwise drop. */
+  white-space: pre;
+  font-variant-numeric: tabular-nums;
+}
+
+.net-latency.warn {
+  color: var(--warn);
+}
+
+.net-latency.crit {
+  color: var(--bad);
+}
+
 /* AI usage page (fourth pager page): provider quota rows plus local transcript
    token history. Provider sections stack on a phone and share the row in a wide
    viewport so the page stays useful in both portrait and StandBy landscape. */
@@ -1600,6 +1707,19 @@ body.host-remote .host-controls {
 .quota-note {
   font-size: 0.74rem;
   color: var(--muted);
+}
+
+/* Pace forecast beside the reset countdown (quotaPace in app.js). Calm and
+   on-pace stay muted like the rest of the line; only a forecast that the
+   window fills before it resets, or a full window, takes a colour. */
+.quota-pace-warn {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.quota-pace-bad {
+  color: var(--bad);
+  font-weight: 600;
 }
 
 /* Empty state for a configured host with no rows yet. Deliberately sets no
@@ -2442,6 +2562,9 @@ body.host-remote .host-controls {
 .control-device-state { color: var(--text); font-weight: 700; }
 .control-state-separator, .control-usage { color: var(--muted); }
 .control-btn.activity-active .control-usage { color: var(--capture-busy); }
+/* An app name ("Zoom +1") replaces "Busy"; a long one ends in an ellipsis
+   rather than widening the control. */
+.control-usage { min-width: 0; max-width: 10ch; overflow: hidden; text-overflow: ellipsis; }
 .mic-glyph, .camera-glyph { position: relative; }
 .mic-live-bars { display: none; align-items: center; gap: 2px; height: 14px; }
 .mic-live-bars i { width: 3px; height: 14px; transform: scaleY(0.35); background: var(--capture-busy); border-radius: 2px; }
@@ -2600,7 +2723,8 @@ body.host-remote .host-controls {
 .pair-submit:focus-visible,
 .pair-cancel:focus-visible,
 .pair-another:focus-visible,
-.paired-remove:focus-visible {
+.paired-remove:focus-visible,
+.notify-button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -2769,7 +2893,8 @@ body.host-remote .host-controls {
 }
 
 .paired-remove,
-.pair-another {
+.pair-another,
+.notify-button {
   min-height: 44px;
   padding: 0 14px;
   border: 1px solid var(--line);
@@ -2860,4 +2985,74 @@ body.host-remote .host-controls {
   color: var(--bad);
   font-size: 0.8rem;
   line-height: 1.4;
+}
+
+/* Script error banner (app.js and boot.js): shown when the dashboard's own
+   script fails, above everything but the GPU alarm. */
+.script-error {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 95;
+  padding:
+    calc(8px + env(safe-area-inset-top))
+    calc(var(--pad-x) + env(safe-area-inset-right))
+    8px
+    calc(var(--pad-x) + env(safe-area-inset-left));
+  background: #3a0d0d;
+  border-bottom: 1px solid var(--bad);
+  color: var(--text);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.script-error[hidden] {
+  display: none;
+}
+
+.script-error-reload {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--bad);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.script-error-more {
+  color: var(--muted);
+}
+
+/* Host alerts (alerts.go): the agent's own rules and targets, with a
+   Web Push opt-in and a test notice. */
+.notify-note {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.notify-message {
+  color: var(--text);
+}
+
+.notify-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.notify-button {
+  flex: 1 1 140px;
+}
+
+.notify-button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
