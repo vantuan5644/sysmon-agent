@@ -24,6 +24,12 @@ on:
 
 permissions:
   contents: write        # required to create the release
+  id-token: write        # build provenance: the OIDC token Sigstore signs with
+  attestations: write    # build provenance: store the attestation on the repo
+
+# Every action is pinned to a full commit SHA (tag in the trailing comment), so a
+# moved or hijacked tag cannot change what runs with these permissions. To bump
+# one, resolve the new tag to its commit and replace both.
 
 concurrency:
   group: release-${{ github.ref }}
@@ -33,11 +39,11 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0        # build scripts use `git describe` when no version is passed
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.22"
           cache-dependency-path: go.mod
@@ -95,8 +101,24 @@ jobs:
           echo "checksum manifest verified"
           cat SHA256SUMS.txt
 
+      # Signed SLSA build provenance for every published binary and the
+      # checksum manifest, so anyone can check an asset came from this
+      # workflow at this commit: `gh attestation verify <file> -R <owner>/<repo>`.
+      # SHA256SUMS.txt proves the bytes match the manifest; the attestation
+      # proves who built the manifest. Runs for tag pushes only, like publishing.
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: |
+            dist/out/sysmon-agent.exe
+            dist/out/sysmon-agent-linux-amd64
+            dist/out/sysmon-agent-linux-arm64
+            dist/out/SysmonAgent-Setup-${{ steps.version.outputs.version }}.exe
+            dist/out/SHA256SUMS.txt
+
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sysmon-agent-${{ steps.version.outputs.version }}
           path: |

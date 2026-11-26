@@ -86,6 +86,7 @@ arch=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 base=https://github.com/vantuan5644/sysmon-agent/releases/latest/download
 curl -fLO "$base/sysmon-agent-linux-$arch" -fLO "$base/SHA256SUMS.txt"
 sha256sum --ignore-missing -c SHA256SUMS.txt   # must print: sysmon-agent-linux-...: OK
+gh attestation verify "sysmon-agent-linux-$arch" -R vantuan5644/sysmon-agent   # optional: built by this repo's release workflow
 sudo install -m0755 "sysmon-agent-linux-$arch" /usr/local/bin/sysmon-agent
 sysmon-agent -settings ./settings.json         # serves on 0.0.0.0:9099
 sysmon-agent -pair -settings ./settings.json   # in a second terminal: a PIN and a QR code for one device
@@ -618,6 +619,10 @@ Self-update from the dashboard works on the **LocalSystem Windows service** and 
 after `-update-setup` (below). A console run refuses it (HTTP 501). Every release **must**
 publish `SHA256SUMS.txt`: it is what authenticates the download before a SYSTEM or root
 process executes it, and every engine refuses to update without it.
+
+Releases from 0.2.9 on also carry signed build provenance for every asset (GitHub artifact
+attestations): `gh attestation verify <file> -R vantuan5644/sysmon-agent` confirms the file
+was built by this repository's release workflow from the tagged commit, not uploaded by hand.
 
 **Turning the check off.** It is on by default. Toggle `update_check_enabled` via
 `POST /api/settings`, or hard-disable it host-side with `-no-update-check` /
